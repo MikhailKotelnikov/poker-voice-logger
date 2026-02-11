@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Poker Voice Logger</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <p class="kicker">локальный логгер раздач</p>
+        <h1>Poker Voice Logger</h1>
+        <p class="subhead">
+          Кликаешь по нику оппонента, диктуешь улицы и пресуппозицию — запись улетает в Google Sheets.
+        </p>
+      </header>
+
+      <section class="panel" id="opponents-panel">
+        <div class="panel-head">
+          <h2>Оппоненты</h2>
+          <span class="hint">клик по нику запускает запись</span>
+        </div>
+        <div class="opponent-input">
+          <input id="opponent-name" type="text" placeholder="Добавить никнейм" />
+          <button id="add-opponent">Добавить</button>
+        </div>
+        <div id="opponent-list" class="opponent-list"></div>
+      </section>
+
+      <section class="panel" id="record-panel">
+        <div class="panel-head">
+          <h2>Запись</h2>
+          <span class="hint" id="record-hint">нет выбранного оппа</span>
+        </div>
+        <div class="record-state" id="record-state">
+          <div>
+            <p class="label">Текущий оппонент</p>
+            <p class="value" id="active-opponent">—</p>
+          </div>
+          <div>
+            <p class="label">Статус</p>
+            <p class="value" id="record-status">ожидание</p>
+          </div>
+          <button id="stop-record" class="ghost" disabled>Стоп</button>
+        </div>
+        <p class="note">
+          Пример диктовки: “флоп 33 + 2x trib, терн xr100, ривер ф1 vs75, пресуппозиция reago vsmy rcb”.
+        </p>
+      </section>
+
+      <section class="panel" id="result-panel">
+        <div class="panel-head">
+          <h2>Результат</h2>
+          <span class="hint">последняя транскрипция</span>
+        </div>
+        <div class="result-grid">
+          <div>
+            <p class="label">Текст</p>
+            <div class="result-box" id="transcript">—</div>
+          </div>
+          <div>
+            <p class="label">Разбор</p>
+            <div class="result-box">
+              <div class="parsed" id="parsed-fields">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="status" id="status">Готово к записи.</div>
+      </section>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
