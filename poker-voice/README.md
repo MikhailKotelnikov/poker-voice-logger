@@ -20,7 +20,11 @@ cp .env.example .env
 3. Заполнить переменные:
 
 - `OPENAI_API_KEY`
+- `OPENAI_MODEL` (рекомендуется `gpt-4o-mini-transcribe`)
+- `OPENAI_LANGUAGE` (`en` для англ. токенов)
+- `OPENAI_PROMPT` (инструкция для ASR на ASCII/шорткоды)
 - `SHEETS_WEBHOOK_URL` (если используешь Apps Script)
+- `SHEET_URL` (ссылка на таблицу вида `https://docs.google.com/spreadsheets/d/.../edit`, нужна для кнопки `Открыть`)
 - `SHEET_NAME` (опционально, если лист не активный)
 - `VOCAB_PATH` (опционально, путь до JSON-словаря)
 
@@ -31,6 +35,26 @@ npm run dev
 ```
 
 Открой `http://localhost:8787`.
+
+## Проверка проекта
+
+Один командой:
+
+```bash
+cd /Users/parisianreflect/Documents/codex/poker-voice
+npm run verify
+```
+
+Что проверяется:
+- синтаксис `server.js`, `public/app.js`, `src/core.js`
+- unit-тесты парсера и генерации ссылок (`tests/core.test.js`)
+
+Если порт занят, можно поменять в `.env`:
+
+```bash
+PORT=8787
+HOST=127.0.0.1
+```
 
 ## Google Sheets через Apps Script (самый простой путь)
 
@@ -44,6 +68,8 @@ npm run dev
 6. Скопируй URL веб‑приложения и вставь в `SHEETS_WEBHOOK_URL`.
 
 > Скрипт вставляет новую строку сразу после последней записи выбранного оппонента.
+>
+> Если ты обновил код `Code.gs`, обязательно: `Deploy -> Manage deployments -> Edit -> Select version -> Deploy` (новая версия).
 
 ## Формат диктовки
 
@@ -77,14 +103,30 @@ npm run dev
 
 С фразой `первая улица ставка 33%` результат будет: в колонке `flop` запишется `bet33`.
 
+Текущий `vocab.json` уже содержит базовые термины:
+- `нулевая улица -> preflop`
+- `первая улица -> flop`
+- `вторая улица -> turn`
+- `третья улица -> river`
+- `пресуппозиция -> presupposition`
+- `я -> i`, `агро -> agro`, `слабая -> l1`, `ставка -> b`, `двойная ставка -> bb`, `тройная ставка -> bbb`
+
 ## Колонки таблицы
 
-1. opponent
-2. preflop
-3. flop
-4. turn
-5. river
-6. presupposition
-7. timing
+1. `A`: nickname (white)
+2. `B`: preflop (white)
+3. `C:E`: flop block (light yellow), text in `C`, `D:E` left empty for visual overflow
+4. `F:H`: turn block (light blue/lilac), text in `F`, `G:H` left empty
+5. `I:K`: river block (white), text in `I`, `J:K` left empty
+6. `L`: presuppositions block (light pink)
 
-`timing` сейчас проставляется автоматически (ISO‑время). Если нужно другое поведение — скажи.
+Текст не обрезается в первой ячейке блока: за счет пустых соседних ячеек и отключенного wrap он визуально продолжается на соседние колонки, как в примере.
+
+Кнопка `Открыть` под никнеймом открывает Google Sheet на первой строке, где встречается этот ник.
+
+## Если формат не применился
+
+1. Вставь актуальный код из `/Users/parisianreflect/Documents/codex/poker-voice/apps_script/Code.gs`.
+2. В Apps Script запусти функцию `setupSheetLayout()` один раз (кнопка `Run`).
+3. Сделай redeploy Web App с новой версией.
+4. Проверь, что `SHEETS_WEBHOOK_URL` в `/Users/parisianreflect/Documents/codex/poker-voice/.env` указывает на этот deployment.

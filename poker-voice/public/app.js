@@ -39,14 +39,26 @@ function setStatus(message, type = 'ok') {
 function renderOpponents() {
   opponentList.innerHTML = '';
   opponents.forEach((name) => {
-    const button = document.createElement('button');
-    button.className = 'opponent-btn';
-    button.textContent = name;
+    const card = document.createElement('div');
+    card.className = 'opponent-card';
+
+    const recordButton = document.createElement('button');
+    recordButton.className = 'opponent-btn';
+    recordButton.textContent = name;
     if (name === activeOpponent) {
-      button.classList.add('active');
+      recordButton.classList.add('active');
     }
-    button.addEventListener('click', () => handleOpponentClick(name));
-    opponentList.appendChild(button);
+
+    const openButton = document.createElement('button');
+    openButton.className = 'open-btn';
+    openButton.textContent = 'открыть';
+
+    recordButton.addEventListener('click', () => handleOpponentClick(name));
+    openButton.addEventListener('click', () => openOpponentInSheet(name));
+
+    card.appendChild(recordButton);
+    card.appendChild(openButton);
+    opponentList.appendChild(card);
   });
 }
 
@@ -82,7 +94,7 @@ function addOpponent() {
     saveOpponents();
   }
   opponentInput.value = '';
-  renderOpponents();
+  updateRecordUI();
 }
 
 addOpponentBtn.addEventListener('click', addOpponent);
@@ -158,6 +170,23 @@ async function sendRecording() {
     setStatus('Запись сохранена.', 'ok');
   } catch (error) {
     setStatus(error.message || 'Ошибка записи.', 'error');
+  }
+}
+
+async function openOpponentInSheet(opponent) {
+  try {
+    setStatus('Открываю строку оппонента в Google Sheets…');
+    const response = await fetch(`/api/open-link?opponent=${encodeURIComponent(opponent)}`);
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error || 'Не удалось открыть таблицу.');
+    }
+
+    window.open(data.url, '_blank', 'noopener,noreferrer');
+    setStatus(`Открыта строка ${data.row} для ${opponent}.`, 'ok');
+  } catch (error) {
+    setStatus(error.message || 'Ошибка открытия таблицы.', 'error');
   }
 }
 

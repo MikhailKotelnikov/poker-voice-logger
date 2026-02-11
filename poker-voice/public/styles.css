@@ -151,6 +151,12 @@ button.ghost {
   gap: 12px;
 }
 
+.opponent-card {
+  display: grid;
+  gap: 8px;
+  min-width: 160px;
+}
+
 .opponent-btn {
   background: var(--accent-soft);
   color: var(--ink);
@@ -162,6 +168,14 @@ button.ghost {
   background: var(--accent-strong);
   color: #fff;
   border-color: transparent;
+}
+
+.open-btn {
+  background: #fdf8ef;
+  color: #6a5644;
+  border: 1px solid rgba(29, 28, 24, 0.16);
+  box-shadow: none;
+  padding: 10px 14px;
 }
 
 .record-state {

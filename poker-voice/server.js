@@ -4,10 +4,17 @@ import dotenv from 'dotenv';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import {
+  buildSheetRangeUrl,
+  normalizeVocabulary,
+  parseTranscript
+} from './src/core.js';
+
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 8787;
+const host = process.env.HOST || '127.0.0.1';
 
 app.use(express.static('public'));
 app.use(express.json({ limit: '2mb' }));
@@ -20,54 +27,15 @@ const upload = multer({
 });
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'whisper-1';
-const OPENAI_LANGUAGE = process.env.OPENAI_LANGUAGE || 'ru';
-const OPENAI_PROMPT = process.env.OPENAI_PROMPT || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini-transcribe';
+const OPENAI_LANGUAGE = process.env.OPENAI_LANGUAGE || 'en';
+const OPENAI_PROMPT = process.env.OPENAI_PROMPT || 'Transcribe poker dictation with lowercase English and ASCII only. Never output Cyrillic. Prefer poker shorthand: d, b, bb, bbb, xr, xb, ai, cb, tp, nutstr, l1, lt1, 3bp, 4bp, vs, i, my, 0t, t, ?, /.';
+const SPELLING_MODE = String(process.env.SPELLING_MODE || '1') !== '0';
 
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || '';
+const SHEET_URL = process.env.SHEET_URL || '';
 const SHEET_NAME = process.env.SHEET_NAME || '';
 const VOCAB_PATH = process.env.VOCAB_PATH || path.resolve(process.cwd(), 'vocab.json');
-
-const STREET_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
-
-const BASE_STREET_MARKERS = [
-  { key: 'preflop', variants: ['префлоп', 'preflop', 'пре флоп', 'пф'] },
-  { key: 'flop', variants: ['флоп', 'flop'] },
-  { key: 'turn', variants: ['терн', 'turn'] },
-  { key: 'river', variants: ['ривер', 'river'] },
-  { key: 'presupposition', variants: ['пресуппозиция', 'пресуппозицию', 'пресуппозиции', 'пресуп', 'presupposition', 'presupp', 'предпосылка', 'предпосылки'] }
-];
-
-function normalizeVocabulary(rawVocabulary) {
-  const normalized = {
-    streetAliases: {},
-    textAliases: {}
-  };
-
-  if (!rawVocabulary || typeof rawVocabulary !== 'object') {
-    return normalized;
-  }
-
-  if (rawVocabulary.streetAliases && typeof rawVocabulary.streetAliases === 'object') {
-    for (const [spokenRaw, targetRaw] of Object.entries(rawVocabulary.streetAliases)) {
-      const spoken = String(spokenRaw || '').trim().toLowerCase();
-      const target = String(targetRaw || '').trim().toLowerCase();
-      if (!spoken || !STREET_KEYS.has(target)) continue;
-      normalized.streetAliases[spoken] = target;
-    }
-  }
-
-  if (rawVocabulary.textAliases && typeof rawVocabulary.textAliases === 'object') {
-    for (const [spokenRaw, targetRaw] of Object.entries(rawVocabulary.textAliases)) {
-      const spoken = String(spokenRaw || '').trim();
-      const target = String(targetRaw || '').trim();
-      if (!spoken) continue;
-      normalized.textAliases[spoken] = target;
-    }
-  }
-
-  return normalized;
-}
 
 function loadVocabulary() {
   try {
@@ -80,106 +48,6 @@ function loadVocabulary() {
     console.error(`Vocabulary load error (${VOCAB_PATH}):`, error.message);
     return normalizeVocabulary({});
   }
-}
-
-function buildStreetMarkers(vocabulary) {
-  const variantsByKey = new Map();
-  for (const marker of BASE_STREET_MARKERS) {
-    variantsByKey.set(marker.key, new Set(marker.variants.map((variant) => variant.toLowerCase())));
-  }
-
-  for (const [spoken, targetKey] of Object.entries(vocabulary.streetAliases || {})) {
-    if (!variantsByKey.has(targetKey)) continue;
-    variantsByKey.get(targetKey).add(spoken.toLowerCase());
-  }
-
-  return BASE_STREET_MARKERS.map((marker) => ({
-    key: marker.key,
-    variants: Array.from(variantsByKey.get(marker.key))
-  }));
-}
-
-function findNextMarker(lowerText, startIndex, streetMarkers) {
-  let best = null;
-  for (const marker of streetMarkers) {
-    for (const variant of marker.variants) {
-      const idx = lowerText.indexOf(variant, startIndex);
-      if (idx === -1) continue;
-      if (!best || idx < best.index || (idx === best.index && variant.length > best.length)) {
-        best = {
-          key: marker.key,
-          index: idx,
-          length: variant.length
-        };
-      }
-    }
-  }
-  return best;
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function applyTextAliases(text, textAliases) {
-  const aliases = Object.entries(textAliases || {})
-    .filter(([spoken]) => spoken)
-    .sort((a, b) => b[0].length - a[0].length);
-
-  let result = text;
-  for (const [spoken, replacement] of aliases) {
-    const regex = new RegExp(escapeRegExp(spoken), 'gi');
-    result = result.replace(regex, replacement);
-  }
-  return result.trim();
-}
-
-function parseTranscript(transcript, vocabulary) {
-  const text = (transcript || '').trim();
-  if (!text) {
-    return { parsed: {}, error: 'Пустая транскрипция.' };
-  }
-
-  const lower = text.toLowerCase();
-  const streetMarkers = buildStreetMarkers(vocabulary);
-  const markers = [];
-  let cursor = 0;
-  while (cursor < lower.length) {
-    const next = findNextMarker(lower, cursor, streetMarkers);
-    if (!next) break;
-    markers.push(next);
-    cursor = next.index + next.length;
-  }
-
-  if (!markers.length) {
-    return { parsed: {}, error: 'Не найдены маркеры улиц (например “флоп”, “терн”, “ривер”, “пресуппозиция”).' };
-  }
-
-  const parsed = {
-    preflop: '',
-    flop: '',
-    turn: '',
-    river: '',
-    presupposition: ''
-  };
-
-  for (let i = 0; i < markers.length; i += 1) {
-    const current = markers[i];
-    const next = markers[i + 1];
-    const start = current.index + current.length;
-    const end = next ? next.index : text.length;
-    const raw = text.slice(start, end).trim();
-    const cleaned = raw.replace(/^[:\-–—\s]+/, '').trim();
-    const normalizedValue = applyTextAliases(cleaned, vocabulary.textAliases);
-
-    if (parsed[current.key]) {
-      parsed[current.key] = `${parsed[current.key]} | ${normalizedValue}`.trim();
-    } else {
-      parsed[current.key] = normalizedValue;
-    }
-  }
-
-  return { parsed, error: null };
 }
 
 async function transcribeAudio(buffer, filename, mimetype) {
@@ -213,6 +81,34 @@ async function transcribeAudio(buffer, filename, mimetype) {
   return data.text || '';
 }
 
+function parseSheetsJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Некорректный ответ Apps Script: ${String(text || '').slice(0, 220)}`);
+  }
+}
+
+async function resolveAppsScriptRedirect(response) {
+  const location = response.headers.get('location');
+  if (!location) {
+    throw new Error('Apps Script вернул редирект без location.');
+  }
+
+  // Apps Script often responds with 302 and a one-time googleusercontent URL.
+  const redirected = await fetch(location, {
+    method: 'GET',
+    redirect: 'follow'
+  });
+
+  const text = await redirected.text();
+  if (!redirected.ok) {
+    throw new Error(`Ошибка чтения ответа Apps Script: ${text.slice(0, 220)}`);
+  }
+
+  return parseSheetsJson(text);
+}
+
 async function postToSheets(payload) {
   if (!SHEETS_WEBHOOK_URL) {
     return { skipped: true };
@@ -223,19 +119,70 @@ async function postToSheets(payload) {
     headers: {
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    redirect: 'manual'
   });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Ошибка при записи в Sheets: ${text}`);
+  if (response.status >= 300 && response.status < 400) {
+    return resolveAppsScriptRedirect(response);
   }
 
-  return response.json().catch(() => ({ ok: true }));
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Ошибка при записи в Sheets: ${text.slice(0, 220)}`);
+  }
+
+  return parseSheetsJson(text);
 }
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
+});
+
+app.get('/api/open-link', async (req, res) => {
+  try {
+    const opponent = String(req.query.opponent || '').trim();
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран оппонент.' });
+    }
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    }
+
+    const lookupResult = await postToSheets({
+      action: 'find_first_row',
+      opponent,
+      sheetName: SHEET_NAME || undefined
+    });
+
+    if (lookupResult?.ok === false) {
+      return res.status(500).json({ error: lookupResult.error || 'Ошибка поиска строки в Sheets.' });
+    }
+
+    if (!lookupResult?.found || !lookupResult?.row) {
+      return res.status(404).json({ error: 'Никнейм не найден в таблице.' });
+    }
+
+    const url = buildSheetRangeUrl({
+      row: lookupResult.row,
+      gid: lookupResult.gid,
+      spreadsheetId: lookupResult.spreadsheetId,
+      sheetUrl: SHEET_URL
+    });
+
+    if (!url) {
+      return res.status(500).json({ error: 'Не удалось собрать ссылку на таблицу. Добавь SHEET_URL в .env.' });
+    }
+
+    return res.json({
+      ok: true,
+      opponent,
+      row: lookupResult.row,
+      url
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка открытия таблицы.' });
+  }
 });
 
 app.post('/api/record', upload.single('audio'), async (req, res) => {
@@ -251,13 +198,12 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
 
     const transcript = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
     const vocabulary = loadVocabulary();
-    const { parsed, error } = parseTranscript(transcript, vocabulary);
+    const { parsed, error } = parseTranscript(transcript, vocabulary, { spellingMode: SPELLING_MODE });
 
     if (error) {
       return res.status(422).json({ error, transcript });
     }
 
-    const timing = new Date().toISOString();
     const payload = {
       opponent,
       preflop: parsed.preflop,
@@ -265,19 +211,34 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
       turn: parsed.turn,
       river: parsed.river,
       presupposition: parsed.presupposition,
-      timing,
-      transcript,
       sheetName: SHEET_NAME || undefined
     };
 
-    await postToSheets(payload);
+    const sheetsResult = await postToSheets(payload);
+    if (sheetsResult?.ok === false) {
+      throw new Error(sheetsResult.error || 'Apps Script вернул ошибку.');
+    }
 
-    return res.json({ ok: true, transcript, parsed, timing });
+    return res.json({
+      ok: true,
+      transcript,
+      parsed,
+      row: sheetsResult?.row || null
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Poker Voice Logger: http://localhost:${port}`);
+const server = app.listen(port, host, () => {
+  console.log(`Poker Voice Logger: http://${host}:${port}`);
+  console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
+});
+
+server.on('error', (error) => {
+  if (error && (error.code === 'EADDRINUSE' || error.code === 'EPERM')) {
+    console.error(`Не удалось запустить сервер на ${host}:${port}: ${error.code}`);
+    return;
+  }
+  console.error('Ошибка запуска сервера:', error);
 });
