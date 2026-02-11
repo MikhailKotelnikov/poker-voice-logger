@@ -13,7 +13,7 @@ var COLOR_WHITE = '#ffffff';
 var COLOR_FLOP = '#f4edd6';
 var COLOR_TURN = '#dbe4f3';
 var COLOR_PRESUP = '#f3e6ea';
-var COLUMN_WIDTH_4CM_PX = 151;
+var COLUMN_WIDTH_3CM_PX = 113;
 
 function doPost(e) {
   try {
@@ -148,7 +148,7 @@ function ensureLayout_(sheet) {
 
   sheet.setFrozenRows(1);
 
-  sheet.setColumnWidths(1, TOTAL_COLUMNS, COLUMN_WIDTH_4CM_PX);
+  sheet.setColumnWidths(1, TOTAL_COLUMNS, COLUMN_WIDTH_3CM_PX);
 
   applyColumnPalette_(sheet);
 }
