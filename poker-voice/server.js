@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import {
   buildSheetRangeUrl,
+  normalizeFieldContent,
   normalizeVocabulary,
   parseTranscript
 } from './src/core.js';
@@ -36,6 +37,7 @@ const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || '';
 const SHEET_URL = process.env.SHEET_URL || '';
 const SHEET_NAME = process.env.SHEET_NAME || '';
 const VOCAB_PATH = process.env.VOCAB_PATH || path.resolve(process.cwd(), 'vocab.json');
+const FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
 
 function loadVocabulary() {
   try {
@@ -224,6 +226,61 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
       transcript,
       parsed,
       row: sheetsResult?.row || null
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
+  }
+});
+
+app.post('/api/record-field', upload.single('audio'), async (req, res) => {
+  try {
+    const opponent = String(req.body.opponent || '').trim();
+    const field = String(req.body.field || '').trim().toLowerCase();
+    const row = Number(req.body.row);
+
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран оппонент.' });
+    }
+    if (!FIELD_KEYS.has(field)) {
+      return res.status(400).json({ error: 'Некорректное поле для передиктовки.' });
+    }
+    if (!Number.isFinite(row) || row < 2) {
+      return res.status(400).json({ error: 'Некорректный номер строки для правки.' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'Аудио не получено.' });
+    }
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    }
+
+    const transcript = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
+    const vocabulary = loadVocabulary();
+    const value = normalizeFieldContent(transcript, vocabulary, { spellingMode: SPELLING_MODE });
+
+    if (!value) {
+      return res.status(422).json({ error: 'Не удалось распознать текст для выбранного поля.', transcript });
+    }
+
+    const sheetsResult = await postToSheets({
+      action: 'update_field',
+      row,
+      field,
+      value,
+      opponent,
+      sheetName: SHEET_NAME || undefined
+    });
+
+    if (sheetsResult?.ok === false) {
+      throw new Error(sheetsResult.error || 'Apps Script вернул ошибку при обновлении поля.');
+    }
+
+    return res.json({
+      ok: true,
+      transcript,
+      row,
+      field,
+      value
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка сервера.' });

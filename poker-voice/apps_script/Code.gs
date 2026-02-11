@@ -33,6 +33,31 @@ function doPost(e) {
       return jsonResponse(findFirstRowPayload_(sheet, data.opponent), 200);
     }
 
+    if (data.action === 'update_field') {
+      var field = asText_(data.field).toLowerCase();
+      var row = Number(data.row);
+      var col = getFieldColumn_(field);
+
+      if (!col) {
+        return jsonResponse({ ok: false, error: 'Некорректное поле.' }, 400);
+      }
+      if (!row || row < FIRST_DATA_ROW || row > sheet.getLastRow()) {
+        return jsonResponse({ ok: false, error: 'Некорректная строка для правки.' }, 400);
+      }
+
+      sheet.getRange(row, col).setValue(asText_(data.value));
+      applyRowFormat_(sheet, row);
+
+      return jsonResponse({
+        ok: true,
+        row: row,
+        field: field,
+        gid: sheet.getSheetId(),
+        sheetName: sheet.getName(),
+        spreadsheetId: sheet.getParent().getId()
+      }, 200);
+    }
+
     if (!data.opponent) {
       return jsonResponse({ ok: false, error: 'Нет opponent.' }, 400);
     }
@@ -239,6 +264,23 @@ function getTargetSheet_(sheetName) {
     return ss.getActiveSheet();
   }
   return ss.getSheetByName(sheetName);
+}
+
+function getFieldColumn_(field) {
+  switch (field) {
+    case 'preflop':
+      return COL_PREFLOP;
+    case 'flop':
+      return COL_FLOP;
+    case 'turn':
+      return COL_TURN;
+    case 'river':
+      return COL_RIVER;
+    case 'presupposition':
+      return COL_PRESUPPOSITION;
+    default:
+      return 0;
+  }
 }
 
 function jsonResponse(payload, status) {

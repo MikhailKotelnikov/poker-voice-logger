@@ -229,6 +229,26 @@ button.ghost {
   gap: 8px;
 }
 
+.parsed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.parsed-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.field-edit-btn {
+  padding: 7px 10px;
+  font-size: 0.8rem;
+  border-radius: 10px;
+  white-space: nowrap;
+  width: auto;
+}
+
 .status {
   padding: 10px 14px;
   border-radius: 12px;
@@ -281,5 +301,9 @@ button.ghost {
 
   button {
     width: 100%;
+  }
+
+  .field-edit-btn {
+    width: auto;
   }
 }

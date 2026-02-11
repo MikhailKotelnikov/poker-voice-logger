@@ -10,11 +10,22 @@ const parsedEl = document.getElementById('parsed-fields');
 const statusEl = document.getElementById('status');
 
 const STORAGE_KEY = 'pokerVoiceOpponents';
+const PARSED_FIELDS = ['preflop', 'flop', 'turn', 'river', 'presupposition'];
 
 let opponents = loadOpponents();
 let activeOpponent = '';
 let mediaRecorder = null;
 let audioChunks = [];
+let currentRecordMode = 'main';
+let currentEditField = '';
+let lastParsed = {
+  preflop: '',
+  flop: '',
+  turn: '',
+  river: '',
+  presupposition: ''
+};
+let lastSavedRow = null;
 
 function loadOpponents() {
   try {
@@ -65,8 +76,10 @@ function renderOpponents() {
 function updateRecordUI() {
   activeOpponentEl.textContent = activeOpponent || '—';
   if (mediaRecorder && mediaRecorder.state === 'recording') {
-    recordStatusEl.textContent = 'запись…';
-    recordHint.textContent = 'говори улицы и пресуппозицию';
+    recordStatusEl.textContent = currentRecordMode === 'field' ? `правка: ${currentEditField}` : 'запись…';
+    recordHint.textContent = currentRecordMode === 'field'
+      ? `передиктовка поля ${currentEditField}`
+      : 'говори улицы и пресуппозицию';
     stopRecordBtn.disabled = false;
   } else {
     recordStatusEl.textContent = 'ожидание';
@@ -74,6 +87,7 @@ function updateRecordUI() {
     stopRecordBtn.disabled = true;
   }
   renderOpponents();
+  renderParsed(lastParsed);
 }
 
 async function handleOpponentClick(name) {
@@ -82,8 +96,10 @@ async function handleOpponentClick(name) {
     return;
   }
   activeOpponent = name;
+  currentRecordMode = 'main';
+  currentEditField = '';
   updateRecordUI();
-  await startRecording();
+  await startRecording('main');
 }
 
 function addOpponent() {
@@ -110,8 +126,11 @@ stopRecordBtn.addEventListener('click', () => {
   }
 });
 
-async function startRecording() {
+async function startRecording(mode = 'main', field = '') {
   if (!activeOpponent) return;
+  currentRecordMode = mode;
+  currentEditField = field;
+
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -130,18 +149,22 @@ async function startRecording() {
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach((track) => track.stop());
       updateRecordUI();
-      await sendRecording();
+      const modeToSend = currentRecordMode;
+      const fieldToSend = currentEditField;
+      currentRecordMode = 'main';
+      currentEditField = '';
+      await sendRecording(modeToSend, fieldToSend);
     };
 
     mediaRecorder.start();
-    setStatus('Запись запущена.', 'ok');
+    setStatus(mode === 'field' ? `Передиктовка поля ${field} запущена.` : 'Запись запущена.', 'ok');
     updateRecordUI();
   } catch (error) {
     setStatus('Не удалось получить доступ к микрофону.', 'error');
   }
 }
 
-async function sendRecording() {
+async function sendRecording(mode = 'main', field = '') {
   if (!audioChunks.length) {
     setStatus('Нет аудио для отправки.', 'error');
     return;
@@ -151,11 +174,18 @@ async function sendRecording() {
   const formData = new FormData();
   formData.append('audio', blob, 'recording.webm');
   formData.append('opponent', activeOpponent);
+  if (mode === 'field') {
+    formData.append('field', field);
+    formData.append('row', String(lastSavedRow || ''));
+  }
 
-  setStatus('Транскрибирую и отправляю в Sheets…');
+  setStatus(mode === 'field'
+    ? `Транскрибирую правку поля ${field} и обновляю строку…`
+    : 'Транскрибирую и отправляю в Sheets…');
 
   try {
-    const response = await fetch('/api/record', {
+    const endpoint = mode === 'field' ? '/api/record-field' : '/api/record';
+    const response = await fetch(endpoint, {
       method: 'POST',
       body: formData
     });
@@ -166,8 +196,21 @@ async function sendRecording() {
     }
 
     transcriptEl.textContent = data.transcript || '—';
-    renderParsed(data.parsed);
-    setStatus('Запись сохранена.', 'ok');
+
+    if (mode === 'field') {
+      if (!lastParsed || typeof lastParsed !== 'object') {
+        lastParsed = { preflop: '', flop: '', turn: '', river: '', presupposition: '' };
+      }
+      lastParsed[field] = data.value || '';
+      lastSavedRow = data.row || lastSavedRow;
+      renderParsed(lastParsed);
+      setStatus(`Поле ${field} обновлено в строке ${lastSavedRow}.`, 'ok');
+    } else {
+      lastParsed = data.parsed || { preflop: '', flop: '', turn: '', river: '', presupposition: '' };
+      lastSavedRow = data.row || null;
+      renderParsed(lastParsed);
+      setStatus(lastSavedRow ? `Запись сохранена в строку ${lastSavedRow}.` : 'Запись сохранена.', 'ok');
+    }
   } catch (error) {
     setStatus(error.message || 'Ошибка записи.', 'error');
   }
@@ -191,20 +234,42 @@ async function openOpponentInSheet(opponent) {
 }
 
 function renderParsed(parsed = {}) {
-  const entries = [
-    ['preflop', parsed.preflop],
-    ['flop', parsed.flop],
-    ['turn', parsed.turn],
-    ['river', parsed.river],
-    ['presupposition', parsed.presupposition]
-  ];
-
   parsedEl.innerHTML = '';
-  entries.forEach(([key, value]) => {
+  PARSED_FIELDS.forEach((key) => {
     const row = document.createElement('div');
-    row.innerHTML = `<strong>${key}</strong>: ${value || '—'}`;
+    row.className = 'parsed-row';
+
+    const text = document.createElement('div');
+    text.className = 'parsed-text';
+    text.innerHTML = `<strong>${key}</strong>: ${parsed[key] || '—'}`;
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'field-edit-btn ghost';
+    editBtn.textContent = 'передиктовать';
+    editBtn.disabled = !activeOpponent || !lastSavedRow || (mediaRecorder && mediaRecorder.state === 'recording');
+    editBtn.addEventListener('click', () => redictateField(key));
+
+    row.appendChild(text);
+    row.appendChild(editBtn);
     parsedEl.appendChild(row);
   });
+}
+
+async function redictateField(field) {
+  if (!activeOpponent) {
+    setStatus('Сначала выбери оппонента.', 'error');
+    return;
+  }
+  if (!lastSavedRow) {
+    setStatus('Нет сохраненной строки для правки. Сначала сделай обычную запись.', 'error');
+    return;
+  }
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    setStatus('Сначала останови текущую запись.', 'error');
+    return;
+  }
+
+  await startRecording('field', field);
 }
 
 renderOpponents();

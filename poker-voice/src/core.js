@@ -247,6 +247,31 @@ export function removeAllDashes(text) {
   return String(text || '').replace(/[‐‑‒–—−-]/g, '');
 }
 
+export function normalizeFieldContent(rawText, vocabulary, options = {}) {
+  const spellingMode = Boolean(options.spellingMode);
+  const cleaned = String(rawText || '')
+    .trim()
+    .replace(/^[:,\-–—\s]+/, '')
+    .replace(/[,\s]+$/, '')
+    .trim();
+
+  if (!cleaned) {
+    return '';
+  }
+
+  // Pass 1: apply user vocab directly on raw (supports Russian keys in vocab.json).
+  const vocabPass1 = applyTextAliases(normalizeSpoken(cleaned), vocabulary.textAliases);
+  // Pass 2: bridge mixed-language/translit tokens into English.
+  const mixedLanguageNormalized = normalizeMixedLanguageText(vocabPass1);
+  // Pass 3: apply user vocab again (handles English keys produced by pass 2).
+  const normalizedValue = transliterateCyrillicText(applyTextAliases(mixedLanguageNormalized, vocabulary.textAliases))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const modeValue = spellingMode ? applySpellingModeText(normalizedValue) : normalizedValue;
+  return removeAllDashes(modeValue).replace(/\s+/g, ' ').trim();
+}
+
 export function parseTranscript(transcript, vocabulary, options = {}) {
   const spellingMode = Boolean(options.spellingMode);
   const text = (transcript || '').trim();
@@ -282,21 +307,8 @@ export function parseTranscript(transcript, vocabulary, options = {}) {
     const next = markers[i + 1];
     const start = current.index + current.length;
     const end = next ? next.index : text.length;
-    const raw = text.slice(start, end).trim();
-    const cleaned = raw
-      .replace(/^[:,\-–—\s]+/, '')
-      .replace(/[,\s]+$/, '')
-      .trim();
-    // Pass 1: apply user vocab directly on raw (supports Russian keys in vocab.json).
-    const vocabPass1 = applyTextAliases(normalizeSpoken(cleaned), vocabulary.textAliases);
-    // Pass 2: bridge mixed-language/translit tokens into English.
-    const mixedLanguageNormalized = normalizeMixedLanguageText(vocabPass1);
-    // Pass 3: apply user vocab again (handles English keys produced by pass 2).
-    const normalizedValue = transliterateCyrillicText(applyTextAliases(mixedLanguageNormalized, vocabulary.textAliases))
-      .replace(/\s+/g, ' ')
-      .trim();
-    const modeValue = spellingMode ? applySpellingModeText(normalizedValue) : normalizedValue;
-    const finalValue = removeAllDashes(modeValue).replace(/\s+/g, ' ').trim();
+    const raw = text.slice(start, end);
+    const finalValue = normalizeFieldContent(raw, vocabulary, { spellingMode });
 
     if (!finalValue) {
       continue;
