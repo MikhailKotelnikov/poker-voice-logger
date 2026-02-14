@@ -5,6 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  normalizeOutputPunctuation,
+  removeNonDecimalDots,
   removeAllDashes,
   applySpellingModeText,
   applyTextAliases,
@@ -94,6 +96,16 @@ test('applySpellingModeText preserves token spaces and drops space token marker'
 test('removeAllDashes strips all dash variants', () => {
   const input = '3-3 0–1 1—2 2−3 4‑5';
   assert.equal(removeAllDashes(input), '33 01 12 23 45');
+});
+
+test('removeNonDecimalDots keeps only decimal points', () => {
+  const input = '0.18 miss.cb 3.3 .x x. 7.';
+  assert.equal(removeNonDecimalDots(input), '0.18 misscb 3.3 x x 7');
+});
+
+test('normalizeOutputPunctuation combines dash and dot cleanup', () => {
+  const input = '0.16 3-3 combo. ai.';
+  assert.equal(normalizeOutputPunctuation(input), '0.16 33 combo ai');
 });
 
 test('parseTranscript returns explicit error when no street markers', () => {

@@ -28,8 +28,10 @@
           <span class="hint">клик по нику запускает запись</span>
         </div>
         <div class="opponent-input">
-          <input id="opponent-name" type="text" placeholder="Добавить никнейм" />
+          <input id="opponent-name" type="text" placeholder="Добавить никнейм" list="opponent-suggestions" />
+          <datalist id="opponent-suggestions"></datalist>
           <button id="add-opponent">Добавить</button>
+          <button id="clear-opponents" class="ghost" type="button">Сбросить активных</button>
         </div>
         <div id="opponent-list" class="opponent-list"></div>
       </section>

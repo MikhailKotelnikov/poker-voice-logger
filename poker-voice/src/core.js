@@ -247,6 +247,33 @@ export function removeAllDashes(text) {
   return String(text || '').replace(/[‐‑‒–—−-]/g, '');
 }
 
+export function removeNonDecimalDots(text) {
+  const source = String(text || '');
+  let out = '';
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch !== '.') {
+      out += ch;
+      continue;
+    }
+
+    const prev = source[i - 1] || '';
+    const next = source[i + 1] || '';
+    if (/\d/.test(prev) && /\d/.test(next)) {
+      out += '.';
+    }
+  }
+
+  return out;
+}
+
+export function normalizeOutputPunctuation(text) {
+  return removeNonDecimalDots(removeAllDashes(text))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function normalizeFieldContent(rawText, vocabulary, options = {}) {
   const spellingMode = Boolean(options.spellingMode);
   const cleaned = String(rawText || '')
@@ -269,7 +296,7 @@ export function normalizeFieldContent(rawText, vocabulary, options = {}) {
     .trim();
 
   const modeValue = spellingMode ? applySpellingModeText(normalizedValue) : normalizedValue;
-  return removeAllDashes(modeValue).replace(/\s+/g, ' ').trim();
+  return normalizeOutputPunctuation(modeValue);
 }
 
 export function parseTranscript(transcript, vocabulary, options = {}) {

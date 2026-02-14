@@ -102,8 +102,10 @@ h1 {
 }
 
 .opponent-input {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
   gap: 12px;
+  align-items: center;
 }
 
 input[type="text"] {
@@ -152,9 +154,31 @@ button.ghost {
 }
 
 .opponent-card {
+  position: relative;
   display: grid;
   gap: 8px;
   min-width: 160px;
+}
+
+.remove-opponent-btn {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  padding: 0;
+  border: 1px solid rgba(29, 28, 24, 0.2);
+  background: #fffaf3;
+  color: #7f5f48;
+  box-shadow: 0 4px 10px rgba(20, 20, 20, 0.14);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.remove-opponent-btn:hover {
+  transform: translateY(0);
+  background: #fbe9e2;
 }
 
 .opponent-btn {
@@ -231,7 +255,7 @@ button.ghost {
 
 .parsed-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
 }
@@ -239,9 +263,43 @@ button.ghost {
 .parsed-text {
   flex: 1;
   min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.parsed-label {
+  line-height: 1.3;
+}
+
+.parsed-input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #fffaf3;
+  padding: 8px 10px;
+  font-size: 0.9rem;
+  color: var(--ink);
+}
+
+.parsed-input:disabled {
+  background: #f3ede3;
+  color: #7a6c5b;
+}
+
+.parsed-actions {
+  display: grid;
+  gap: 6px;
 }
 
 .field-edit-btn {
+  padding: 7px 10px;
+  font-size: 0.8rem;
+  border-radius: 10px;
+  white-space: nowrap;
+  width: auto;
+}
+
+.field-save-btn {
   padding: 7px 10px;
   font-size: 0.8rem;
   border-radius: 10px;
@@ -296,7 +354,7 @@ button.ghost {
   }
 
   .opponent-input {
-    flex-direction: column;
+    grid-template-columns: 1fr;
   }
 
   button {
@@ -305,5 +363,14 @@ button.ghost {
 
   .field-edit-btn {
     width: auto;
+  }
+
+  .field-save-btn {
+    width: auto;
+  }
+
+  .remove-opponent-btn {
+    width: 24px;
+    height: 24px;
   }
 }

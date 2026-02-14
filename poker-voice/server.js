@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   buildSheetRangeUrl,
   normalizeFieldContent,
+  normalizeOutputPunctuation,
   normalizeVocabulary,
   parseTranscript
 } from './src/core.js';
@@ -28,7 +29,7 @@ const upload = multer({
 });
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini-transcribe';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-transcribe';
 const OPENAI_LANGUAGE = process.env.OPENAI_LANGUAGE || 'en';
 const OPENAI_PROMPT = process.env.OPENAI_PROMPT || 'Transcribe poker dictation with lowercase English and ASCII only. Never output Cyrillic. Prefer poker shorthand: d, b, bb, bbb, xr, xb, ai, cb, tp, nutstr, l1, lt1, 3bp, 4bp, vs, i, my, 0t, t, ?, /.';
 const SPELLING_MODE = String(process.env.SPELLING_MODE || '1') !== '0';
@@ -139,6 +140,36 @@ async function postToSheets(payload) {
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
+});
+
+app.get('/api/opponent-suggestions', async (req, res) => {
+  try {
+    const query = String(req.query.q || '').trim();
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(5000, Math.trunc(limitRaw)))
+      : 50;
+
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.json({ ok: true, opponents: [] });
+    }
+
+    const result = await postToSheets({
+      action: 'list_opponents',
+      query,
+      limit,
+      sheetName: SHEET_NAME || undefined
+    });
+
+    if (result?.ok === false) {
+      return res.status(500).json({ error: result.error || 'Ошибка поиска оппонентов в Sheets.' });
+    }
+
+    const opponents = Array.isArray(result?.opponents) ? result.opponents : [];
+    return res.json({ ok: true, opponents });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
+  }
 });
 
 app.get('/api/open-link', async (req, res) => {
@@ -278,6 +309,50 @@ app.post('/api/record-field', upload.single('audio'), async (req, res) => {
     return res.json({
       ok: true,
       transcript,
+      row,
+      field,
+      value
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
+  }
+});
+
+app.post('/api/update-field-text', async (req, res) => {
+  try {
+    const opponent = String(req.body.opponent || '').trim();
+    const field = String(req.body.field || '').trim().toLowerCase();
+    const row = Number(req.body.row);
+    const value = normalizeOutputPunctuation(String(req.body.value || ''));
+
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран оппонент.' });
+    }
+    if (!FIELD_KEYS.has(field)) {
+      return res.status(400).json({ error: 'Некорректное поле для ручной правки.' });
+    }
+    if (!Number.isFinite(row) || row < 2) {
+      return res.status(400).json({ error: 'Некорректный номер строки для правки.' });
+    }
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    }
+
+    const sheetsResult = await postToSheets({
+      action: 'update_field',
+      row,
+      field,
+      value,
+      opponent,
+      sheetName: SHEET_NAME || undefined
+    });
+
+    if (sheetsResult?.ok === false) {
+      throw new Error(sheetsResult.error || 'Apps Script вернул ошибку при ручной правке поля.');
+    }
+
+    return res.json({
+      ok: true,
       row,
       field,
       value
