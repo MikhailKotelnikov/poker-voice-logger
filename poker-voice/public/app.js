@@ -352,12 +352,27 @@ async function sendRecording(mode = 'main', field = '') {
       lastParsed[field] = data.value || '';
       lastSavedRow = data.row || lastSavedRow;
       renderParsed(lastParsed);
-      setStatus(`Поле ${field} обновлено в строке ${lastSavedRow}.`, 'ok');
+      const parserSource = data?.parser?.source === 'semantic_llm' ? 'LLM' : 'rules';
+      const parserModel = data?.parser?.model ? `/${data.parser.model}` : '';
+      const confidence = typeof data?.parser?.confidence === 'number'
+        ? ` conf=${data.parser.confidence.toFixed(2)}`
+        : '';
+      setStatus(`Поле ${field} обновлено в строке ${lastSavedRow}. parser=${parserSource}${parserModel}${confidence}`, 'ok');
     } else {
       lastParsed = data.parsed || emptyParsedFields();
       lastSavedRow = data.row || null;
       renderParsed(lastParsed);
-      setStatus(lastSavedRow ? `Запись сохранена в строку ${lastSavedRow}.` : 'Запись сохранена.', 'ok');
+      const parserSource = data?.parser?.source === 'semantic_llm' ? 'LLM' : 'rules';
+      const parserModel = data?.parser?.model ? `/${data.parser.model}` : '';
+      const confidence = typeof data?.parser?.confidence === 'number'
+        ? ` conf=${data.parser.confidence.toFixed(2)}`
+        : '';
+      setStatus(
+        lastSavedRow
+          ? `Запись сохранена в строку ${lastSavedRow}. parser=${parserSource}${parserModel}${confidence}`
+          : `Запись сохранена. parser=${parserSource}${parserModel}${confidence}`,
+        'ok'
+      );
     }
   } catch (error) {
     setStatus(error.message || 'Ошибка записи.', 'error');

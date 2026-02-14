@@ -11,6 +11,15 @@ import {
   normalizeVocabulary,
   parseTranscript
 } from './src/core.js';
+import {
+  coerceSemanticResult,
+  emptyParsedFields,
+  hasAnyParsedField,
+  mergeParsedFields,
+  normalizeSemanticFieldValue,
+  normalizeSemanticParsed,
+  parseSemanticModelContent
+} from './src/semantic.js';
 
 dotenv.config();
 
@@ -30,9 +39,19 @@ const upload = multer({
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-transcribe';
-const OPENAI_LANGUAGE = process.env.OPENAI_LANGUAGE || 'en';
+const OPENAI_LANGUAGE = String(process.env.OPENAI_LANGUAGE || '').trim();
 const OPENAI_PROMPT = process.env.OPENAI_PROMPT || 'Transcribe poker dictation with lowercase English and ASCII only. Never output Cyrillic. Prefer poker shorthand: d, b, bb, bbb, xr, xb, ai, cb, tp, nutstr, l1, lt1, 3bp, 4bp, vs, i, my, 0t, t, ?, /.';
 const SPELLING_MODE = String(process.env.SPELLING_MODE || '1') !== '0';
+const NOTS_SEMANTIC_ENABLED = String(process.env.NOTS_SEMANTIC_ENABLED || '1') !== '0';
+const NOTS_SEMANTIC_MODEL = process.env.NOTS_SEMANTIC_MODEL || 'gpt-5.2';
+const NOTS_SEMANTIC_MODEL_FALLBACKS = String(process.env.NOTS_SEMANTIC_MODEL_FALLBACKS || 'gpt-5.2,gpt-5')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
+const NOTS_SEMANTIC_TEMPERATURE = Number(process.env.NOTS_SEMANTIC_TEMPERATURE || '0');
+const NOTS_SEMANTIC_MAX_TOKENS = Number(process.env.NOTS_SEMANTIC_MAX_TOKENS || '600');
+const NOTS_SEMANTIC_TIMEOUT_MS = Number(process.env.NOTS_SEMANTIC_TIMEOUT_MS || '25000');
+const NOTS_SEMANTIC_DICTIONARY_PATH = process.env.NOTS_SEMANTIC_DICTIONARY_PATH || path.resolve(process.cwd(), 'NOTS_SEMANTIC_DICTIONARY.md');
 
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || '';
 const SHEET_URL = process.env.SHEET_URL || '';
@@ -53,6 +72,287 @@ function loadVocabulary() {
   }
 }
 
+function loadSemanticDictionaryText() {
+  try {
+    if (!fs.existsSync(NOTS_SEMANTIC_DICTIONARY_PATH)) {
+      return '';
+    }
+    return fs.readFileSync(NOTS_SEMANTIC_DICTIONARY_PATH, 'utf8');
+  } catch (error) {
+    console.error(`Semantic dictionary load error (${NOTS_SEMANTIC_DICTIONARY_PATH}):`, error.message);
+    return '';
+  }
+}
+
+function buildSemanticPromptPayload(transcript, vocabulary, semanticDictionaryText) {
+  const textAliases = Object.entries(vocabulary.textAliases || {})
+    .slice(0, 240)
+    .map(([spoken, target]) => ({ spoken, target }));
+  const streetAliases = Object.entries(vocabulary.streetAliases || {})
+    .slice(0, 120)
+    .map(([spoken, target]) => ({ spoken, target }));
+
+  return {
+    task: 'Convert free-form poker dictation into canonical nots fields.',
+    transcript,
+    canonical_rules: [
+      'Return only JSON.',
+      'Keys must be exactly: preflop, flop, turn, river, presupposition, confidence, unresolved.',
+      'Use concise poker shorthand in the style from dictionary and aliases.',
+      'Do not invent facts not present in transcript.',
+      'If uncertain, leave field empty and add short notes into unresolved.',
+      'Interpret details according to dictionary_markdown first.'
+    ],
+    dictionary_markdown: semanticDictionaryText || '',
+    vocab_street_aliases: streetAliases,
+    vocab_text_aliases: textAliases
+  };
+}
+
+function buildSemanticFieldPromptPayload(transcript, field, vocabulary, semanticDictionaryText) {
+  const textAliases = Object.entries(vocabulary.textAliases || {})
+    .slice(0, 240)
+    .map(([spoken, target]) => ({ spoken, target }));
+  const streetAliases = Object.entries(vocabulary.streetAliases || {})
+    .slice(0, 120)
+    .map(([spoken, target]) => ({ spoken, target }));
+
+  return {
+    task: 'Convert free-form poker dictation into canonical nots value for one target field.',
+    target_field: field,
+    transcript,
+    output_contract: {
+      value: 'string',
+      confidence: 'number 0..1',
+      unresolved: 'string[]'
+    },
+    canonical_rules: [
+      'Return only JSON with keys: value, confidence, unresolved.',
+      'Use concise poker shorthand in the style from dictionary and aliases.',
+      'Do not invent facts not present in transcript.',
+      'If unsure, return empty value and explain briefly in unresolved.',
+      'Interpret details according to dictionary_markdown first.'
+    ],
+    dictionary_markdown: semanticDictionaryText || '',
+    vocab_street_aliases: streetAliases,
+    vocab_text_aliases: textAliases
+  };
+}
+
+function extractChatCompletionText(data) {
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .join('\n')
+      .trim();
+  }
+  return '';
+}
+
+async function callSemanticCompletion(messages, model, useJsonFormat = true) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(1000, NOTS_SEMANTIC_TIMEOUT_MS));
+
+  const body = {
+    model,
+    temperature: Number.isFinite(NOTS_SEMANTIC_TEMPERATURE) ? NOTS_SEMANTIC_TEMPERATURE : 0,
+    messages
+  };
+  if (Number.isFinite(NOTS_SEMANTIC_MAX_TOKENS) && NOTS_SEMANTIC_MAX_TOKENS > 0) {
+    body.max_completion_tokens = Math.trunc(NOTS_SEMANTIC_MAX_TOKENS);
+  }
+  if (useJsonFormat) {
+    body.response_format = { type: 'json_object' };
+  }
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (error) {
+      throw new Error(`Semantic completion returned non-JSON response: ${text.slice(0, 220)}`);
+    }
+
+    if (!response.ok) {
+      const message = data?.error?.message || `Semantic completion failed (${response.status}).`;
+      const err = new Error(message);
+      err.status = response.status;
+      throw err;
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isUnsupportedResponseFormatError(error) {
+  const message = String(error?.message || '');
+  return /response_format|json_object|unsupported/i.test(message);
+}
+
+function isModelUnavailableError(error) {
+  const status = Number(error?.status);
+  const message = String(error?.message || '').toLowerCase();
+  if (status === 403 || status === 404) {
+    return true;
+  }
+  return /model|not found|does not exist|unsupported model|permission|access|not available/.test(message);
+}
+
+async function parseTranscriptSemantic(transcript, vocabulary) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY не задан для semantic parser.');
+  }
+
+  const semanticDictionaryText = loadSemanticDictionaryText();
+  const payload = buildSemanticPromptPayload(transcript, vocabulary, semanticDictionaryText);
+  const messages = [
+    {
+      role: 'system',
+      content: 'You are a poker nots semantic parser. Return strict JSON only.'
+    },
+    {
+      role: 'user',
+      content: JSON.stringify(payload)
+    }
+  ];
+
+  const candidateModels = Array.from(new Set([NOTS_SEMANTIC_MODEL, ...NOTS_SEMANTIC_MODEL_FALLBACKS]));
+  let lastModelError = null;
+
+  for (const model of candidateModels) {
+    let completion;
+    try {
+      try {
+        completion = await callSemanticCompletion(messages, model, true);
+      } catch (error) {
+        if (isUnsupportedResponseFormatError(error)) {
+          completion = await callSemanticCompletion(messages, model, false);
+        } else {
+          throw error;
+        }
+      }
+
+      const content = extractChatCompletionText(completion);
+      const rawObj = parseSemanticModelContent(content);
+      const coerced = coerceSemanticResult(rawObj);
+      const parsed = normalizeSemanticParsed(coerced.parsed, vocabulary);
+
+      return {
+        parsed,
+        confidence: coerced.confidence,
+        unresolved: coerced.unresolved,
+        modelUsed: model
+      };
+    } catch (error) {
+      if (isModelUnavailableError(error)) {
+        lastModelError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  const tried = candidateModels.join(', ');
+  const detail = lastModelError ? ` Last error: ${lastModelError.message}` : '';
+  throw new Error(`No semantic model available. Tried: ${tried}.${detail}`);
+}
+
+function coerceSemanticFieldResult(raw) {
+  const rawObj = raw && typeof raw === 'object' ? raw : {};
+  const value = typeof rawObj.value === 'string' ? rawObj.value.trim() : '';
+  const confidenceRaw = Number(rawObj.confidence);
+  const confidence = Number.isFinite(confidenceRaw)
+    ? Math.max(0, Math.min(1, confidenceRaw))
+    : null;
+  const unresolved = Array.isArray(rawObj.unresolved)
+    ? rawObj.unresolved
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .slice(0, 50)
+    : [];
+  return { value, confidence, unresolved };
+}
+
+async function parseFieldSemantic(transcript, field, vocabulary) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY не задан для semantic parser.');
+  }
+
+  const semanticDictionaryText = loadSemanticDictionaryText();
+  const payload = buildSemanticFieldPromptPayload(transcript, field, vocabulary, semanticDictionaryText);
+  const messages = [
+    {
+      role: 'system',
+      content: 'You are a poker nots semantic parser. Return strict JSON only.'
+    },
+    {
+      role: 'user',
+      content: JSON.stringify(payload)
+    }
+  ];
+
+  const candidateModels = Array.from(new Set([NOTS_SEMANTIC_MODEL, ...NOTS_SEMANTIC_MODEL_FALLBACKS]));
+  let lastModelError = null;
+
+  for (const model of candidateModels) {
+    let completion;
+    try {
+      try {
+        completion = await callSemanticCompletion(messages, model, true);
+      } catch (error) {
+        if (isUnsupportedResponseFormatError(error)) {
+          completion = await callSemanticCompletion(messages, model, false);
+        } else {
+          throw error;
+        }
+      }
+
+      const content = extractChatCompletionText(completion);
+      const rawObj = parseSemanticModelContent(content);
+      const coerced = coerceSemanticFieldResult(rawObj);
+      const value = normalizeSemanticFieldValue(coerced.value, vocabulary);
+
+      return {
+        value,
+        confidence: coerced.confidence,
+        unresolved: coerced.unresolved,
+        modelUsed: model
+      };
+    } catch (error) {
+      if (isModelUnavailableError(error)) {
+        lastModelError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  const tried = candidateModels.join(', ');
+  const detail = lastModelError ? ` Last error: ${lastModelError.message}` : '';
+  throw new Error(`No semantic model available. Tried: ${tried}.${detail}`);
+}
+
 async function transcribeAudio(buffer, filename, mimetype) {
   if (!OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY не задан.');
@@ -62,7 +362,9 @@ async function transcribeAudio(buffer, filename, mimetype) {
   const blob = new Blob([buffer], { type: mimetype || 'audio/webm' });
   form.append('file', blob, filename || 'audio.webm');
   form.append('model', OPENAI_MODEL);
-  form.append('language', OPENAI_LANGUAGE);
+  if (OPENAI_LANGUAGE) {
+    form.append('language', OPENAI_LANGUAGE);
+  }
   if (OPENAI_PROMPT) {
     form.append('prompt', OPENAI_PROMPT);
   }
@@ -231,10 +533,30 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
 
     const transcript = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
     const vocabulary = loadVocabulary();
-    const { parsed, error } = parseTranscript(transcript, vocabulary, { spellingMode: SPELLING_MODE });
+    const ruleResult = parseTranscript(transcript, vocabulary, { spellingMode: SPELLING_MODE });
+    let semanticResult = { parsed: emptyParsedFields(), confidence: null, unresolved: [], modelUsed: null };
+    let semanticError = '';
 
-    if (error) {
-      return res.status(422).json({ error, transcript });
+    if (NOTS_SEMANTIC_ENABLED) {
+      try {
+        semanticResult = await parseTranscriptSemantic(transcript, vocabulary);
+      } catch (error) {
+        semanticError = error.message || 'Ошибка semantic parser.';
+      }
+    }
+
+    let parsed = emptyParsedFields();
+    let parserSource = 'rules';
+
+    if (hasAnyParsedField(semanticResult.parsed)) {
+      parsed = mergeParsedFields(semanticResult.parsed, ruleResult.parsed || {});
+      parserSource = 'semantic_llm';
+    } else if (!ruleResult.error) {
+      parsed = ruleResult.parsed;
+      parserSource = 'rules';
+    } else {
+      const detail = semanticError ? ` Semantic parser: ${semanticError}` : '';
+      return res.status(422).json({ error: `${ruleResult.error}${detail}`, transcript });
     }
 
     const payload = {
@@ -256,7 +578,14 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
       ok: true,
       transcript,
       parsed,
-      row: sheetsResult?.row || null
+      row: sheetsResult?.row || null,
+      parser: {
+        source: parserSource,
+        model: semanticResult.modelUsed,
+        confidence: semanticResult.confidence,
+        unresolved: semanticResult.unresolved,
+        semanticError: semanticError || null
+      }
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
@@ -287,10 +616,23 @@ app.post('/api/record-field', upload.single('audio'), async (req, res) => {
 
     const transcript = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
     const vocabulary = loadVocabulary();
-    const value = normalizeFieldContent(transcript, vocabulary, { spellingMode: SPELLING_MODE });
+    let semanticError = '';
+    let semanticResult = { value: '', confidence: null, unresolved: [], modelUsed: null };
+
+    if (NOTS_SEMANTIC_ENABLED) {
+      try {
+        semanticResult = await parseFieldSemantic(transcript, field, vocabulary);
+      } catch (error) {
+        semanticError = error.message || 'Ошибка semantic parser.';
+      }
+    }
+
+    const parserSource = semanticResult.value ? 'semantic_llm' : 'rules';
+    const value = semanticResult.value || normalizeFieldContent(transcript, vocabulary, { spellingMode: SPELLING_MODE });
 
     if (!value) {
-      return res.status(422).json({ error: 'Не удалось распознать текст для выбранного поля.', transcript });
+      const detail = semanticError ? ` Semantic parser: ${semanticError}` : '';
+      return res.status(422).json({ error: `Не удалось распознать текст для выбранного поля.${detail}`, transcript });
     }
 
     const sheetsResult = await postToSheets({
@@ -311,7 +653,14 @@ app.post('/api/record-field', upload.single('audio'), async (req, res) => {
       transcript,
       row,
       field,
-      value
+      value,
+      parser: {
+        source: parserSource,
+        model: semanticResult.modelUsed,
+        confidence: semanticResult.confidence,
+        unresolved: semanticResult.unresolved,
+        semanticError: semanticError || null
+      }
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
@@ -364,7 +713,8 @@ app.post('/api/update-field-text', async (req, res) => {
 
 const server = app.listen(port, host, () => {
   console.log(`Poker Voice Logger: http://${host}:${port}`);
-  console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
+  console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE || 'auto'} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
+  console.log(`Semantic parser: ${NOTS_SEMANTIC_ENABLED ? 'on' : 'off'} primary=${NOTS_SEMANTIC_MODEL} fallbacks=[${NOTS_SEMANTIC_MODEL_FALLBACKS.join(', ')}] dict=${NOTS_SEMANTIC_DICTIONARY_PATH}`);
 });
 
 server.on('error', (error) => {

@@ -21,8 +21,12 @@ cp .env.example .env
 
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL` (рекомендуется `gpt-4o-transcribe`)
-- `OPENAI_LANGUAGE` (`en` для англ. токенов)
+- `OPENAI_LANGUAGE` (оставь пустым для автоопределения mixed RU/EN)
 - `OPENAI_PROMPT` (инструкция для ASR на ASCII/шорткоды)
+- `NOTS_SEMANTIC_ENABLED` (`1` чтобы включить LLM-семантику после STT)
+- `NOTS_SEMANTIC_MODEL` (primary, например `gpt-5.3`)
+- `NOTS_SEMANTIC_MODEL_FALLBACKS` (через запятую, например `gpt-5.2,gpt-5`)
+- `NOTS_SEMANTIC_DICTIONARY_PATH` (путь до semantic-словаря)
 - `SHEETS_WEBHOOK_URL` (если используешь Apps Script)
 - `SHEET_URL` (ссылка на таблицу вида `https://docs.google.com/spreadsheets/d/.../edit`, нужна для кнопки `Открыть`)
 - `SHEET_NAME` (опционально, если лист не активный)
@@ -46,8 +50,8 @@ npm run verify
 ```
 
 Что проверяется:
-- синтаксис `server.js`, `public/app.js`, `src/core.js`
-- unit-тесты парсера и генерации ссылок (`tests/core.test.js`)
+- синтаксис `server.js`, `public/app.js`, `src/core.js`, `src/semantic.js`
+- unit-тесты парсера и semantic-утилит (`tests/core.test.js`, `tests/semantic.test.js`)
 
 Если порт занят, можно поменять в `.env`:
 
@@ -78,6 +82,22 @@ HOST=127.0.0.1
 - Presupposition идёт в той же записи после улиц.
 
 Пример: `флоп 33 + 2x trib, терн xr100, ривер ф1 vs75, пресуппозиция reago vsmy rcb`.
+
+## Семантический режим (свободная диктовка)
+
+Теперь в `/api/record` есть 2 этапа:
+
+1. STT: аудио -> текст.
+2. Semantic LLM parser: текст -> `preflop/flop/turn/river/presupposition`.
+
+Если LLM-парсер выключен или не дал валидный результат, сервер делает fallback на старый маркерный парсер (`флоп/терн/ривер/...`).
+
+Если primary-модель недоступна в API-аккаунте, сервер автоматически пробует модели из `NOTS_SEMANTIC_MODEL_FALLBACKS`.
+
+Semantic-словарь хранится в:
+- `/Users/parisianreflect/Documents/codex/poker-voice/NOTS_SEMANTIC_DICTIONARY.md`
+
+Этот файл используется как знание для конвертации свободной речи в каноничный формат `nots`.
 
 ## Пользовательский словарь
 
