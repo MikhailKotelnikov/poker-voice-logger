@@ -10,10 +10,13 @@ import {
   removeAllDashes,
   applySpellingModeText,
   applyTextAliases,
+  applySpellingAliases,
   BUILTIN_MIXED_LANGUAGE_ALIASES,
   buildSheetRangeUrl,
   normalizeMixedLanguageText,
   normalizeVocabulary,
+  canonicalizeAceRankCase,
+  normalizeFieldContent,
   parseTranscript
 } from '../src/core.js';
 
@@ -49,10 +52,10 @@ test('parseTranscript maps street aliases to correct fields', () => {
 
   assert.equal(error, null);
   assert.equal(parsed.preflop, 'b');
-  assert.equal(parsed.flop, 'bb 33');
+  assert.equal(parsed.flop, 'bb33');
   assert.equal(parsed.turn, 'agro');
   assert.equal(parsed.river, 'i');
-  assert.equal(parsed.presupposition, 'l1');
+  assert.equal(parsed.presupposition, 'L');
 });
 
 test('parseTranscript supports noisy presupposition marker variants', () => {
@@ -106,6 +109,11 @@ test('removeNonDecimalDots keeps only decimal points', () => {
 test('normalizeOutputPunctuation combines dash and dot cleanup', () => {
   const input = '0.16 3-3 combo. ai.';
   assert.equal(normalizeOutputPunctuation(input), '0.16 33 combo ai');
+});
+
+test('canonicalizeAceRankCase keeps lowercase canon except Ace rank', () => {
+  const input = 'a72 aa_nfd ak_run_ts ona72 agro ai 75';
+  assert.equal(canonicalizeAceRankCase(input), 'A72 AA_nfd Ak_run_ts onA72 agro ai 75');
 });
 
 test('parseTranscript returns explicit error when no street markers', () => {
@@ -176,6 +184,64 @@ test('project vocab maps t-prod tprob rprob to/plyus/pair and this-is->vs', () =
   assert.match(normalized, /\+\s+vs me\s+vs cap/i);
 });
 
+test('project vocab maps new spelling aliases for naked/mp/oe/fd/wrap', () => {
+  const testDir = path.dirname(fileURLToPath(import.meta.url));
+  const raw = JSON.parse(fs.readFileSync(path.join(testDir, '..', 'vocab.json'), 'utf8'));
+  const vocabFromFile = normalizeVocabulary(raw);
+
+  const spoken = 'middle pair open ended straight draw naked flush draw рэп';
+  const normalized = applyTextAliases(spoken, vocabFromFile.textAliases);
+
+  assert.match(normalized, /\bmp\b/i);
+  assert.match(normalized, /\boe\b/i);
+  assert.match(normalized, /\bnaked\b/i);
+  assert.match(normalized, /\bfd\b/i);
+  assert.match(normalized, /\bwrap\b/i);
+});
+
+test('spelling aliases normalize topfull xr_ai and time-bank suffix', () => {
+  const testDir = path.dirname(fileURLToPath(import.meta.url));
+  const raw = JSON.parse(fs.readFileSync(path.join(testDir, '..', 'vocab.json'), 'utf8'));
+  const vocabFromFile = normalizeVocabulary(raw);
+
+  const spoken = 'топ-фул и check raise all-in 0.5 тайм-банк';
+  const bySpelling = applySpellingAliases(spoken, vocabFromFile.spellingAliases);
+  assert.match(bySpelling, /\btopfull\b/i);
+  assert.match(bySpelling, /\bxr_ai\b/i);
+
+  const normalizedField = normalizeFieldContent(spoken, vocabFromFile);
+  assert.match(normalizedField, /\btopfull\b/);
+  assert.match(normalizedField, /\bxr_ai\b/);
+  assert.match(normalizedField, /\b0\.5tb\b/);
+});
+
+test('normalizeFieldContent wraps gc markers and canonicalizes on_str_turn', () => {
+  const testDir = path.dirname(fileURLToPath(import.meta.url));
+  const raw = JSON.parse(fs.readFileSync(path.join(testDir, '..', 'vocab.json'), 'utf8'));
+  const vocabFromFile = normalizeVocabulary(raw);
+  const line = normalizeFieldContent('he 0t check on_str_turn / i b / he gc++', vocabFromFile);
+  assert.match(line, /\bonStrTurn\b/);
+  assert.match(line, /\bhe \[gc\+\+\]/);
+});
+
+test('normalizeFieldContent keeps sizedown and nuts as separate tokens and canonicalizes l marker', () => {
+  const testDir = path.dirname(fileURLToPath(import.meta.url));
+  const raw = JSON.parse(fs.readFileSync(path.join(testDir, '..', 'vocab.json'), 'utf8'));
+  const vocabFromFile = normalizeVocabulary(raw);
+
+  const line = normalizeFieldContent('size down nuts and i tp33 l 4w onflush / he r100', vocabFromFile);
+  assert.match(line, /\bsizedown nuts\b/);
+  assert.match(line, /\bi tp33 L 4w onflush \/ he r100\b/);
+});
+
+test('spelling aliases normalize honest split marker', () => {
+  const testDir = path.dirname(fileURLToPath(import.meta.url));
+  const raw = JSON.parse(fs.readFileSync(path.join(testDir, '..', 'vocab.json'), 'utf8'));
+  const vocabFromFile = normalizeVocabulary(raw);
+  const line = normalizeFieldContent('[honest split] [честный сплит]', vocabFromFile);
+  assert.match(line, /\[honest_split\] \[honest_split\]/);
+});
+
 test('project vocab maps pilot ru codewords to poker shorthand', () => {
   const testDir = path.dirname(fileURLToPath(import.meta.url));
   const raw = JSON.parse(fs.readFileSync(path.join(testDir, '..', 'vocab.json'), 'utf8'));
@@ -200,8 +266,8 @@ test('parseTranscript recognizes spaced street markers and press marker', () => 
   const transcript = 'f l o p xr 100, t u r n tp 75, r i v e r bb 100, press vs me vs cap';
   const { parsed, error } = parseTranscript(transcript, vocabulary);
   assert.equal(error, null);
-  assert.equal(parsed.flop, 'xr 100');
-  assert.equal(parsed.turn, 'tp 75');
-  assert.equal(parsed.river, 'bb 100');
+  assert.equal(parsed.flop, 'xr100');
+  assert.equal(parsed.turn, 'tp75');
+  assert.equal(parsed.river, 'bb100');
   assert.equal(parsed.presupposition, 'vs me vs cap');
 });

@@ -20,6 +20,16 @@ import {
   normalizeSemanticParsed,
   parseSemanticModelContent
 } from './src/semantic.js';
+import {
+  appendReportJsonl,
+  createReportRecord
+} from './src/reports.js';
+import {
+  buildHandHistoryContext,
+  canonicalizeHandHistoryUnits,
+  enrichHandHistoryParsed,
+  parseHandHistory
+} from './src/handHistory.js';
 
 dotenv.config();
 
@@ -57,6 +67,7 @@ const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || '';
 const SHEET_URL = process.env.SHEET_URL || '';
 const SHEET_NAME = process.env.SHEET_NAME || '';
 const VOCAB_PATH = process.env.VOCAB_PATH || path.resolve(process.cwd(), 'vocab.json');
+const REPORTS_PATH = process.env.REPORTS_PATH || path.resolve(process.cwd(), 'reports', 'nots_reports.jsonl');
 const FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
 
 function loadVocabulary() {
@@ -88,6 +99,9 @@ function buildSemanticPromptPayload(transcript, vocabulary, semanticDictionaryTe
   const textAliases = Object.entries(vocabulary.textAliases || {})
     .slice(0, 240)
     .map(([spoken, target]) => ({ spoken, target }));
+  const spellingAliases = Object.entries(vocabulary.spellingAliases || {})
+    .slice(0, 400)
+    .map(([spoken, target]) => ({ spoken, target }));
   const streetAliases = Object.entries(vocabulary.streetAliases || {})
     .slice(0, 120)
     .map(([spoken, target]) => ({ spoken, target }));
@@ -105,13 +119,17 @@ function buildSemanticPromptPayload(transcript, vocabulary, semanticDictionaryTe
     ],
     dictionary_markdown: semanticDictionaryText || '',
     vocab_street_aliases: streetAliases,
-    vocab_text_aliases: textAliases
+    vocab_text_aliases: textAliases,
+    vocab_spelling_aliases: spellingAliases
   };
 }
 
 function buildSemanticFieldPromptPayload(transcript, field, vocabulary, semanticDictionaryText) {
   const textAliases = Object.entries(vocabulary.textAliases || {})
     .slice(0, 240)
+    .map(([spoken, target]) => ({ spoken, target }));
+  const spellingAliases = Object.entries(vocabulary.spellingAliases || {})
+    .slice(0, 400)
     .map(([spoken, target]) => ({ spoken, target }));
   const streetAliases = Object.entries(vocabulary.streetAliases || {})
     .slice(0, 120)
@@ -135,7 +153,55 @@ function buildSemanticFieldPromptPayload(transcript, field, vocabulary, semantic
     ],
     dictionary_markdown: semanticDictionaryText || '',
     vocab_street_aliases: streetAliases,
-    vocab_text_aliases: textAliases
+    vocab_text_aliases: textAliases,
+    vocab_spelling_aliases: spellingAliases
+  };
+}
+
+function extractTargetIdHint(opponent) {
+  const match = String(opponent || '').match(/\d{4,}/g);
+  if (!match || !match.length) {
+    return '';
+  }
+  return match[match.length - 1];
+}
+
+function buildHandHistoryPromptPayload(handHistory, opponent, parsedContext, vocabulary, semanticDictionaryText) {
+  const textAliases = Object.entries(vocabulary.textAliases || {})
+    .slice(0, 240)
+    .map(([spoken, target]) => ({ spoken, target }));
+  const spellingAliases = Object.entries(vocabulary.spellingAliases || {})
+    .slice(0, 400)
+    .map(([spoken, target]) => ({ spoken, target }));
+  const streetAliases = Object.entries(vocabulary.streetAliases || {})
+    .slice(0, 120)
+    .map(([spoken, target]) => ({ spoken, target }));
+
+  return {
+    task: 'Convert poker hand history into canonical nots fields for one selected opponent.',
+    target_opponent: opponent,
+    target_id_hint: extractTargetIdHint(opponent),
+    hand_history: String(handHistory || '').slice(0, 120000),
+    canonical_rules: [
+      'Return only JSON.',
+      'Keys must be exactly: preflop, flop, turn, river, presupposition, confidence, unresolved.',
+      'Focus on selected target opponent actions and opponent reactions.',
+      'Do NOT use actor markers i/he in output.',
+      'Preflop sizings must be in BB units.',
+      'Postflop bets/raises must be in %pot units when possible.',
+      'Use board cards and showdown cards to infer hand class per street (flop/turn/river) for target and main shown opponent.',
+      'If showdown cards exist, include concrete shown cards in output (prefer river field).',
+      'Use concise poker shorthand in the style from dictionary and aliases.',
+      'Do not invent facts not present in hand history.',
+      'Use showed only for voluntary reveal before mandatory showdown. For mandatory showdown use sd token and cards.',
+      'If uncertain, leave field empty and add short notes into unresolved.',
+      'Interpret details according to dictionary_markdown first.'
+    ],
+    parsed_context: parsedContext || '',
+    dictionary_markdown: semanticDictionaryText || '',
+    vocab_street_aliases: streetAliases,
+    vocab_text_aliases: textAliases,
+    vocab_spelling_aliases: spellingAliases
   };
 }
 
@@ -351,6 +417,77 @@ async function parseFieldSemantic(transcript, field, vocabulary) {
   const tried = candidateModels.join(', ');
   const detail = lastModelError ? ` Last error: ${lastModelError.message}` : '';
   throw new Error(`No semantic model available. Tried: ${tried}.${detail}`);
+}
+
+async function parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY не задан для semantic parser.');
+  }
+
+  const semanticDictionaryText = loadSemanticDictionaryText();
+  const payload = buildHandHistoryPromptPayload(handHistory, opponent, parsedContext, vocabulary, semanticDictionaryText);
+  const messages = [
+    {
+      role: 'system',
+      content: 'You are a poker hand-history semantic parser. Return strict JSON only.'
+    },
+    {
+      role: 'user',
+      content: JSON.stringify(payload)
+    }
+  ];
+
+  const candidateModels = Array.from(new Set([NOTS_SEMANTIC_MODEL, ...NOTS_SEMANTIC_MODEL_FALLBACKS]));
+  let lastModelError = null;
+
+  for (const model of candidateModels) {
+    let completion;
+    try {
+      try {
+        completion = await callSemanticCompletion(messages, model, true);
+      } catch (error) {
+        if (isUnsupportedResponseFormatError(error)) {
+          completion = await callSemanticCompletion(messages, model, false);
+        } else {
+          throw error;
+        }
+      }
+
+      const content = extractChatCompletionText(completion);
+      const rawObj = parseSemanticModelContent(content);
+      const coerced = coerceSemanticResult(rawObj);
+      const parsed = normalizeSemanticParsed(coerced.parsed, vocabulary);
+
+      return {
+        parsed,
+        confidence: coerced.confidence,
+        unresolved: coerced.unresolved,
+        modelUsed: model
+      };
+    } catch (error) {
+      if (isModelUnavailableError(error)) {
+        lastModelError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  const tried = candidateModels.join(', ');
+  const detail = lastModelError ? ` Last error: ${lastModelError.message}` : '';
+  throw new Error(`No semantic model available. Tried: ${tried}.${detail}`);
+}
+
+function normalizeHandHistoryParsed(rawParsed, vocabulary) {
+  const parsed = normalizeSemanticParsed(rawParsed, vocabulary);
+  for (const key of Object.keys(parsed)) {
+    const segments = String(parsed[key] || '')
+      .split('/')
+      .map((segment) => segment.trim().replace(/^(?:i|he)\s+/i, '').trim())
+      .filter(Boolean);
+    parsed[key] = segments.join(' / ');
+  }
+  return parsed;
 }
 
 async function transcribeAudio(buffer, filename, mimetype) {
@@ -592,6 +729,87 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
   }
 });
 
+app.post('/api/record-hand-history', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    const handHistory = String(req.body?.handHistory || '').trim();
+
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран оппонент.' });
+    }
+    if (!handHistory) {
+      return res.status(400).json({ error: 'Hand history пустая.' });
+    }
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    }
+    if (!NOTS_SEMANTIC_ENABLED) {
+      return res.status(400).json({ error: 'Для hand history нужен semantic parser (NOTS_SEMANTIC_ENABLED=1).' });
+    }
+
+    const vocabulary = loadVocabulary();
+    const parsedHH = parseHandHistory(handHistory, opponent);
+    const parsedContext = buildHandHistoryContext(parsedHH);
+
+    if (!parsedHH.targetPlayer) {
+      return res.status(422).json({
+        error: 'Не удалось определить выбранного игрока в hand history. Выбери оппонента с ID из HH.',
+        transcript: handHistory
+      });
+    }
+
+    const semanticResult = await parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary);
+
+    let parsed = normalizeHandHistoryParsed(semanticResult.parsed, vocabulary);
+    parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
+    parsed = enrichHandHistoryParsed(parsed, parsedHH);
+
+    if (!hasAnyParsedField(parsed)) {
+      return res.status(422).json({
+        error: 'Не удалось извлечь структуру раздачи из hand history.',
+        transcript: handHistory,
+        parser: {
+          source: 'semantic_llm',
+          model: semanticResult.modelUsed,
+          confidence: semanticResult.confidence,
+          unresolved: semanticResult.unresolved,
+          semanticError: null
+        }
+      });
+    }
+
+    const sheetsResult = await postToSheets({
+      opponent,
+      preflop: parsed.preflop,
+      flop: parsed.flop,
+      turn: parsed.turn,
+      river: parsed.river,
+      presupposition: parsed.presupposition,
+      sheetName: SHEET_NAME || undefined
+    });
+
+    if (sheetsResult?.ok === false) {
+      throw new Error(sheetsResult.error || 'Apps Script вернул ошибку.');
+    }
+
+    return res.json({
+      ok: true,
+      transcript: handHistory,
+      parsed,
+      row: sheetsResult?.row || null,
+      parser: {
+        source: 'semantic_llm',
+        model: semanticResult.modelUsed,
+        confidence: semanticResult.confidence,
+        unresolved: [...(semanticResult.unresolved || []), `target_player=${parsedHH.targetPlayer}`],
+        semanticError: null
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка разбора hand history.' });
+  }
+});
+
 app.post('/api/record-field', upload.single('audio'), async (req, res) => {
   try {
     const opponent = String(req.body.opponent || '').trim();
@@ -711,10 +929,26 @@ app.post('/api/update-field-text', async (req, res) => {
   }
 });
 
+app.post('/api/save-report', async (req, res) => {
+  try {
+    const report = createReportRecord(req.body || {});
+    const result = appendReportJsonl(REPORTS_PATH, report);
+    return res.json({
+      ok: true,
+      id: report.id,
+      path: result.path,
+      savedAt: report.savedAt
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'Не удалось сохранить report.' });
+  }
+});
+
 const server = app.listen(port, host, () => {
   console.log(`Poker Voice Logger: http://${host}:${port}`);
   console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE || 'auto'} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
   console.log(`Semantic parser: ${NOTS_SEMANTIC_ENABLED ? 'on' : 'off'} primary=${NOTS_SEMANTIC_MODEL} fallbacks=[${NOTS_SEMANTIC_MODEL_FALLBACKS.join(', ')}] dict=${NOTS_SEMANTIC_DICTIONARY_PATH}`);
+  console.log(`Reports path: ${REPORTS_PATH}`);
 });
 
 server.on('error', (error) => {

@@ -7,8 +7,13 @@ const activeOpponentEl = document.getElementById('active-opponent');
 const recordStatusEl = document.getElementById('record-status');
 const recordHint = document.getElementById('record-hint');
 const stopRecordBtn = document.getElementById('stop-record');
+const handHistoryInput = document.getElementById('hand-history-input');
+const submitHandHistoryBtn = document.getElementById('submit-hand-history');
+const clearHandHistoryBtn = document.getElementById('clear-hand-history');
+const hhOpponentList = document.getElementById('hh-opponent-list');
 const transcriptEl = document.getElementById('transcript');
 const parsedEl = document.getElementById('parsed-fields');
+const saveReportBtn = document.getElementById('save-report');
 const statusEl = document.getElementById('status');
 
 const STORAGE_KEY = 'pokerVoiceOpponents';
@@ -31,6 +36,8 @@ let lastParsed = {
 let lastSavedRow = null;
 let opponentIndexLoaded = false;
 let suggestionsRequestId = 0;
+let lastTranscript = '';
+let reportDraft = null;
 
 function loadOpponents() {
   try {
@@ -62,10 +69,33 @@ function emptyParsedFields() {
   };
 }
 
+function createSessionId() {
+  return `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cloneParsedFields(source = {}) {
+  const out = emptyParsedFields();
+  PARSED_FIELDS.forEach((field) => {
+    out[field] = String(source[field] || '');
+  });
+  return out;
+}
+
+function canSaveReport() {
+  return Boolean(
+    reportDraft
+    && reportDraft.opponent
+    && (reportDraft.row || lastSavedRow)
+    && !(mediaRecorder && mediaRecorder.state === 'recording')
+  );
+}
+
 function resetCurrentSelection() {
   activeOpponent = '';
   lastSavedRow = null;
   lastParsed = emptyParsedFields();
+  lastTranscript = '';
+  reportDraft = null;
   transcriptEl.textContent = '—';
 }
 
@@ -176,6 +206,39 @@ function renderOpponents() {
   renderOpponentSuggestions(opponentInput.value);
 }
 
+function renderHandHistoryOpponents() {
+  if (!hhOpponentList) return;
+  hhOpponentList.innerHTML = '';
+
+  if (!opponents.length) {
+    const empty = document.createElement('div');
+    empty.className = 'hh-opponent-empty';
+    empty.textContent = 'Нет активных оппонентов. Добавь никнейм выше.';
+    hhOpponentList.appendChild(empty);
+    return;
+  }
+
+  opponents.forEach((name) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'hh-opponent-btn';
+    btn.textContent = name;
+    if (name === activeOpponent) {
+      btn.classList.add('active');
+    }
+    btn.addEventListener('click', () => {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        setStatus('Сначала останови текущую запись.', 'error');
+        return;
+      }
+      activeOpponent = name;
+      updateRecordUI();
+      setStatus(`Целевой оппонент для HH: ${name}`, 'ok');
+    });
+    hhOpponentList.appendChild(btn);
+  });
+}
+
 function updateRecordUI() {
   activeOpponentEl.textContent = activeOpponent || '—';
   if (mediaRecorder && mediaRecorder.state === 'recording') {
@@ -189,7 +252,19 @@ function updateRecordUI() {
     recordHint.textContent = activeOpponent ? 'готов к записи' : 'нет выбранного оппа';
     stopRecordBtn.disabled = true;
   }
+  if (saveReportBtn) {
+    saveReportBtn.disabled = !canSaveReport();
+  }
+  if (submitHandHistoryBtn) {
+    const hasText = Boolean(handHistoryInput && handHistoryInput.value.trim());
+    submitHandHistoryBtn.disabled = !activeOpponent || !hasText || (mediaRecorder && mediaRecorder.state === 'recording');
+  }
+  if (clearHandHistoryBtn) {
+    const hasText = Boolean(handHistoryInput && handHistoryInput.value.trim());
+    clearHandHistoryBtn.disabled = !hasText || (mediaRecorder && mediaRecorder.state === 'recording');
+  }
   renderOpponents();
+  renderHandHistoryOpponents();
   renderParsed(lastParsed);
 }
 
@@ -249,6 +324,9 @@ function clearActiveOpponents() {
 
 addOpponentBtn.addEventListener('click', addOpponent);
 clearOpponentsBtn.addEventListener('click', clearActiveOpponents);
+if (saveReportBtn) {
+  saveReportBtn.addEventListener('click', saveReport);
+}
 opponentInput.addEventListener('focus', () => {
   if (!opponentInput.value.trim()) {
     renderOpponentSuggestions('');
@@ -273,6 +351,22 @@ stopRecordBtn.addEventListener('click', () => {
     mediaRecorder.stop();
   }
 });
+if (submitHandHistoryBtn) {
+  submitHandHistoryBtn.addEventListener('click', submitHandHistory);
+}
+if (clearHandHistoryBtn) {
+  clearHandHistoryBtn.addEventListener('click', () => {
+    if (handHistoryInput) {
+      handHistoryInput.value = '';
+    }
+    updateRecordUI();
+  });
+}
+if (handHistoryInput) {
+  handHistoryInput.addEventListener('input', () => {
+    updateRecordUI();
+  });
+}
 
 async function startRecording(mode = 'main', field = '') {
   if (!activeOpponent) return;
@@ -318,6 +412,10 @@ async function sendRecording(mode = 'main', field = '') {
     return;
   }
 
+  const previousFieldValue = mode === 'field'
+    ? String((lastParsed && typeof lastParsed === 'object' && lastParsed[field]) || '')
+    : '';
+
   const blob = new Blob(audioChunks, { type: 'audio/webm' });
   const formData = new FormData();
   formData.append('audio', blob, 'recording.webm');
@@ -343,7 +441,8 @@ async function sendRecording(mode = 'main', field = '') {
       throw new Error(data.error || 'Ошибка записи.');
     }
 
-    transcriptEl.textContent = data.transcript || '—';
+    lastTranscript = data.transcript || '';
+    transcriptEl.textContent = lastTranscript || '—';
 
     if (mode === 'field') {
       if (!lastParsed || typeof lastParsed !== 'object') {
@@ -357,10 +456,35 @@ async function sendRecording(mode = 'main', field = '') {
       const confidence = typeof data?.parser?.confidence === 'number'
         ? ` conf=${data.parser.confidence.toFixed(2)}`
         : '';
+
+      if (reportDraft) {
+        reportDraft.row = lastSavedRow || reportDraft.row || null;
+        reportDraft.edits.push({
+          type: 'redictate',
+          field,
+          at: new Date().toISOString(),
+          transcript: data.transcript || '',
+          previousValue: previousFieldValue,
+          newValue: data.value || '',
+          parser: data.parser || null
+        });
+      }
+
       setStatus(`Поле ${field} обновлено в строке ${lastSavedRow}. parser=${parserSource}${parserModel}${confidence}`, 'ok');
     } else {
       lastParsed = data.parsed || emptyParsedFields();
       lastSavedRow = data.row || null;
+      reportDraft = {
+        sessionId: createSessionId(),
+        source: 'poker-voice-web',
+        createdAt: new Date().toISOString(),
+        opponent: activeOpponent,
+        row: lastSavedRow,
+        initialTranscript: data.transcript || '',
+        parser: data.parser || null,
+        initialParsed: cloneParsedFields(lastParsed),
+        edits: []
+      };
       renderParsed(lastParsed);
       const parserSource = data?.parser?.source === 'semantic_llm' ? 'LLM' : 'rules';
       const parserModel = data?.parser?.model ? `/${data.parser.model}` : '';
@@ -374,8 +498,76 @@ async function sendRecording(mode = 'main', field = '') {
         'ok'
       );
     }
+    updateRecordUI();
   } catch (error) {
     setStatus(error.message || 'Ошибка записи.', 'error');
+  }
+}
+
+async function submitHandHistory() {
+  if (!activeOpponent) {
+    setStatus('Сначала выбери оппонента.', 'error');
+    return;
+  }
+  if (!handHistoryInput || !handHistoryInput.value.trim()) {
+    setStatus('Вставь hand history.', 'error');
+    return;
+  }
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    setStatus('Сначала останови текущую запись.', 'error');
+    return;
+  }
+
+  const handHistory = handHistoryInput.value.trim();
+
+  try {
+    setStatus('Разбираю hand history и записываю в Sheets...');
+    const response = await fetch('/api/record-hand-history', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        opponent: activeOpponent,
+        handHistory
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка разбора hand history.');
+    }
+
+    lastTranscript = data.transcript || handHistory;
+    transcriptEl.textContent = lastTranscript || '—';
+    lastParsed = data.parsed || emptyParsedFields();
+    lastSavedRow = data.row || null;
+    reportDraft = {
+      sessionId: createSessionId(),
+      source: 'poker-voice-web-hand-history',
+      createdAt: new Date().toISOString(),
+      opponent: activeOpponent,
+      row: lastSavedRow,
+      initialTranscript: handHistory,
+      parser: data.parser || null,
+      initialParsed: cloneParsedFields(lastParsed),
+      edits: []
+    };
+
+    renderParsed(lastParsed);
+    const parserSource = data?.parser?.source === 'semantic_llm' ? 'LLM' : 'rules';
+    const parserModel = data?.parser?.model ? `/${data.parser.model}` : '';
+    const confidence = typeof data?.parser?.confidence === 'number'
+      ? ` conf=${data.parser.confidence.toFixed(2)}`
+      : '';
+    setStatus(
+      lastSavedRow
+        ? `HH сохранена в строку ${lastSavedRow}. parser=${parserSource}${parserModel}${confidence}`
+        : `HH сохранена. parser=${parserSource}${parserModel}${confidence}`,
+      'ok'
+    );
+    updateRecordUI();
+  } catch (error) {
+    setStatus(error.message || 'Ошибка разбора hand history.', 'error');
   }
 }
 
@@ -465,6 +657,7 @@ async function saveFieldText(field, value) {
   }
 
   try {
+    const previousValue = String((lastParsed && typeof lastParsed === 'object' && lastParsed[field]) || '');
     setStatus(`Сохраняю поле ${field}…`);
     const response = await fetch('/api/update-field-text', {
       method: 'POST',
@@ -485,7 +678,20 @@ async function saveFieldText(field, value) {
 
     lastParsed[field] = data.value ?? value;
     lastSavedRow = data.row || lastSavedRow;
+    if (reportDraft) {
+      reportDraft.row = lastSavedRow || reportDraft.row || null;
+      reportDraft.edits.push({
+        type: 'manual_edit',
+        field,
+        at: new Date().toISOString(),
+        transcript: '',
+        previousValue,
+        newValue: lastParsed[field],
+        parser: null
+      });
+    }
     renderParsed(lastParsed);
+    updateRecordUI();
     setStatus(`Поле ${field} сохранено в строке ${lastSavedRow}.`, 'ok');
   } catch (error) {
     setStatus(error.message || 'Ошибка сохранения поля.', 'error');
@@ -507,6 +713,51 @@ async function redictateField(field) {
   }
 
   await startRecording('field', field);
+}
+
+async function saveReport() {
+  if (!reportDraft) {
+    setStatus('Сначала сделай запись раздачи, затем можно сохранить репорт.', 'error');
+    return;
+  }
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    setStatus('Сначала останови текущую запись.', 'error');
+    return;
+  }
+
+  const payload = {
+    source: reportDraft.source || 'poker-voice-web',
+    sessionId: reportDraft.sessionId || createSessionId(),
+    createdAt: reportDraft.createdAt || new Date().toISOString(),
+    savedAt: new Date().toISOString(),
+    opponent: reportDraft.opponent || activeOpponent,
+    row: lastSavedRow || reportDraft.row || null,
+    initialTranscript: reportDraft.initialTranscript || '',
+    finalTranscript: lastTranscript || '',
+    parser: reportDraft.parser || null,
+    initialParsed: cloneParsedFields(reportDraft.initialParsed || {}),
+    finalParsed: cloneParsedFields(lastParsed),
+    edits: Array.isArray(reportDraft.edits) ? reportDraft.edits : []
+  };
+
+  try {
+    setStatus('Сохраняю репорт...');
+    const response = await fetch('/api/save-report', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Не удалось сохранить репорт.');
+    }
+
+    setStatus(`Репорт сохранен (${data.id}). Файл: ${data.path}`, 'ok');
+  } catch (error) {
+    setStatus(error.message || 'Ошибка сохранения репорта.', 'error');
+  }
 }
 
 renderOpponents();

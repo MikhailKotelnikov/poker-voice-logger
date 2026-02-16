@@ -30,7 +30,8 @@ export function normalizeSpoken(value) {
 export function normalizeVocabulary(rawVocabulary) {
   const normalized = {
     streetAliases: {},
-    textAliases: {}
+    textAliases: {},
+    spellingAliases: {}
   };
 
   if (!rawVocabulary || typeof rawVocabulary !== 'object') {
@@ -52,6 +53,15 @@ export function normalizeVocabulary(rawVocabulary) {
       const target = String(targetRaw || '').trim();
       if (!spoken) continue;
       normalized.textAliases[spoken] = target;
+    }
+  }
+
+  if (rawVocabulary.spellingAliases && typeof rawVocabulary.spellingAliases === 'object') {
+    for (const [spokenRaw, targetRaw] of Object.entries(rawVocabulary.spellingAliases)) {
+      const spoken = normalizeSpoken(spokenRaw);
+      const target = String(targetRaw || '').trim();
+      if (!spoken || !target) continue;
+      normalized.spellingAliases[spoken] = target;
     }
   }
 
@@ -121,6 +131,19 @@ export function applyTextAliases(text, textAliases) {
     .sort((a, b) => b[0].length - a[0].length);
 
   let result = text;
+  for (const [spoken, replacement] of aliases) {
+    const regex = buildAliasRegex(spoken);
+    result = result.replace(regex, replacement);
+  }
+  return result.trim();
+}
+
+export function applySpellingAliases(text, spellingAliases) {
+  const aliases = Object.entries(spellingAliases || {})
+    .filter(([spoken, target]) => spoken && target)
+    .sort((a, b) => b[0].length - a[0].length);
+
+  let result = normalizeSpoken(text);
   for (const [spoken, replacement] of aliases) {
     const regex = buildAliasRegex(spoken);
     result = result.replace(regex, replacement);
@@ -274,6 +297,89 @@ export function normalizeOutputPunctuation(text) {
     .trim();
 }
 
+export function canonicalizeAceRankCase(text) {
+  let out = String(text || '');
+
+  // board context like ona72 -> onA72
+  out = out.replace(/\bona(?=[2-9kqjt])/g, 'onA');
+
+  // token-leading Ace rank: a72, ak, aa_nfd -> A72, Ak, AA_nfd
+  out = out.replace(/\baa(?=[_2-9kqjt]|$)/g, 'AA');
+  out = out.replace(/\ba(?=[2-9kqjt])/g, 'A');
+  out = out.replace(/\ba(?=\d)/g, 'A');
+
+  // underscore-joined segments: *_a72, *_ak, *_aa_*
+  out = out.replace(/(?<=_)aa(?=[_2-9kqjt]|$)/g, 'AA');
+  out = out.replace(/(?<=_)a(?=[2-9kqjt])/g, 'A');
+  out = out.replace(/(?<=_)a(?=\d)/g, 'A');
+  out = out.replace(/\baads\b/g, 'AAds');
+
+  return out;
+}
+
+export function canonicalizeLineAndSizing(text) {
+  let out = String(text || '');
+
+  out = out.replace(
+    /\b(bbb|bb|cb|tpb|tp|xr|bl|b|r|d|c)\s+((?:\d+(?:\.\d+)?)|(?:\d+x\+?))\b/g,
+    '$1$2'
+  );
+  out = out.replace(
+    /\bvs\s+((?:\d+(?:\.\d+)?)|(?:[a-z_]+\d+(?:\.\d+)?))\b/g,
+    'vs$1'
+  );
+  out = out.replace(/\b(\d+(?:\.\d+)?)\s+tb\b/g, '$1tb');
+  out = out.replace(/\bxrai\b/g, 'xr_ai');
+
+  return out;
+}
+
+export function canonicalizeLightMarkers(text) {
+  let out = String(text || '');
+  out = out.replace(/\bl\d+\b/g, 'L');
+  out = out.replace(/\bl([ftr])\b/g, 'L$1');
+  out = out.replace(/\bl\b/g, 'L');
+  return out;
+}
+
+export function canonicalizeCompositeSpecs(text) {
+  const suffixTokens = new Set(['naked', 'fd', 'nfd', 'oe', 'wrap', 'mp', 'mpp', 't']);
+  const basePattern = /^(topset|set|2p|low2p|mp|mpp|aa|AA|AAds|bluff|t)(?:_[a-z0-9]+)*$/;
+
+  const tokens = String(text || '').split(/\s+/).filter(Boolean);
+  const out = [];
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    let current = tokens[i];
+    while (
+      i + 1 < tokens.length
+      && suffixTokens.has(tokens[i + 1])
+      && (current.includes('_') || basePattern.test(current))
+    ) {
+      current = `${current}_${tokens[i + 1]}`;
+      i += 1;
+    }
+    out.push(current);
+  }
+
+  return out.join(' ').trim();
+}
+
+export function canonicalizeBoardContexts(text) {
+  let out = String(text || '');
+  out = out.replace(/\bon_str_turn\b/gi, 'onStrTurn');
+  out = out.replace(/\bonstrturn\b/gi, 'onStrTurn');
+  return out;
+}
+
+export function canonicalizeGcMarkers(text) {
+  let out = String(text || '');
+  // keep gc as local interpretation marker.
+  out = out.replace(/(?<!\[)\bgc(\+{1,3})(?!\])/gi, (_match, suffix) => `[gc${suffix}]`);
+  out = out.replace(/(?<!\[)\bgc\b(?!\])/gi, '[gc]');
+  return out;
+}
+
 export function normalizeFieldContent(rawText, vocabulary, options = {}) {
   const spellingMode = Boolean(options.spellingMode);
   const cleaned = String(rawText || '')
@@ -286,17 +392,27 @@ export function normalizeFieldContent(rawText, vocabulary, options = {}) {
     return '';
   }
 
-  // Pass 1: apply user vocab directly on raw (supports Russian keys in vocab.json).
-  const vocabPass1 = applyTextAliases(normalizeSpoken(cleaned), vocabulary.textAliases);
+  // Pass 1: spelling normalization by explicit spoken variants.
+  const spellingPass1 = applySpellingAliases(normalizeSpoken(cleaned), vocabulary.spellingAliases);
+  // Pass 2: apply user vocab directly on raw (supports Russian keys in vocab.json).
+  const vocabPass1 = applyTextAliases(spellingPass1, vocabulary.textAliases);
   // Pass 2: bridge mixed-language/translit tokens into English.
   const mixedLanguageNormalized = normalizeMixedLanguageText(vocabPass1);
-  // Pass 3: apply user vocab again (handles English keys produced by pass 2).
-  const normalizedValue = transliterateCyrillicText(applyTextAliases(mixedLanguageNormalized, vocabulary.textAliases))
+  // Pass 3: apply user vocab and spelling aliases again after bridge.
+  const vocabPass2 = applyTextAliases(mixedLanguageNormalized, vocabulary.textAliases);
+  const spellingPass2 = applySpellingAliases(vocabPass2, vocabulary.spellingAliases);
+  const normalizedValue = transliterateCyrillicText(spellingPass2)
     .replace(/\s+/g, ' ')
     .trim();
 
   const modeValue = spellingMode ? applySpellingModeText(normalizedValue) : normalizedValue;
-  return normalizeOutputPunctuation(modeValue);
+  const punctuation = normalizeOutputPunctuation(modeValue);
+  const lineAndSizing = spellingMode ? punctuation : canonicalizeLineAndSizing(punctuation);
+  const boardContexts = spellingMode ? lineAndSizing : canonicalizeBoardContexts(lineAndSizing);
+  const composites = spellingMode ? boardContexts : canonicalizeCompositeSpecs(boardContexts);
+  const lights = spellingMode ? composites : canonicalizeLightMarkers(composites);
+  const gcMarkers = spellingMode ? lights : canonicalizeGcMarkers(lights);
+  return canonicalizeAceRankCase(gcMarkers);
 }
 
 export function parseTranscript(transcript, vocabulary, options = {}) {

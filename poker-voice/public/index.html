@@ -57,6 +57,27 @@
         </p>
       </section>
 
+      <section class="panel" id="hand-history-panel">
+        <div class="panel-head">
+          <h2>Hand History</h2>
+          <span class="hint">вставь HH и запиши на выбранного оппа</span>
+        </div>
+        <div class="hh-target-picker">
+          <p class="label">Целевой оппонент для HH</p>
+          <div id="hh-opponent-list" class="hh-opponent-list"></div>
+        </div>
+        <textarea
+          id="hand-history-input"
+          class="hand-history-input"
+          rows="10"
+          placeholder="Вставь hand history из PokerTracker / Hand2Note..."
+        ></textarea>
+        <div class="hand-history-actions">
+          <button id="submit-hand-history" type="button" disabled>Разобрать HH и записать</button>
+          <button id="clear-hand-history" class="ghost" type="button" disabled>Очистить</button>
+        </div>
+      </section>
+
       <section class="panel" id="result-panel">
         <div class="panel-head">
           <h2>Результат</h2>
@@ -73,6 +94,9 @@
               <div class="parsed" id="parsed-fields">—</div>
             </div>
           </div>
+        </div>
+        <div class="result-actions">
+          <button id="save-report" class="ghost" type="button" disabled>Сохранить репорт</button>
         </div>
         <div class="status" id="status">Готово к записи.</div>
       </section>

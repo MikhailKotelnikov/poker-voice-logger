@@ -46,14 +46,14 @@ test('coerceSemanticResult keeps allowed structure', () => {
   assert.deepEqual(result.unresolved, ['missing river']);
 });
 
-test('normalizeSemanticParsed applies vocab aliases without forced canonical rewrites', () => {
+test('normalizeSemanticParsed applies vocab aliases and canonical light marker', () => {
   const parsed = normalizeSemanticParsed({
     flop: 'L1 ставка 33',
     river: 'я ставка 100 против меня'
   }, vocabulary);
 
-  assert.equal(parsed.flop, 'l1 b 33');
-  assert.equal(parsed.river, 'i b 100 vsme');
+  assert.equal(parsed.flop, 'L b33');
+  assert.equal(parsed.river, 'i b100 vsme');
 });
 
 test('hasAnyParsedField and mergeParsedFields keep fallback values', () => {

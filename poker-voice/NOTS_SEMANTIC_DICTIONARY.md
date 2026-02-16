@@ -1,4 +1,4 @@
-# Poker Nots Semantic Dictionary (v5)
+# Poker Nots Semantic Dictionary (v6)
 
 Цель файла: хранить и обновлять словарь и правила, по которым свободная диктовка конвертируется в итоговую строку `nots` в твоем стиле.
 
@@ -35,7 +35,7 @@
 2. `actor` (`i` или оппонент по умолчанию)
 3. `action_line` (`b`, `r`, `c`, `x`, `xr`, `xb`, `xc`, `xf`, `cb`, `tp`, `tpb`, `bb`, `bbb`, `bxb`, `d`, `limp`, `trib`)
 4. `sizing` (`25`, `33`, `50`, `66`, `75`, `100`, `175`, `2x+`...)
-5. `hand_or_equity` (`set`, `topset`, `2p`, `tri`, `full`, `nuts`, `nutfull`, `fd`, `nfd`, `g`, `wrap`, `weak`, `bu`, `bp`)
+5. `hand_or_equity` (`set`, `topset`, `2p`, `mp`, `tri`, `full`, `nuts`, `nutfull`, `fd`, `nfd`, `oe`, `g`, `wrap`, `weak`, `bu`, `bp`)
 6. `context` (`vsme`, `vsagro`, `vsreagro`, `vsNN`, `onK94`, `onA833`, `onFD`, `onflush`, `onStrRiver`, `3bp`, `3w/4w`, `4c/5c/6c`, `sprX`)
 7. `interpretation` (`merge`, `bluff`, `unval`, `foldy`, `big`, `huge`, `mid`, `value`, `blockers`, `z`, `much`)
 
@@ -60,6 +60,11 @@
 - `on...` = дескриптор борда (`onK94`, `on998`, `onA833`, `onJJ48`, `onflush`)
 - `onFD` = контекст борда с флеш-дро
 - `onStrRiver` = стритовый ривер (в `str` имеется в виду `straight`, не `street`)
+- `onStrTurn` = стритовый терн (turn-карта усилила стритовый контекст)
+- `onMono` = моноборд (3 карты одной масти на борде)
+- `on4str` = 4-straight структура борда
+- `onDrawy` = дровяная, очень динамичная текстура борда
+- `onFlushTurn` = turn-карта закрыла/сильно усилила флеш-контекст
 - `3bp` = 3-bet pot контекст
 - `3w` = 3-way контекст
 - `4w` = 4-way контекст
@@ -76,10 +81,12 @@
 - `x` = check
 - `ai` = all-in
 - `xr` = check-raise
+- `xr_ai` = check-raise all-in
 - `xb` = check-back
 - `xc` = check-call
 - `xf` = check-fold
 - `cb` = c-bet
+- `fp` = flop probe
 - `tp` = turn probe
 - `tpb` = turn probe + river bet continuation
 - `bb` = bet-bet
@@ -89,6 +96,9 @@
 - `f` = fold
 - `limp` = preflop limp
 - `trib` = postflop 3-bet (отдельно от preflop `3b`)
+- `rai` = raise all-in
+- `5bai` = 5-bet all-in (preflop)
+- `bbbai` = bet-bet-bet-all-in (postflop)
 - `rb66` = raise then bet 66 on next street context
 - `minbet` = минимальный возможный sizing
 
@@ -98,25 +108,40 @@
 - `draws`
 - `fd`
 - `nfd` (nut flush draw)
+- `oe` (open-ended straight draw; `oesd` -> `oe`)
 - `g` (gutshot)
 - `wrap`
 - `set` / `sets`
 - `topset`
+- `topfull`
 - `2p`
+- `low2p`
+- `mp` (middle pair)
+- `mpp` (middle pocket pair)
+- `pp` (pocket pair)
 - `tri`
+- `2ndstr` (second straight)
+- `nutstr` (nut straight)
 - `full`
+- `3rdfull` (third full)
 - `lowfull`
 - `nuts`
 - `nutfull`
 - `nutflush`
 - `3rd_flush`
 - `blockers`
+- `blocker_nutflush`
+- `blocker_fullhouse`
 - `bu` = busted draw
 - `bp` = bottom pair (единый токен, не split на `b` + `p`)
 - `AA_nfd` (структурный состав: `AA` + `nfd`)
+- `AA_t` (структурный состав: `AA` + `top pair`)
+- `AAds` (aces double-suited)
 - `set_fd` (структурный состав: `set` + `fd`)
-- `t_wrap` (структурный состав: `top pair` + `wrap`)
+- `base_spec1_spec2` (общий канон композитов через `_`, например `t_wrap`, `mp_oe`, `mp_oe_fd`, `topset_naked`)
+- `naked` (сильная, но "голая" рука без доп. эквити/дро)
 - `[rep_*]` = локальный represent-маркер (например, `[rep_topset]`)
+- `[gc]` = локальная интерпретация great/hero call
 - `[gc++]` / `[gc+++]` = локальный great-call маркер с градацией
 
 ### 3.5 Interpretation classes (action/strategy)
@@ -128,9 +153,14 @@
 - `big`
 - `huge`
 - `mid` (средний/средне-малый банк или давление)
+- `sizedown` (уменьшение сайзинга относительно baseline линии)
+- `sizeup` (увеличение сайзинга относительно baseline линии)
+- `ideal` (маркер "идеального" блеф-кандидата/спота, часто в контексте `unbluff ideal`)
+- `honest_split` (маркер "честный сплит" в локальной интерпретации)
 - `value`
 - `agro`, `agro+++` (уровни агрессии)
 - `notaffraid` (не боится исполнять линию)
+- `potctrl` (line of pot control)
 - `z` (зеркальная/непрямая линия: slowplay/control/unvalue с сильной рукой)
 - `much` (частотный маркер: много/часто)
 
@@ -146,6 +176,20 @@
 8. Если указан только `sizing` без `b/bb/bbb`, это все равно факт ставки; глубина линии считается незафиксированной.
 9. Пары рангов в начале составного токена не фиксированы: `QJ_run_ts`, `AK_run_ds`, `98_run_ts` и т.п.
 10. Для семейства `L` используются street-уточнения: `Lf`, `Lt`, `Lr`.
+11. Канон для line+sizing: слитный формат без пробела (`b75`, `bb75`, `bbb100`, `cb30`, `tp75`, `tpb50`, `xr100`, `bl33`).
+12. Суффикс `_naked` обобщенный: применяется к любому классу руки (`topset_naked`, `set_naked`, `2p_naked`).
+13. Канон регистра: всё в `lowercase`, кроме ранга туза `A` (например `A72`, `AA_nfd`, `onA72`).
+14. `xrai` и `xr ai` канонизируются в `xr_ai`.
+15. Тайм-банк пишется как суффикс `tb` с числом: `0.5tb`, `0.9tb`.
+16. `vsmy*`, `vs me`, `vs my` канонизируются в `vsme`.
+17. `topful` -> `topfull`.
+18. `f2` на этом этапе сводится к `f`.
+19. `g1` на этом этапе сводится к `g`.
+20. `gc2` на этом этапе сводится к `gc`.
+21. `some_ctrl` -> `potctrl`.
+22. `3bs` -> `3bp`.
+23. `a1` в контексте класса руки сводится к `air`.
+24. `wo fe`/`wofe` канонизируется в `WOFE` (`without fold equity`).
 
 ## 5) Семантические правила извлечения
 
@@ -164,6 +208,17 @@
 11. Квадратные скобки `[...]` в конце/внутри строки = локальная интерпретация или локальная presupposition.
 12. `?` после токена/гипотезы = неуверенность, требует проверки.
 13. Паттерн `vsNN` означает реакцию против sizing `NN` (например, `vs33`, `vs66`).
+14. Если явно сказано "голая рука/без доп. эквити", добавляется `naked` (обычно как суффикс `*_naked`).
+15. Спот с дровяным бордом нормализуется в `onDrawy`.
+16. Внутри одной строки символ `+` может разделять действия по улицам; при разборе такие фрагменты раскладываются по `flop/turn/river`.
+17. `great call`/`hero call` оформляется как локальная интерпретация в квадратных скобках: `[gc]`.
+18. `showed` использовать только для добровольного показа карт, когда show не обязателен (например, после фолда оппонента).
+19. Если карты раскрыты в обязательном `*** SHOW DOWN ***`, использовать `sd` + карты (`tcards_...`, `vcards_...`), но не `showed`.
+20. Для hand-history импорта классы по улицам фиксируются как `tclass_*` (target) и `vclass_*` (main shown opponent): `flop/turn/river`.
+21. Для HH-канона можно сразу писать класс в токене руки: `QhJcTdTc8c_nutstr`, `Ks6c5s5h4d_2p`.
+22. Локальные интерпретации в HH:
+- turn `x` с `nutstr` в x/x-линии -> `[z]` (slowplay / mirror line).
+- river `x` на спаренном борде -> `[potctrl]`.
 
 ## 6) Примеры (free phrase -> nots)
 
@@ -191,6 +246,7 @@
 22. `заколлил top-pair+wrap в huge споте в 3-way против чек-рейз олл-ина на fd доске, 6-карточный` -> `c t_wrap huge 3w vsxr_ai onFD 6c [gc+++]`
 23. `префлоп лимп с QJ-rundown triple-suit в 6-карточной` -> `limp QJ_run_ts 6c`
 24. `ривер 0 тайм блеф в среднем банке, я зеркалю с фуллом` -> `0t bluff mid / i z full`
+25. `на флопе 75 топсет naked, на терне bet-bet 75 с тем же классом` -> `75 topset_naked | bb75 topset_naked`
 
 ## 7) Открытые точки (для следующего батча)
 
@@ -209,11 +265,22 @@
 - `he` -> явный маркер второго субъекта (он) внутри той же строки.
 - `/` -> переключатель субъекта внутри одной записи.
 - `vsme` -> действие выполнено против тебя.
+- `sd` -> обязательный showdown (не добровольный show).
+- `showed` -> добровольный show (когда раскрытие карт не обязательно).
+- `tcards_*` -> конкретные карты target из showdown.
+- `vcards_*` -> конкретные карты main shown opponent из showdown.
+- `tclass_*` -> класс руки target на конкретной улице (для HH-импорта).
+- `vclass_*` -> класс руки main shown opponent на конкретной улице (для HH-импорта).
 - `vsagro` -> действие против агрессивного оппонента.
 - `vsreagro` -> действие против ответной агрессии.
 - `on...` -> контекст конкретного борда (например `onK94`).
 - `onflush` -> контекст флешового борда.
 - `onStrRiver` -> контекст ривера, который закрыл/создал стрит.
+- `onStrTurn` -> контекст терна, который усилил стритовую структуру.
+- `onMono` -> моноборд (3 одномастные карты на борде).
+- `on4str` -> борд с 4-straight структурой.
+- `onDrawy` -> дровяная, динамичная текстура борда.
+- `onFlushTurn` -> флеш-контекст резко усилился на тёрне.
 - `3w` -> мультивей-спот с тремя игроками.
 - `4w` -> мультивей-спот с четырьмя игроками.
 - `4c` -> контекст 4-карточной PLO.
@@ -226,10 +293,12 @@
 - `x` -> чек.
 - `ai` -> олл-ин.
 - `xr` -> чек-рейз.
+- `xr_ai` -> чек-рейз олл-ин.
 - `xb` -> чек-бэк в позиции.
 - `xc` -> чек-колл.
 - `xf` -> чек-фолд.
 - `cb` -> continuation bet.
+- `fp` -> flop probe.
 - `tp` -> turn probe после пассивного флопа.
 - `tpb` -> turn probe на терне и продолжение ставки на ривере.
 - `bb` -> линия bet-bet.
@@ -246,6 +315,7 @@
 - `2x+` -> рейз чуть больше 2x.
 - `0t` -> мгновенное решение.
 - `0.8t` -> долгое решение, около 80% тайм-окна.
+- `0.5tb` -> использование 50% тайм-банка (обобщенно `Ntb`).
 - `L` -> light/слабая линия с последующим фолдом (без счетчика в одиночной записи).
 - `tilting` -> состояние тильта.
 - `lite` -> лайтовое отклонение от стандартного диапазона.
@@ -255,6 +325,7 @@
 - `draws` -> неготовые дровяные руки.
 - `fd` -> флеш-дро.
 - `nfd` -> натсовое флеш-дро.
+- `oe` -> open-ended straight draw.
 - `onFD` -> fd-структура борда (борд с флеш-дро).
 - `g` -> гатшот.
 - `wrap` -> сильное стрит-дро в PLO.
@@ -262,6 +333,7 @@
 - `topset` -> топ-сет.
 - `sets` -> сеты (множественное наблюдение класса).
 - `2p` -> две пары.
+- `mp` -> middle pair.
 - `tri` -> трипс.
 - `full` -> фулл-хаус.
 - `lowfull` -> низкий фулл-хаус.
@@ -270,12 +342,23 @@
 - `nutflush` -> натсовый флеш.
 - `3rd_flush` -> третий по силе флеш.
 - `blockers` -> блокеры, влияющие на частоты колла/фолда.
+- `blocker_nutflush` -> блокер(ы) на натсовый флеш.
+- `blocker_fullhouse` -> блокер(ы) на фулл-хаус.
 - `bu` -> busted draw (недоехавшее дро).
 - `bp` -> bottom pair (нижняя пара).
 - `AA_nfd` -> состав руки: два туза плюс натсовое флеш-дро.
 - `set_fd` -> состав руки: сет плюс флеш-дро.
-- `t_wrap` -> состав: top pair + wrap.
+- `t_wrap` -> пример составной записи (`t` + `wrap`) в общем формате `base_spec1_spec2`.
+- `base_spec1_spec2` -> общий формат составных спецификаций руки через `_`.
 - `RANK_run_ts/ds/dts` -> шаблон структуры руки: ранги + rundown + suitedness.
+- `naked` -> рука без доп. эквити/дро (обычно как `*_naked`).
+- `topfull` -> топовый фулл-хаус.
+- `low2p` -> нижние две пары.
+- `2ndstr` -> второй по силе стрит.
+- `3rdfull` -> третий по силе фулл-хаус.
+- `pp` -> pocket pair.
+- `mpp` -> middle pocket pair.
+- `AAds` -> aces double-suited.
 - `merge` -> мержовая ставка средней частью диапазона.
 - `merge_AA` -> мерж-линия, где отмечен конкретный класс руки AA.
 - `merge_set` -> мерж-линия, где отмечен класс руки set.
@@ -290,10 +373,49 @@
 - `agro` -> агрессивный стиль линии.
 - `agro+++` -> сильно повышенная агрессия.
 - `notaffraid` -> не боится исполнять агрессивную или тонкую линию.
+- `potctrl` -> линия под-контроль банка/дисперсии.
+- `sizedown` -> осознанное уменьшение сайзинга.
+- `sizeup` -> осознанное увеличение сайзинга.
+- `ideal` -> идеальный блеф-кандидат/блокерный спот, который не реализован как блеф.
+- `honest_split` -> локальная интерпретация: честный дележ диапазонов/ран-аута.
 - `opp` -> оппонент как целевой субъект в пресуппозиции.
 - `blXX` -> блеф с сайзингом XX (например `bl33`).
+- `WOFE` -> without fold equity (ставка/пуш с минимальным FE).
+- `air` -> воздух (блеф-категория без showdown value).
 - `z` -> зеркальная/непрямая линия (slowplay/control/unvalue с сильной рукой).
 - `much` -> маркер высокой частоты действия (много/часто).
 - `gc`, `gc++`, `gc+++` -> градация силы great call / hero call.
 - `[ ... ]` -> локальная интерпретация/локальная presupposition внутри конкретной строки.
+- `+` -> разделитель фрагментов внутри одной исходной строки (часто разные улицы).
 - `?` -> гипотеза под вопросом, требует проверки.
+
+## 9) Speech/Spelling Map (spoken -> token)
+
+- `naked`, `нэйкед`, `некед` -> `naked`
+- `middle pair`, `средняя пара`, `эм пи` -> `mp`
+- `open ended`, `open-ended`, `open ended straight draw`, `open ended street draw`, `oesd`, `oi` -> `oe`
+- `flush draw`, `флеш дро`, `эф ди` -> `fd`
+- `врап`, `рэп` -> `wrap`
+- `топ-фул`, `топ-фулхаус`, `top full`, `top full house` -> `topfull`
+- `нижние две пары`, `low two pair` -> `low2p`
+- `second straight`, `второй стрит` -> `2ndstr`
+- `third full`, `третий фул`, `третий фулхаус` -> `3rdfull`
+- `check raise all-in`, `check raise all in`, `xr-ai`, `xr ai` -> `xr_ai`
+- `great call`, `hero call`, `геро колл`, `хиро колл` -> `[gc]`
+- `захераколил`, `захироколил`, `захероколил` -> `[gc]`
+- `под контроль`, `pot control` -> `potctrl`
+- `size down`, `сайз-даун` -> `sizedown`
+- `size up`, `сайз-ап` -> `sizeup`
+- `ideal`, `идеал`, `идеальный` -> `ideal`
+- `honest split`, `честный сплит` -> `honest_split`
+- `middle pocket pair`, `pocket pair` -> `mpp`, `pp`
+- `тайм-банк`, `тайм банк`, `time bank` -> `tb`
+- `drawy board`, `дровяной борт`, `дровяная доска` -> `onDrawy`
+- `mono board`, `моноборд` -> `onMono`
+- `4 straight`, `four straight`, `4-стрит`, `4 стрит` -> `on4str`
+- `тузы double suited`, `aces double suited`, `aads double suited`, `acs double suited` -> `AAds`
+- `wo fe`, `without fold equity` -> `WOFE`
+- `air`, `эйр`, `айр` -> `air`
+- `отбет`, `потбет`, `pot bet`, `potbet` -> `b100`
+- `кантбет` -> `cb`
+- `бакенлы`, `back inlay`, `light of river` -> `Lr`
