@@ -1,177 +1,188 @@
 # Poker Voice Logger
 
-Локальный web‑интерфейс для диктовки улиц и пресуппозиции с записью в Google Sheets.
+Локальное web-приложение для записи покерных `nots` в Google Sheets из:
+- голосовой диктовки,
+- hand history (PokerTracker/Hand2Note).
+
+---
+
+## Что реализовано (актуально)
+
+### 1) Web UI и рабочий поток
+- Список **активных оппонентов** (локально, в браузере).
+- Добавление/удаление одного оппа (`×`) и `Сбросить активных`.
+- Выбор активного оппа кликом по карточке.
+- Кнопка `открыть` под каждым оппом: открывает Google Sheet на первой строке этого ника.
+- Раздел **Запись**: старт/стоп записи с микрофона.
+- Раздел **Результат**: транскрипт + разобранные поля (`preflop/flop/turn/river/presupposition`).
+- Для каждого поля есть:
+  - `передиктовать` (перезаписать только это поле),
+  - `сохранить` (ручная правка с клавиатуры в ту же строку Sheets).
+- Кнопка `Сохранить репорт`: сохраняет локальный JSONL-репорт для дообучения словаря/спеллингов.
+
+### 2) Голосовой пайплайн (audio -> nots)
+- STT через OpenAI (`/v1/audio/transcriptions`).
+- Затем semantic LLM-парсер (если включен).
+- Fallback на rule-based парсер, если LLM не дал валидный результат.
+- Поддержка mixed RU/EN диктовки через `vocab.json` и нормализации.
+
+### 3) Hand History режим (HH -> nots)
+- В UI отдельный блок **Hand History**.
+- В этом блоке выведены активные игроки как отдельный picker цели HH.
+- HH вставляется текстом и отправляется на `/api/record-hand-history`.
+- На выходе формируется структурная запись в стиле `nots`:
+  - позиции (`SB/BB/CO/...`) и маркер target-позиции `_HE` (например `HJ_HE`),
+  - сайзинги в `bb`/`%pot`,
+  - последовательность действий в порядке HH,
+  - board с мастями (`onKc9d6s...`),
+  - showdown-карты target/opponent,
+  - классы рук и дро по улицам (`_p`, `_2p`, `_str`, `_nutstr`, `_fd`, `_nfd`, `_g`, `_oe`, `_wrap`),
+  - локальные интерпретации (`[z]`, `[potctrl]`),
+  - без отдельного `sd` токена.
+
+### 4) Семантика и словари
+- `NOTS_SEMANTIC_DICTIONARY.md` — канон токенов, правила, спеллинги, контекст.
+- `vocab.json` — пользовательские алиасы:
+  - `streetAliases`
+  - `textAliases`
+  - `spellingAliases`
+- Канонизация line+sizing, street-маркеров, light-маркеров, композитов руки, локальных интерпретаций.
+
+### 5) Интеграция с Google Sheets (Apps Script)
+- Вставка новой строки после последней строки выбранного оппонента.
+- Обновление конкретного поля в конкретной строке.
+- Поиск первой строки оппонента.
+- Поиск/автодополнение ника по всей таблице.
+- Форматирование листа под рабочий layout.
+
+### 6) Репорты для итеративного улучшения
+- Формат JSONL (`reports/nots_reports.jsonl`).
+- Сохраняются:
+  - исходная транскрипция,
+  - initial parsed,
+  - final parsed,
+  - все правки (manual/redictate),
+  - parser meta (model/confidence/unresolved),
+  - opponent/row/session.
+
+---
+
+## Архитектура (файлы)
+
+- `/Users/parisianreflect/Documents/codex/poker-voice/server.js`
+  - HTTP API, STT, semantic routing, запись в Sheets.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/core.js`
+  - rule-based parsing и нормализация текста.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/semantic.js`
+  - разбор и валидация JSON-ответов LLM.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/handHistory.js`
+  - детерминированный парсинг HH: позиции, поты, board, showdown, классы, итоговые street-ноты.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/reports.js`
+  - санитизация и запись training reports.
+- `/Users/parisianreflect/Documents/codex/poker-voice/public/index.html`
+- `/Users/parisianreflect/Documents/codex/poker-voice/public/app.js`
+- `/Users/parisianreflect/Documents/codex/poker-voice/public/styles.css`
+  - UI/UX.
+- `/Users/parisianreflect/Documents/codex/poker-voice/apps_script/Code.gs`
+  - вебхук/формат/операции Google Sheets.
+- `/Users/parisianreflect/Documents/codex/poker-voice/tests/*.test.js`
+  - unit-тесты core/semantic/handHistory/reports.
+
+---
+
+## API (локально)
+
+- `GET /api/health`
+- `GET /api/opponent-suggestions`
+- `GET /api/open-link?opponent=...`
+- `POST /api/record` (audio)
+- `POST /api/record-field` (audio + field + row)
+- `POST /api/update-field-text` (manual edit)
+- `POST /api/record-hand-history` (HH text)
+- `POST /api/save-report`
+
+---
+
+## Ключевые правила Hand History
+
+- Префлоп сайзинги -> `bb`.
+- Постфлоп ставки/рейзы -> `%pot`.
+- В showdown-спотах:
+  - `showed` только для добровольного показа,
+  - при обязательном showdown просто используются карты в street-ноте (без `sd`).
+- Рука и board добавляются в street-запись.
+- Для nut-straight используется `nutstr` (где определяется детерминированно).
+- Для `fd`/`nfd` в PLO обязательно:
+  - на текущей улице на борде уже есть минимум 2 карты одной масти,
+  - у игрока есть минимум 2 карты этой масти в руке.
+  - На rainbow-флопе (`3 разные масти`) `fd` не ставится.
+- Локальные интерпретации:
+  - turn `x` с `nutstr` в x/x-линии -> `[z]`,
+  - river `x` на спаренном борде -> `[potctrl]`.
+
+---
 
 ## Быстрый старт
 
-1. Установить зависимости:
+1. Установка:
 
 ```bash
 cd /Users/parisianreflect/Documents/codex/poker-voice
 npm install
 ```
 
-2. Создать `.env` по примеру:
+2. Переменные:
 
 ```bash
 cp .env.example .env
 ```
 
-3. Заполнить переменные:
-
+Минимум:
 - `OPENAI_API_KEY`
-- `OPENAI_MODEL` (рекомендуется `gpt-4o-transcribe`)
-- `OPENAI_LANGUAGE` (оставь пустым для автоопределения mixed RU/EN)
-- `OPENAI_PROMPT` (инструкция для ASR на ASCII/шорткоды)
-- `NOTS_SEMANTIC_ENABLED` (`1` чтобы включить LLM-семантику после STT)
-- `NOTS_SEMANTIC_MODEL` (primary, например `gpt-5.3`)
-- `NOTS_SEMANTIC_MODEL_FALLBACKS` (через запятую, например `gpt-5.2,gpt-5`)
-- `NOTS_SEMANTIC_DICTIONARY_PATH` (путь до semantic-словаря)
-- `SHEETS_WEBHOOK_URL` (если используешь Apps Script)
-- `SHEET_URL` (ссылка на таблицу вида `https://docs.google.com/spreadsheets/d/.../edit`, нужна для кнопки `Открыть`)
-- `SHEET_NAME` (опционально, если лист не активный)
-- `VOCAB_PATH` (опционально, путь до JSON-словаря)
-- `REPORTS_PATH` (куда сохранять training-reports, по умолчанию `./reports/nots_reports.jsonl`)
+- `SHEETS_WEBHOOK_URL`
 
-4. Запустить:
+Рекомендуется:
+- `OPENAI_MODEL=gpt-4o-transcribe`
+- `OPENAI_LANGUAGE=` (пусто для auto mixed)
+- `NOTS_SEMANTIC_ENABLED=1`
+- `NOTS_SEMANTIC_MODEL=gpt-5.3`
+- `NOTS_SEMANTIC_MODEL_FALLBACKS=gpt-5.2,gpt-5`
+- `NOTS_SEMANTIC_DICTIONARY_PATH=/Users/parisianreflect/Documents/codex/poker-voice/NOTS_SEMANTIC_DICTIONARY.md`
+- `SHEET_URL=...`
+- `SHEET_NAME=...` (если нужен не активный лист)
+- `REPORTS_PATH=/Users/parisianreflect/Documents/codex/poker-voice/reports/nots_reports.jsonl`
+
+3. Запуск:
 
 ```bash
 npm run dev
 ```
 
-Открой `http://localhost:8787`.
+Открыть: `http://127.0.0.1:8787`
 
-## Проверка проекта
+---
 
-Один командой:
+## Проверка
 
 ```bash
 cd /Users/parisianreflect/Documents/codex/poker-voice
 npm run verify
 ```
 
-Что проверяется:
-- синтаксис `server.js`, `public/app.js`, `src/core.js`, `src/semantic.js`
-- unit-тесты парсера и semantic-утилит (`tests/core.test.js`, `tests/semantic.test.js`)
+Проверяются:
+- синтаксис (`server.js`, `public/app.js`, `src/*.js`),
+- тесты (`tests/core.test.js`, `tests/semantic.test.js`, `tests/handHistory.test.js`, `tests/reports.test.js`).
 
-Если порт занят, можно поменять в `.env`:
+---
 
-```bash
-PORT=8787
-HOST=127.0.0.1
-```
+## Настройка Google Sheets (Apps Script)
 
-## Google Sheets через Apps Script (самый простой путь)
+1. Google Sheet -> `Extensions -> Apps Script`.
+2. Вставить код из `/Users/parisianreflect/Documents/codex/poker-voice/apps_script/Code.gs`.
+3. `Deploy -> New deployment -> Web app`.
+4. Настройки:
+   - Execute as: `Me`
+   - Access: `Anyone with the link`
+5. URL веб-приложения вставить в `.env` как `SHEETS_WEBHOOK_URL`.
 
-1. Открой нужную Google‑таблицу.
-2. `Расширения → Apps Script`.
-3. Вставь код из `/Users/parisianreflect/Documents/codex/poker-voice/apps_script/Code.gs`.
-4. `Deploy → New deployment → Web app`.
-5. Выполни настройки:
-   - Execute as: **Me**
-   - Who has access: **Anyone with the link**
-6. Скопируй URL веб‑приложения и вставь в `SHEETS_WEBHOOK_URL`.
-
-> Скрипт вставляет новую строку сразу после последней записи выбранного оппонента.
->
-> Если ты обновил код `Code.gs`, обязательно: `Deploy -> Manage deployments -> Edit -> Select version -> Deploy` (новая версия).
-
-## Формат диктовки
-
-- Улица произносится как маркер: `флоп`, `терн`, `ривер`, `пресуппозиция`.
-- В ячейки записывается только текст после маркера.
-- Presupposition идёт в той же записи после улиц.
-
-Пример: `флоп 33 + 2x trib, терн xr100, ривер ф1 vs75, пресуппозиция reago vsmy rcb`.
-
-## Семантический режим (свободная диктовка)
-
-Теперь в `/api/record` есть 2 этапа:
-
-1. STT: аудио -> текст.
-2. Semantic LLM parser: текст -> `preflop/flop/turn/river/presupposition`.
-
-Если LLM-парсер выключен или не дал валидный результат, сервер делает fallback на старый маркерный парсер (`флоп/терн/ривер/...`).
-
-Если primary-модель недоступна в API-аккаунте, сервер автоматически пробует модели из `NOTS_SEMANTIC_MODEL_FALLBACKS`.
-
-Semantic-словарь хранится в:
-- `/Users/parisianreflect/Documents/codex/poker-voice/NOTS_SEMANTIC_DICTIONARY.md`
-
-Этот файл используется как знание для конвертации свободной речи в каноничный формат `nots`.
-
-## Пользовательский словарь
-
-В проекте есть файл `/Users/parisianreflect/Documents/codex/poker-voice/vocab.json`.
-
-Поля:
-
-- `streetAliases`: какие голосовые фразы считать какой улицей
-- `textAliases`: какие фразы заменять в результирующем тексте
-- `spellingAliases`: отдельный слой spoken/spelling-вариантов (сверяется на каждом прогоне до и после mixed-language нормализации)
-
-Пример:
-
-```json
-{
-  "streetAliases": {
-    "первая улица": "flop"
-  },
-  "textAliases": {
-    "ставка 33%": "bet33"
-  }
-}
-```
-
-С фразой `первая улица ставка 33%` результат будет: в колонке `flop` запишется `bet33`.
-
-Текущий `vocab.json` уже содержит базовые термины:
-- `нулевая улица -> preflop`
-- `первая улица -> flop`
-- `вторая улица -> turn`
-- `третья улица -> river`
-- `пресуппозиция -> presupposition`
-- `я -> i`, `агро -> agro`, `слабая -> l1`, `ставка -> b`, `двойная ставка -> bb`, `тройная ставка -> bbb`
-
-## Колонки таблицы
-
-1. `A`: nickname (white, wrap включен, текст не вылезает за границы колонки)
-2. `B:C`: preflop block (white), запись идет в `B`, `C` — запас
-3. `D:F`: flop block (light yellow), запись идет в `D`, `E:F` — запас
-4. `G:I`: turn block (light blue/lilac), запись идет в `G`, `H:I` — запас
-5. `J:L`: river block (white), запись идет в `J`, `K:L` — запас
-6. `M`: presuppositions block (light pink)
-7. `N:Q`: пустой отступ
-8. `R`: date (автоматическое `дата-время` создания записи)
-9. Ширина всех колонок: `3 см` (приблизительно `113 px`)
-
-После каждого блока одного оппонента автоматически добавляется пустая строка для визуального разделения.
-
-Все строки с данными принудительно форматируются как `normal` (не жирные).
-
-Кнопка `Открыть` под никнеймом открывает Google Sheet на первой строке, где встречается этот ник.
-
-Поле добавления никнейма:
-- один раз при запуске подгружает индекс никнеймов из Google Sheets
-- показывает подсказки только когда начинаешь печатать
-- поиск идет по всей колонке `nickname` в Sheets, а не по локальному активному списку
-
-В карточках оппонентов:
-- `×` в правом верхнем углу удаляет оппонента из активного локального списка
-- `Сбросить активных` очищает весь локальный список оппонентов
-
-В блоке `Разбор` у каждого поля есть кнопка `передиктовать`:
-- она записывает только выбранное поле (`preflop/flop/turn/river/presupposition`)
-- правка пишется в уже сохраненную строку Google Sheets (без добавления новой строки)
-
-Кнопка `Сохранить репорт` в блоке `Результат`:
-- сохраняет JSONL-report для анализа качества распознавания и пополнения словаря
-- в report попадает: исходная транскрипция, первичный parse, финальные правки, история правок (передиктовка/ручная правка), row/opponent
-- файл накапливается локально в `REPORTS_PATH` (можно потом прикреплять в чат для разбора)
-
-## Если формат не применился
-
-1. Вставь актуальный код из `/Users/parisianreflect/Documents/codex/poker-voice/apps_script/Code.gs`.
-2. В Apps Script запусти функцию `setupSheetLayout()` один раз (кнопка `Run`).
-3. Сделай redeploy Web App с новой версией.
-4. Проверь, что `SHEETS_WEBHOOK_URL` в `/Users/parisianreflect/Documents/codex/poker-voice/.env` указывает на этот deployment.
+Если менялся `Code.gs`, нужен redeploy новой версии.

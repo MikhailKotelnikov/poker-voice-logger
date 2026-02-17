@@ -386,6 +386,177 @@ function computeStreetClasses(cards, board) {
   return out;
 }
 
+function buildStreetDraws(cardsRaw, board) {
+  const cards = (cardsRaw || []).map(parseCardToken).filter(Boolean);
+  if (cards.length < 2) {
+    return { flop: [], turn: [], river: [] };
+  }
+
+  const boards = buildStreetBoards(board);
+  const classes = computeStreetClasses(cardsRaw, board);
+
+  return {
+    flop: deriveStreetDrawTokens(cards, boards.flop, classes.flop),
+    turn: deriveStreetDrawTokens(cards, boards.turn, classes.turn),
+    river: []
+  };
+}
+
+function deriveStreetDrawTokens(holeCards, boardCards, madeClass) {
+  const cardsToCome = 5 - (boardCards?.length || 0);
+  if (cardsToCome <= 0) return [];
+
+  const made = String(madeClass || '').toLowerCase();
+  const draws = [];
+
+  const flushDrawToken = detectFlushDrawToken(holeCards, boardCards, cardsToCome, made);
+  if (flushDrawToken) draws.push(flushDrawToken);
+
+  const straightDrawToken = detectStraightDrawToken(holeCards, boardCards, cardsToCome, made);
+  if (straightDrawToken) draws.push(straightDrawToken);
+
+  return draws;
+}
+
+function detectFlushDrawToken(holeCards, boardCardsRaw, cardsToCome, madeClass) {
+  if (['flush', 'strflush', 'full', 'quads'].includes(madeClass)) {
+    return '';
+  }
+
+  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  const holeSuitCounts = new Map();
+  for (const card of holeCards || []) {
+    holeSuitCounts.set(card.suit, (holeSuitCounts.get(card.suit) || 0) + 1);
+  }
+  const boardSuitCounts = new Map();
+  for (const card of boardCards) {
+    boardSuitCounts.set(card.suit, (boardSuitCounts.get(card.suit) || 0) + 1);
+  }
+  const hasTwoSuitBoard = Array.from(boardSuitCounts.values()).some((count) => count >= 2);
+  if (!hasTwoSuitBoard) {
+    return '';
+  }
+
+  let bestSuit = '';
+  let bestNeeded = Infinity;
+  let bestBoardCount = 0;
+  for (const [suit, holeCount] of holeSuitCounts.entries()) {
+    if (holeCount < 2) continue;
+    const boardCount = boardSuitCounts.get(suit) || 0;
+    // PLO rule for current project: flush draw is tracked only if board already has 2 cards of same suit.
+    // 1-suited board (rainbow) is treated as no flush draw token.
+    if (boardCount < 2) continue;
+    const needed = 3 - boardCount;
+    if (needed <= 0 || needed > cardsToCome) continue;
+    if (needed < bestNeeded || (needed === bestNeeded && boardCount > bestBoardCount)) {
+      bestNeeded = needed;
+      bestBoardCount = boardCount;
+      bestSuit = suit;
+    }
+  }
+
+  if (!bestSuit) return '';
+  const hasAceSuit = (holeCards || []).some((card) => card.rank === 'A' && card.suit === bestSuit);
+  return hasAceSuit ? 'nfd' : 'fd';
+}
+
+function detectStraightDrawToken(holeCards, boardCardsRaw, cardsToCome, madeClass) {
+  if (['str', 'nutstr', 'strflush', 'full', 'quads'].includes(madeClass)) {
+    return '';
+  }
+  if (cardsToCome <= 0) return '';
+
+  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  if (boardCards.length < 3) return '';
+
+  const holeRaw = (holeCards || []).map((card) => card.raw).filter(Boolean);
+  const boardRaw = boardCards.map((card) => card.raw);
+  const availableDeck = fullDeckExcluding([...holeRaw, ...boardRaw]);
+  const outRanks = new Set();
+
+  for (const rank of CARD_RANKS) {
+    const forcedCards = availableDeck.filter((card) => card[0].toUpperCase() === rank);
+    let support = 0;
+    let possible = 0;
+    for (const forcedCard of forcedCards) {
+      const nextCount = Math.max(0, availableDeck.length - 1);
+      possible += cardsToCome >= 2 ? nextCount : 1;
+      support += countStraightSupportsWithForcedCard(holeRaw, boardRaw, forcedCard, cardsToCome, availableDeck);
+    }
+    const ratio = possible > 0 ? support / possible : 0;
+    const rankWorks = cardsToCome >= 2 ? ratio >= 0.45 : support >= 1;
+    if (rankWorks) {
+      outRanks.add(rank);
+    }
+  }
+
+  const count = outRanks.size;
+  if (count >= 4) return 'wrap';
+  if (count >= 2) return 'oe';
+  if (count === 1) return 'g';
+  return '';
+}
+
+function fullDeckExcluding(excludedCardsRaw) {
+  const excluded = new Set((excludedCardsRaw || []).map((card) => String(card || '').trim()).filter(Boolean));
+  const deck = [];
+  for (const rank of CARD_RANKS) {
+    for (const suit of CARD_SUITS) {
+      const raw = `${rank}${suit}`;
+      if (!excluded.has(raw)) {
+        deck.push(raw);
+      }
+    }
+  }
+  return deck;
+}
+
+function countStraightSupportsWithForcedCard(holeRaw, boardRaw, forcedCard, cardsToCome, availableDeck) {
+  if (!forcedCard) return 0;
+  const remaining = Math.max(0, cardsToCome - 1);
+  if (remaining === 0) {
+    return hasStraightUsingForcedCard(holeRaw, [...boardRaw, forcedCard], forcedCard) ? 1 : 0;
+  }
+
+  const nextDeck = (availableDeck || []).filter((card) => card !== forcedCard);
+  let support = 0;
+  if (remaining === 1) {
+    for (const second of nextDeck) {
+      if (hasStraightUsingForcedCard(holeRaw, [...boardRaw, forcedCard, second], forcedCard)) {
+        support += 1;
+      }
+    }
+    return support;
+  }
+
+  for (const combo of combinations(nextDeck, remaining)) {
+    if (hasStraightUsingForcedCard(holeRaw, [...boardRaw, forcedCard, ...combo], forcedCard)) {
+      support += 1;
+    }
+  }
+  return support;
+}
+
+function hasStraightUsingForcedCard(holeRaw, boardRaw, forcedCardRaw) {
+  const holeCards = (holeRaw || []).map(parseCardToken).filter(Boolean);
+  const boardCards = (boardRaw || []).map(parseCardToken).filter(Boolean);
+  if (holeCards.length < 2 || boardCards.length < 3) return false;
+
+  const forced = String(forcedCardRaw || '').trim();
+  const holeCombos = combinations(holeCards, 2);
+  const boardCombos = combinations(boardCards, 3);
+  for (const hole of holeCombos) {
+    for (const board of boardCombos) {
+      if (!board.some((card) => card.raw === forced)) continue;
+      const strength = evaluateFiveCardStrength([...hole, ...board]);
+      if (strength.category === 4 || strength.category === 8) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function boardIsPaired(boardCardsRaw) {
   const values = (boardCardsRaw || [])
     .map(parseCardToken)
@@ -632,8 +803,10 @@ export function parseHandHistory(handHistory, opponent) {
     showCardsByPlayer[event.player] = event.cards;
   }
   const streetClassByPlayer = {};
+  const streetDrawByPlayer = {};
   for (const [player, cards] of Object.entries(showCardsByPlayer)) {
     streetClassByPlayer[player] = computeStreetClasses(cards, board);
+    streetDrawByPlayer[player] = buildStreetDraws(cards, board);
   }
   const primaryOpponentShow = selectPrimaryShowdownOpponent(targetPlayer, showEvents, events);
   const primaryOpponentCards = primaryOpponentShow?.cards || [];
@@ -673,7 +846,8 @@ export function parseHandHistory(handHistory, opponent) {
       primaryOpponentCards,
       opponentStreetClass,
       showCardsByPlayer,
-      streetClassByPlayer
+      streetClassByPlayer,
+      streetDrawByPlayer
     }
   };
 }
@@ -720,7 +894,7 @@ export function buildHandHistoryContext(parsed) {
   lines.push(`showdown_primary_opponent=${parsed?.showdown?.primaryOpponent || ''}`);
   lines.push(`showdown_primary_cards=[${(parsed?.showdown?.primaryOpponentCards || []).join(' ')}]`);
   lines.push(`opponent_class_by_street=flop:${parsed?.showdown?.opponentStreetClass?.flop || ''} turn:${parsed?.showdown?.opponentStreetClass?.turn || ''} river:${parsed?.showdown?.opponentStreetClass?.river || ''}`);
-  lines.push('rule_showed=Use token showed only for voluntary reveal when showdown is not mandatory. For mandatory showdown use sd + cards.');
+  lines.push('rule_showed=Use token showed only for voluntary reveal when showdown is not mandatory. Do not add sd token.');
 
   for (const street of ['preflop', 'flop', 'turn', 'river']) {
     lines.push(`${street.toUpperCase()}:`);
@@ -759,31 +933,6 @@ function stripShowedToken(text) {
     .replace(/\s+/g, ' ')
     .replace(/(^\/\s*|\s*\/$)/g, '')
     .trim();
-}
-
-function appendUniqueToken(text, token) {
-  const source = String(text || '').trim();
-  const cleanToken = String(token || '').trim();
-  if (!cleanToken) return source;
-  const regex = new RegExp(`\\b${escapeRegExp(cleanToken)}\\b`, 'i');
-  if (regex.test(source)) {
-    return source;
-  }
-  return source ? `${source} ${cleanToken}` : cleanToken;
-}
-
-function containsToken(text, token) {
-  if (!token) return false;
-  const regex = new RegExp(`\\b${escapeRegExp(token)}\\b`, 'i');
-  return regex.test(String(text || ''));
-}
-
-function compactStreetClassToken(cardsCompact, cls) {
-  const cards = String(cardsCompact || '').trim();
-  const streetClass = String(cls || '').trim();
-  if (!cards && !streetClass) return '';
-  if (cards && streetClass) return `${cards}_${streetClass}`;
-  return cards || streetClass;
 }
 
 function streetBoardCards(parsedHistory, street) {
@@ -887,26 +1036,112 @@ function eventActionToken(event, street, isCheckBehind = false) {
   return '';
 }
 
+function formatRaiseMultiplier(multiplierRaw) {
+  const multiplier = round2(multiplierRaw);
+  if (!Number.isFinite(multiplier) || multiplier <= 0) return '';
+  const nearestInt = Math.round(multiplier);
+  if (Math.abs(multiplier - nearestInt) <= 0.08) {
+    return String(nearestInt);
+  }
+  const oneDecimal = round2(Math.round(multiplier * 10) / 10);
+  const oneDecimalInt = Math.round(oneDecimal);
+  if (Math.abs(oneDecimal - oneDecimalInt) <= 0.08) {
+    return String(oneDecimalInt);
+  }
+  return formatNum(oneDecimal);
+}
+
+function previousAggressionSizeBb(events, index) {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (!event) continue;
+    if (event.type === 'bet' && Number.isFinite(event.amountBb)) {
+      return event.amountBb;
+    }
+    if (event.type === 'raise') {
+      if (Number.isFinite(event.toAmountBb)) return event.toAmountBb;
+      if (Number.isFinite(event.amountBb)) return event.amountBb;
+    }
+  }
+  return null;
+}
+
+function postflopRaiseByXToken(events, index, event) {
+  if (!event || event.type !== 'raise') return '';
+  const baseBb = previousAggressionSizeBb(events, index);
+  const raiseToBb = Number.isFinite(event.toAmountBb) ? event.toAmountBb : event.amountBb;
+  if (!Number.isFinite(baseBb) || baseBb <= 0 || !Number.isFinite(raiseToBb) || raiseToBb <= 0) {
+    return '';
+  }
+  const multiplier = raiseToBb / baseBb;
+  const formatted = formatRaiseMultiplier(multiplier);
+  if (!formatted) return '';
+  return `r${formatted}x`;
+}
+
+function lastPreflopAggressor(parsedHistory) {
+  const preflop = parsedHistory?.events?.preflop || [];
+  for (let i = preflop.length - 1; i >= 0; i -= 1) {
+    const event = preflop[i];
+    if (event.type === 'raise' || event.type === 'bet') {
+      return event.player;
+    }
+  }
+  return '';
+}
+
+function isCheckBehindEvent(events, index) {
+  const event = events[index];
+  if (!event || event.type !== 'check') return false;
+  const hasAggression = events.some((item) => item.type === 'bet' || item.type === 'raise');
+  if (hasAggression) return false;
+  for (let i = index + 1; i < events.length; i += 1) {
+    if (['check', 'call', 'bet', 'raise', 'fold'].includes(events[i].type)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function formatPlayerPrefix(player, parsedHistory) {
+  const pos = String(parsedHistory?.positionsByPlayer?.[player] || '').toUpperCase();
+  if (!pos) return player || '';
+  if (player && player === parsedHistory?.targetPlayer) {
+    return `${pos}_HE`;
+  }
+  return pos;
+}
+
+function playerStreetHandToken(parsedHistory, player, street) {
+  const cards = compactCards(parsedHistory?.showdown?.showCardsByPlayer?.[player]);
+  if (!cards) return '';
+  const cls = parsedHistory?.showdown?.streetClassByPlayer?.[player]?.[street] || '';
+  const drawTokens = parsedHistory?.showdown?.streetDrawByPlayer?.[player]?.[street] || [];
+  const suffix = [cls, ...drawTokens].filter(Boolean).join('_');
+  return suffix ? `${cards}_${suffix}` : cards;
+}
+
 function buildOpponentFragmentsForStreet(parsedHistory, street) {
   const events = parsedHistory?.events?.[street] || [];
   const target = parsedHistory?.targetPlayer;
   if (!target || !events.length) return [];
 
   const positions = parsedHistory?.positionsByPlayer || {};
-  const showCardsByPlayer = parsedHistory?.showdown?.showCardsByPlayer || {};
-  const streetClassByPlayer = parsedHistory?.showdown?.streetClassByPlayer || {};
   let relevant = events;
 
   if (street === 'preflop') {
-    let targetAggIndex = -1;
+    let lastAggIndex = -1;
     for (let i = 0; i < events.length; i += 1) {
       const event = events[i];
-      if (event.player === target && (event.type === 'raise' || event.type === 'bet')) {
-        targetAggIndex = i;
+      if (event.type === 'raise' || event.type === 'bet') {
+        lastAggIndex = i;
       }
     }
-    if (targetAggIndex >= 0) {
-      relevant = events.slice(targetAggIndex + 1);
+    if (lastAggIndex >= 0) {
+      const aggressor = events[lastAggIndex];
+      relevant = aggressor?.player === target
+        ? events.slice(lastAggIndex + 1)
+        : events.slice(lastAggIndex);
     }
   }
 
@@ -937,9 +1172,7 @@ function buildOpponentFragmentsForStreet(parsedHistory, street) {
     const prefix = pos || event.player;
     let token = `${prefix} ${action}`;
 
-    const cards = compactCards(showCardsByPlayer[event.player]);
-    const cls = streetClassByPlayer[event.player]?.[street] || '';
-    const withClass = compactStreetClassToken(cards, cls);
+    const withClass = playerStreetHandToken(parsedHistory, event.player, street);
     if (withClass) token = `${token} ${withClass}`;
 
     out.push(token.trim());
@@ -947,10 +1180,61 @@ function buildOpponentFragmentsForStreet(parsedHistory, street) {
   return out;
 }
 
+function buildPreflopSequenceNote(parsedHistory) {
+  const events = (parsedHistory?.events?.preflop || [])
+    .filter((event) => ['check', 'call', 'bet', 'raise'].includes(event.type));
+  if (!events.length) return '';
+
+  let startIndex = 0;
+  for (let i = 0; i < events.length; i += 1) {
+    const event = events[i];
+    if (event.type === 'raise' || event.type === 'bet') {
+      startIndex = i;
+    }
+  }
+  const relevant = events.slice(startIndex);
+
+  const target = parsedHistory?.targetPlayer;
+  const targetHasStraddle = (parsedHistory?.events?.preflop || [])
+    .some((event) => event.player === target && event.type === 'straddle');
+  let targetStraddleUsed = false;
+
+  const parts = [];
+  for (const event of relevant) {
+    const action = eventActionToken(event, 'preflop', false);
+    if (!action) continue;
+
+    const prefix = formatPlayerPrefix(event.player, parsedHistory);
+    if (!prefix) continue;
+
+    const tokenParts = [];
+    if (
+      event.player === target
+      && targetHasStraddle
+      && !targetStraddleUsed
+    ) {
+      if (Number.isFinite(parsedHistory?.gameCardCount)) {
+        tokenParts.push(`${parsedHistory.gameCardCount}c`);
+      }
+      tokenParts.push('straddle');
+      targetStraddleUsed = true;
+    }
+
+    tokenParts.push(`${prefix} ${action}`);
+
+    const handToken = playerStreetHandToken(parsedHistory, event.player, 'preflop');
+    if (handToken) tokenParts.push(handToken);
+
+    parts.push(tokenParts.join(' ').trim());
+  }
+
+  return parts.join(' / ').trim();
+}
+
 function buildTargetStreetPrefix(parsedHistory, street) {
   const target = parsedHistory?.targetPlayer || '';
-  const targetPos = String(parsedHistory?.positionsByPlayer?.[target] || '').toUpperCase();
-  const targetCardsCompact = compactCards(parsedHistory?.showdown?.targetCards);
+  const targetPos = formatPlayerPrefix(target, parsedHistory);
+  const targetCardsCompact = playerStreetHandToken(parsedHistory, target, street);
   const targetClass = parsedHistory?.showdown?.targetStreetClass?.[street] || '';
   const actionEvent = findTargetPrimaryActionEvent(parsedHistory, street);
   if (!actionEvent) return '';
@@ -982,11 +1266,7 @@ function buildTargetStreetPrefix(parsedHistory, street) {
   parts.push(normalizedAction);
 
   if (targetCardsCompact) {
-    if (street === 'preflop') {
-      parts.push(targetCardsCompact);
-    } else {
-      parts.push(compactStreetClassToken(targetCardsCompact, targetClass));
-    }
+    parts.push(targetCardsCompact);
   }
 
   if (street !== 'preflop') {
@@ -1002,13 +1282,57 @@ function buildTargetStreetPrefix(parsedHistory, street) {
   return parts.join(' ').trim();
 }
 
+function buildPostflopSequenceNote(parsedHistory, street) {
+  const events = (parsedHistory?.events?.[street] || [])
+    .filter((event) => ['check', 'fold', 'call', 'bet', 'raise'].includes(event.type));
+  if (!events.length) return '';
+
+  const aggressor = lastPreflopAggressor(parsedHistory);
+  const parts = [];
+
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    const isCheckBehind = isCheckBehindEvent(events, index);
+    let action = eventActionToken(event, street, isCheckBehind);
+    if (street !== 'preflop' && event.type === 'raise') {
+      const raiseByX = postflopRaiseByXToken(events, index, event);
+      if (raiseByX) action = raiseByX;
+    }
+    if (
+      street === 'flop'
+      && event.type === 'bet'
+      && event.player === aggressor
+      && /^b\d/.test(action)
+    ) {
+      action = action.replace(/^b/, 'cb');
+    }
+
+    const prefix = formatPlayerPrefix(event.player, parsedHistory);
+    if (!prefix || !action) continue;
+
+    const tokenParts = [`${prefix} ${action}`];
+    const handToken = playerStreetHandToken(parsedHistory, event.player, street);
+    if (handToken) {
+      tokenParts.push(handToken);
+    }
+    if (event.player === parsedHistory?.targetPlayer) {
+      const board = boardToken(parsedHistory, street);
+      if (board) tokenParts.push(board);
+      const targetClass = parsedHistory?.showdown?.targetStreetClass?.[street] || '';
+      const interpretation = deriveTargetInterpretation(parsedHistory, street, event, targetClass);
+      if (interpretation) tokenParts.push(interpretation);
+    }
+    parts.push(tokenParts.join(' ').trim());
+  }
+
+  return parts.join(' / ').trim();
+}
+
 function buildDeterministicStreetNote(parsedHistory, street) {
-  const targetPrefix = buildTargetStreetPrefix(parsedHistory, street);
-  const opponents = buildOpponentFragmentsForStreet(parsedHistory, street);
-  if (!targetPrefix && !opponents.length) return '';
-  if (!targetPrefix) return opponents.join(' / ');
-  if (!opponents.length) return targetPrefix;
-  return `${targetPrefix} / ${opponents.join(' / ')}`.trim();
+  if (street !== 'preflop') {
+    return buildPostflopSequenceNote(parsedHistory, street);
+  }
+  return buildPreflopSequenceNote(parsedHistory);
 }
 
 export function enrichHandHistoryParsed(parsedFields, parsedHistory) {
@@ -1032,11 +1356,6 @@ export function enrichHandHistoryParsed(parsedFields, parsedHistory) {
     if (deterministic) {
       out[street] = sanitizeArtifacts(deterministic);
     }
-  }
-
-  if (showdown.mandatory) {
-    const riverTarget = out.river ? 'river' : 'presupposition';
-    out[riverTarget] = appendUniqueToken(out[riverTarget], 'sd');
   }
 
   return out;
