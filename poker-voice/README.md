@@ -13,6 +13,7 @@
 - Добавление/удаление одного оппа (`×`) и `Сбросить активных`.
 - Выбор активного оппа кликом по карточке.
 - Кнопка `открыть` под каждым оппом: открывает Google Sheet на первой строке этого ника.
+- Кнопка `профиль` под каждым оппом: открывает popup с цветовой визуализацией по его строкам.
 - Раздел **Запись**: старт/стоп записи с микрофона.
 - Раздел **Результат**: транскрипт + разобранные поля (`preflop/flop/turn/river/presupposition`).
 - Для каждого поля есть:
@@ -30,6 +31,9 @@
 - В UI отдельный блок **Hand History**.
 - В этом блоке выведены активные игроки как отдельный picker цели HH.
 - HH вставляется текстом и отправляется на `/api/record-hand-history`.
+- HH-записи пишутся в отдельный лист (по умолчанию `Sheet2` через `SHEET_NAME_HAND_HISTORY`).
+- Можно загрузить сразу несколько HH-файлов (`.txt/.log/.hh`) и разобрать пакетно через `/api/record-hand-history-files`.
+- Дополнительно: кнопка `Визуализировать HH` строит цветную построчную визуализацию одной раздачи (`/api/visualize-hand`).
 - На выходе формируется структурная запись в стиле `nots`:
   - позиции (`SB/BB/CO/...`) и маркер target-позиции `_HE` (например `HJ_HE`),
   - сайзинги в `bb`/`%pot`,
@@ -95,10 +99,13 @@
 - `GET /api/health`
 - `GET /api/opponent-suggestions`
 - `GET /api/open-link?opponent=...`
+- `GET /api/opponent-visual-profile?opponent=...` (по умолчанию объединяет `voice + hh` листы)
+- `POST /api/visualize-hand` (HH visual preview)
 - `POST /api/record` (audio)
-- `POST /api/record-field` (audio + field + row)
-- `POST /api/update-field-text` (manual edit)
+- `POST /api/record-field` (audio + field + row, optional `sheetName`)
+- `POST /api/update-field-text` (manual edit, optional `sheetName`)
 - `POST /api/record-hand-history` (HH text)
+- `POST /api/record-hand-history-files` (multipart batch upload files)
 - `POST /api/save-report`
 
 ---
@@ -149,7 +156,9 @@ cp .env.example .env
 - `NOTS_SEMANTIC_MODEL_FALLBACKS=gpt-5.2,gpt-5`
 - `NOTS_SEMANTIC_DICTIONARY_PATH=/Users/parisianreflect/Documents/codex/poker-voice/NOTS_SEMANTIC_DICTIONARY.md`
 - `SHEET_URL=...`
-- `SHEET_NAME=...` (если нужен не активный лист)
+- `SHEET_NAME_VOICE=Sheet1` (лист для голосовых нотсов)
+- `SHEET_NAME_HAND_HISTORY=Sheet2` (лист для HH-нотсов)
+- `SHEET_NAME=...` (legacy fallback, если не заданы *_VOICE / *_HAND_HISTORY)
 - `REPORTS_PATH=/Users/parisianreflect/Documents/codex/poker-voice/reports/nots_reports.jsonl`
 
 3. Запуск:

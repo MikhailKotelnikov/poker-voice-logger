@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check server.js && node --check public/app.js && node --check src/core.js && node --check src/semantic.js && node --check src/reports.js && node --check src/handHistory.js",
+    "check": "node --check server.js && node --check public/app.js && node --check src/core.js && node --check src/semantic.js && node --check src/reports.js && node --check src/handHistory.js && node --check src/visualProfile.js && node --check src/handVisual.js",
     "test": "node --test",
     "verify": "npm run check && npm run test"
   },

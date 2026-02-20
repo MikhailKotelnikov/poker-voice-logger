@@ -103,32 +103,41 @@ function buildPositionMap(buttonSeat, seatToPlayer) {
 }
 
 function parseStreetMarker(line) {
-  if (line.startsWith('*** HOLE CARDS ***')) return 'preflop';
-  if (line.startsWith('*** FLOP ***')) return 'flop';
-  if (line.startsWith('*** TURN ***')) return 'turn';
-  if (line.startsWith('*** RIVER ***')) return 'river';
-  if (line.startsWith('*** SHOW DOWN ***')) return 'showdown';
+  const source = String(line || '');
+  if (/^\*\*\*\s+HOLE CARDS\s+\*\*\*/i.test(source)) return 'preflop';
+  if (/^\*\*\*\s+(?:FIRST|SECOND)\s+FLOP\s+\*\*\*/i.test(source)) return 'flop';
+  if (/^\*\*\*\s+(?:FIRST|SECOND)\s+TURN\s+\*\*\*/i.test(source)) return 'turn';
+  if (/^\*\*\*\s+(?:FIRST|SECOND)\s+RIVER\s+\*\*\*/i.test(source)) return 'river';
+  if (/^\*\*\*\s+(?:FIRST|SECOND)\s+SHOW DOWN\s+\*\*\*/i.test(source)) return 'showdown';
+  if (/^\*\*\*\s+FLOP\s+\*\*\*/i.test(source)) return 'flop';
+  if (/^\*\*\*\s+TURN\s+\*\*\*/i.test(source)) return 'turn';
+  if (/^\*\*\*\s+RIVER\s+\*\*\*/i.test(source)) return 'river';
+  if (/^\*\*\*\s+SHOW DOWN\s+\*\*\*/i.test(source)) return 'showdown';
   return '';
 }
 
 function parseBoardCards(line, street, board) {
+  const source = String(line || '');
+  const runMarker = source.match(/^\*\*\*\s+(FIRST|SECOND)\s+/i)?.[1]?.toUpperCase() || '';
+  const canOverwrite = runMarker !== 'SECOND';
+
   if (street === 'flop') {
-    const m = line.match(/\*\*\* FLOP \*\*\* \[([^\]]+)\]/);
-    if (m?.[1]) {
+    const m = source.match(/\*\*\*\s+(?:FIRST\s+|SECOND\s+)?FLOP\s+\*\*\*\s+\[([^\]]+)\]/i);
+    if (m?.[1] && (!Array.isArray(board.flop) || !board.flop.length || canOverwrite)) {
       board.flop = m[1].trim().split(/\s+/).filter(Boolean);
     }
     return;
   }
   if (street === 'turn') {
-    const m = line.match(/\*\*\* TURN \*\*\* \[[^\]]+\] \[([^\]]+)\]/);
-    if (m?.[1]) {
+    const m = source.match(/\*\*\*\s+(?:FIRST\s+|SECOND\s+)?TURN\s+\*\*\*\s+\[[^\]]+\]\s+\[([^\]]+)\]/i);
+    if (m?.[1] && (!board.turn || canOverwrite)) {
       board.turn = m[1].trim();
     }
     return;
   }
   if (street === 'river') {
-    const m = line.match(/\*\*\* RIVER \*\*\* \[[^\]]+\] \[([^\]]+)\]/);
-    if (m?.[1]) {
+    const m = source.match(/\*\*\*\s+(?:FIRST\s+|SECOND\s+)?RIVER\s+\*\*\*\s+\[[^\]]+\]\s+\[([^\]]+)\]/i);
+    if (m?.[1] && (!board.river || canOverwrite)) {
       board.river = m[1].trim();
     }
   }
@@ -164,21 +173,22 @@ function parseActionLine(line) {
   if (!m) return null;
   const player = m[1].trim();
   const action = m[2].trim();
+  const allIn = /\ball-?in\b/i.test(action);
 
   if (/^checks\b/i.test(action)) return { player, type: 'check', raw: action };
   if (/^folds\b/i.test(action)) return { player, type: 'fold', raw: action };
   if (/^calls\b/i.test(action)) {
     const amount = toNumber(action.match(/calls\s+[^0-9]*([0-9.,]+)/i)?.[1]);
-    return { player, type: 'call', amount, raw: action };
+    return { player, type: 'call', amount, allIn, raw: action };
   }
   if (/^bets\b/i.test(action)) {
     const amount = toNumber(action.match(/bets\s+[^0-9]*([0-9.,]+)/i)?.[1]);
-    return { player, type: 'bet', amount, raw: action };
+    return { player, type: 'bet', amount, allIn, raw: action };
   }
   if (/^raises\b/i.test(action)) {
     const amount = toNumber(action.match(/raises\s+[^0-9]*([0-9.,]+)/i)?.[1]);
     const toAmount = toNumber(action.match(/\bto\s+[^0-9]*([0-9.,]+)/i)?.[1]);
-    return { player, type: 'raise', amount, toAmount, raw: action };
+    return { player, type: 'raise', amount, toAmount, allIn, raw: action };
   }
   if (/^posts the ante\b/i.test(action)) {
     const amount = toNumber(action.match(/ante\s+[^0-9]*([0-9.,]+)/i)?.[1]);
@@ -201,6 +211,15 @@ function parseActionLine(line) {
     return { player, type: 'show', cards: cards.split(/\s+/).filter(Boolean), raw: action };
   }
   return { player, type: 'other', raw: action };
+}
+
+function parseUncalledReturnLine(line) {
+  const match = String(line || '').match(/^Uncalled bet\s+\(([^)]+)\)\s+returned to\s+(.+)$/i);
+  if (!match) return null;
+  const amount = toNumber(match[1]);
+  const player = String(match[2] || '').trim();
+  if (!player || !Number.isFinite(amount)) return null;
+  return { player, amount };
 }
 
 function amountToBb(amount, bb) {
@@ -650,6 +669,7 @@ export function parseHandHistory(handHistory, opponent) {
   const seatToPlayer = new Map();
   let buttonSeat = null;
   let showdownSeen = false;
+  let inTableHeader = true;
 
   let street = 'preflop';
   let pot = 0;
@@ -668,23 +688,77 @@ export function parseHandHistory(handHistory, opponent) {
           roundContrib = new Map();
         }
         parseBoardCards(line, street, board);
+        if (streetMarker === 'preflop') {
+          inTableHeader = false;
+        }
       }
       continue;
     }
 
-    const parsedButton = parseButtonSeat(line);
-    if (Number.isFinite(parsedButton)) {
-      buttonSeat = parsedButton;
-      continue;
+    if (inTableHeader) {
+      const parsedButton = parseButtonSeat(line);
+      if (Number.isFinite(parsedButton)) {
+        buttonSeat = parsedButton;
+        continue;
+      }
+
+      const seatMatch = line.match(/^Seat\s+(\d+):\s+(.+?)\s+\([^)]+in chips\)\s*$/i);
+      if (seatMatch?.[2]) {
+        const seat = Number(seatMatch[1]);
+        const playerName = seatMatch[2].trim();
+        playersSet.add(playerName);
+        if (Number.isFinite(seat)) {
+          seatToPlayer.set(seat, playerName);
+        }
+        continue;
+      }
     }
 
-    const seatMatch = line.match(/^Seat\s+(\d+):\s+(.+?)\s+\(/i);
-    if (seatMatch?.[2]) {
-      const seat = Number(seatMatch[1]);
-      const playerName = seatMatch[2].trim();
-      playersSet.add(playerName);
-      if (Number.isFinite(seat)) {
-        seatToPlayer.set(seat, playerName);
+    const uncalledReturn = parseUncalledReturnLine(line);
+    if (uncalledReturn) {
+      if (events[street]) {
+        const event = {
+          street,
+          player: uncalledReturn.player,
+          type: 'uncalled_return',
+          raw: line,
+          amount: uncalledReturn.amount,
+          toAmount: null,
+          cards: [],
+          potBefore: round2(pot),
+          potAfter: round2(pot)
+        };
+
+        pot = round2(Math.max(0, pot - uncalledReturn.amount));
+        event.potAfter = round2(pot);
+
+        const streetEvents = events[street];
+        for (let i = streetEvents.length - 1; i >= 0; i -= 1) {
+          const prev = streetEvents[i];
+          if (!prev || prev.player !== uncalledReturn.player) continue;
+          if (!['bet', 'raise'].includes(prev.type)) continue;
+          if (Number.isFinite(prev.amount)) {
+            const hadMatchedCounterAction = streetEvents
+              .slice(i + 1)
+              .some((candidate) => (
+                candidate
+                && candidate.player
+                && candidate.player !== uncalledReturn.player
+                && (candidate.type === 'call' || candidate.type === 'raise')
+              ));
+            prev.uncalledReturned = uncalledReturn.amount;
+            if (hadMatchedCounterAction) {
+              prev.amount = round2(Math.max(0, prev.amount - uncalledReturn.amount));
+              prev.amountBb = amountToBb(prev.amount, bb);
+              prev.pctPot = Number.isFinite(prev.potBefore) && prev.potBefore > 0
+                ? round2((prev.amount / prev.potBefore) * 100)
+                : null;
+            }
+          }
+          break;
+        }
+
+        streetEvents.push(event);
       }
       continue;
     }
@@ -699,14 +773,14 @@ export function parseHandHistory(handHistory, opponent) {
 
     const player = parsed.player;
     playersSet.add(player);
+    if (parsed.type === 'show') {
+      showEvents.push({
+        player,
+        cards: Array.isArray(parsed.cards) ? parsed.cards : []
+      });
+    }
 
     if (!events[street]) {
-      if (parsed.type === 'show') {
-        showEvents.push({
-          player,
-          cards: Array.isArray(parsed.cards) ? parsed.cards : []
-        });
-      }
       continue;
     }
 
@@ -723,8 +797,11 @@ export function parseHandHistory(handHistory, opponent) {
       player,
       type: parsed.type,
       raw: parsed.raw,
+      allIn: Boolean(parsed.allIn),
       amount: Number.isFinite(parsed.amount) ? parsed.amount : null,
+      amountRaw: Number.isFinite(parsed.amount) ? parsed.amount : null,
       toAmount: Number.isFinite(parsed.toAmount) ? parsed.toAmount : null,
+      toAmountRaw: Number.isFinite(parsed.toAmount) ? parsed.toAmount : null,
       cards: Array.isArray(parsed.cards) ? parsed.cards : [],
       potBefore: round2(pot),
       potAfter: round2(pot)
@@ -761,19 +838,37 @@ export function parseHandHistory(handHistory, opponent) {
       event.pctPot = Number.isFinite(event.amount) && event.potBefore > 0
         ? round2((event.amount / event.potBefore) * 100)
         : null;
+      event.rawPctPot = event.pctPot;
       events[street].push(event);
       continue;
     }
 
     if (parsed.type === 'raise') {
-      if (Number.isFinite(parsed.amount)) {
-        pot += parsed.amount;
+      const prevContribution = roundContrib.get(player) || 0;
+      let addedAmount = Number.isFinite(parsed.amount) ? parsed.amount : null;
+      event.rawPctPot = Number.isFinite(event.amountRaw) && event.potBefore > 0
+        ? round2((event.amountRaw / event.potBefore) * 100)
+        : null;
+      event.rawToPctPot = Number.isFinite(event.toAmountRaw) && event.potBefore > 0
+        ? round2((event.toAmountRaw / event.potBefore) * 100)
+        : null;
+      if (Number.isFinite(parsed.toAmount)) {
+        const delta = round2(parsed.toAmount - prevContribution);
+        if (Number.isFinite(delta) && delta >= 0) {
+          addedAmount = delta;
+        }
+      }
+      if (Number.isFinite(addedAmount)) {
+        pot += addedAmount;
       }
       if (Number.isFinite(parsed.toAmount)) {
         roundContrib.set(player, parsed.toAmount);
-      } else if (Number.isFinite(parsed.amount)) {
-        const prev = roundContrib.get(player) || 0;
-        roundContrib.set(player, prev + parsed.amount);
+      } else if (Number.isFinite(addedAmount)) {
+        roundContrib.set(player, prevContribution + addedAmount);
+      }
+      event.amountRaw = Number.isFinite(event.amount) ? event.amount : null;
+      if (Number.isFinite(addedAmount)) {
+        event.amount = addedAmount;
       }
       event.potAfter = round2(pot);
       event.amountBb = amountToBb(event.amount, bb);
@@ -837,7 +932,7 @@ export function parseHandHistory(handHistory, opponent) {
     targetIdHint: extractTargetIdHint(opponent),
     showdown: {
       seen: showdownSeen,
-      mandatory: Boolean(showdownSeen && showEvents.length),
+      mandatory: Boolean(showEvents.length && (showdownSeen || showEvents.length >= 2)),
       showEvents,
       voluntaryShowEvents,
       targetCards,
@@ -953,6 +1048,16 @@ function boardToken(parsedHistory, street) {
   return `on${cards.join('')}`;
 }
 
+function streetPotToken(parsedHistory, street) {
+  if (street === 'preflop') return '';
+  const bb = Number(parsedHistory?.blinds?.bigBlind || 0);
+  const rawPot = Number(parsedHistory?.streetStartPot?.[street]);
+  if (!Number.isFinite(bb) || bb <= 0 || !Number.isFinite(rawPot) || rawPot <= 0) return '';
+  const potBb = amountToBb(rawPot, bb);
+  if (!Number.isFinite(potBb) || potBb <= 0) return '';
+  return `(${formatNum(potBb)})`;
+}
+
 function deriveTargetInterpretation(parsedHistory, street, actionEvent, targetClass) {
   if (!actionEvent) return '';
   const events = parsedHistory?.events?.[street] || [];
@@ -1015,8 +1120,13 @@ function eventActionToken(event, street, isCheckBehind = false) {
     return 'c';
   }
   if (event.type === 'bet') {
-    if (street !== 'preflop' && Number.isFinite(event.pctPot)) {
-      return `b${formatNum(event.pctPot)}`;
+    const pctPot = Number.isFinite(event.pctPot) && event.pctPot > 0
+      ? event.pctPot
+      : Number.isFinite(event.rawPctPot) && event.rawPctPot > 0
+        ? event.rawPctPot
+        : null;
+    if (street !== 'preflop' && Number.isFinite(pctPot)) {
+      return `b${formatNum(pctPot)}`;
     }
     if (street === 'preflop' && Number.isFinite(event.amountBb)) {
       return `b${formatNum(event.amountBb)}bb`;
@@ -1029,8 +1139,18 @@ function eventActionToken(event, street, isCheckBehind = false) {
       if (Number.isFinite(event.amountBb)) return `r${formatNum(event.amountBb)}bb`;
       return 'r';
     }
-    if (Number.isFinite(event.toPctPot)) return `r${formatNum(event.toPctPot)}`;
-    if (Number.isFinite(event.pctPot)) return `r${formatNum(event.pctPot)}`;
+    const toPctPot = Number.isFinite(event.toPctPot) && event.toPctPot > 0
+      ? event.toPctPot
+      : Number.isFinite(event.rawToPctPot) && event.rawToPctPot > 0
+        ? event.rawToPctPot
+        : null;
+    const pctPot = Number.isFinite(event.pctPot) && event.pctPot > 0
+      ? event.pctPot
+      : Number.isFinite(event.rawPctPot) && event.rawPctPot > 0
+        ? event.rawPctPot
+        : null;
+    if (Number.isFinite(toPctPot)) return `r${formatNum(toPctPot)}`;
+    if (Number.isFinite(pctPot)) return `r${formatNum(pctPot)}`;
     return 'r';
   }
   return '';
@@ -1105,11 +1225,10 @@ function isCheckBehindEvent(events, index) {
 
 function formatPlayerPrefix(player, parsedHistory) {
   const pos = String(parsedHistory?.positionsByPlayer?.[player] || '').toUpperCase();
-  if (!pos) return player || '';
-  if (player && player === parsedHistory?.targetPlayer) {
-    return `${pos}_HE`;
-  }
-  return pos;
+  const playerId = String(player || '').trim();
+  if (!pos) return playerId;
+  if (!playerId) return pos;
+  return `${pos}_${playerId}`;
 }
 
 function playerStreetHandToken(parsedHistory, player, street) {
@@ -1174,6 +1293,7 @@ function buildOpponentFragmentsForStreet(parsedHistory, street) {
 
     const withClass = playerStreetHandToken(parsedHistory, event.player, street);
     if (withClass) token = `${token} ${withClass}`;
+    if (event.allIn) token = `${token} allin`;
 
     out.push(token.trim());
   }
@@ -1185,12 +1305,9 @@ function buildPreflopSequenceNote(parsedHistory) {
     .filter((event) => ['check', 'call', 'bet', 'raise'].includes(event.type));
   if (!events.length) return '';
 
-  let startIndex = 0;
-  for (let i = 0; i < events.length; i += 1) {
-    const event = events[i];
-    if (event.type === 'raise' || event.type === 'bet') {
-      startIndex = i;
-    }
+  let startIndex = events.findIndex((event) => event.type === 'raise' || event.type === 'bet');
+  if (startIndex < 0) {
+    startIndex = 0;
   }
   const relevant = events.slice(startIndex);
 
@@ -1224,6 +1341,7 @@ function buildPreflopSequenceNote(parsedHistory) {
 
     const handToken = playerStreetHandToken(parsedHistory, event.player, 'preflop');
     if (handToken) tokenParts.push(handToken);
+    if (event.allIn) tokenParts.push('allin');
 
     parts.push(tokenParts.join(' ').trim());
   }
@@ -1265,8 +1383,11 @@ function buildTargetStreetPrefix(parsedHistory, street) {
   if (targetPos) parts.push(targetPos);
   parts.push(normalizedAction);
 
-  if (targetCardsCompact) {
-    parts.push(targetCardsCompact);
+    if (targetCardsCompact) {
+      parts.push(targetCardsCompact);
+    }
+  if (actionEvent.allIn) {
+    parts.push('allin');
   }
 
   if (street !== 'preflop') {
@@ -1288,6 +1409,8 @@ function buildPostflopSequenceNote(parsedHistory, street) {
   if (!events.length) return '';
 
   const aggressor = lastPreflopAggressor(parsedHistory);
+  const target = parsedHistory?.targetPlayer || '';
+  let boardAddedWithoutTarget = false;
   const parts = [];
 
   for (let index = 0; index < events.length; index += 1) {
@@ -1315,17 +1438,27 @@ function buildPostflopSequenceNote(parsedHistory, street) {
     if (handToken) {
       tokenParts.push(handToken);
     }
-    if (event.player === parsedHistory?.targetPlayer) {
+    if (target && event.player === target) {
       const board = boardToken(parsedHistory, street);
       if (board) tokenParts.push(board);
       const targetClass = parsedHistory?.showdown?.targetStreetClass?.[street] || '';
       const interpretation = deriveTargetInterpretation(parsedHistory, street, event, targetClass);
       if (interpretation) tokenParts.push(interpretation);
+    } else if (!target && !boardAddedWithoutTarget) {
+      const board = boardToken(parsedHistory, street);
+      if (board) {
+        tokenParts.push(board);
+        boardAddedWithoutTarget = true;
+      }
     }
+    if (event.allIn) tokenParts.push('allin');
     parts.push(tokenParts.join(' ').trim());
   }
 
-  return parts.join(' / ').trim();
+  const body = parts.join(' / ').trim();
+  if (!body) return '';
+  const pot = streetPotToken(parsedHistory, street);
+  return pot ? `${pot} ${body}`.trim() : body;
 }
 
 function buildDeterministicStreetNote(parsedHistory, street) {
@@ -1353,7 +1486,21 @@ export function enrichHandHistoryParsed(parsedFields, parsedHistory) {
 
   for (const street of ['preflop', 'flop', 'turn', 'river']) {
     const deterministic = buildDeterministicStreetNote(parsedHistory, street);
-    if (deterministic) {
+    const hasStreetEvents = Array.isArray(parsedHistory?.events?.[street]);
+    if (hasStreetEvents) {
+      if (deterministic) {
+        out[street] = sanitizeArtifacts(deterministic);
+      } else {
+        const keepVoluntaryShowToken = (
+          street === 'river'
+          && !showdown.mandatory
+          && /\bshow(?:ed)?\b/i.test(out[street])
+        );
+        out[street] = keepVoluntaryShowToken
+          ? sanitizeArtifacts(out[street])
+          : '';
+      }
+    } else if (deterministic) {
       out[street] = sanitizeArtifacts(deterministic);
     }
   }

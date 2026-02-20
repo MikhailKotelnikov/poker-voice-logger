@@ -136,6 +136,39 @@ Seat 6: 14461705 (¥6288.02 in chips)
 56962166: shows [Qs 9h 8c 6h 3s]
 `.trim();
 
+const SAMPLE_HH_STRADDLE_3BET_ALLIN_UNCALLED = `
+PokerStars Hand #1413806286:  5 Card Omaha Pot Limit (¥5/¥10 CNY) - 2026/02/11 21:42:00 UTC
+Table 'CGG_9224270-WEEKLYBENDER' 6-max Seat #1 is the button
+Seat 1: 46657035 (¥2661.71 in chips)
+Seat 3: 85033665 (¥4913.71 in chips)
+Seat 4: 12121116 (¥1190 in chips)
+85033665: posts the ante ¥10
+12121116: posts the ante ¥10
+46657035: posts the ante ¥10
+85033665: posts small blind ¥5
+12121116: posts big blind ¥10
+85033665: posts straddle ¥15
+46657035: posts straddle ¥40
+85033665: posts straddle ¥60
+*** HOLE CARDS ***
+12121116: raises ¥230 to ¥310
+46657035: folds
+85033665: raises ¥690 to ¥1000
+12121116: calls ¥690
+*** FLOP *** [4c Qc 4d]
+85033665: bets ¥2070
+12121116: calls ¥180 and is all-in
+Uncalled bet (¥1890) returned to 85033665
+85033665: shows [Ah Ac Kd 9d 4h]
+12121116: shows [Kh Js 9s 8c 7c]
+*** FIRST TURN *** [4c Qc 4d] [9c]
+*** FIRST RIVER *** [4c Qc 4d 9c] [8d]
+*** SECOND TURN *** [4c Qc 4d] [7d]
+*** SECOND RIVER *** [4c Qc 4d 7d] [Qd]
+*** SUMMARY ***
+Total pot ¥2430 | Rake ¥72.90
+`.trim();
+
 test('parseHandHistory extracts blinds target and pot-based sizing context', () => {
   const parsed = parseHandHistory(SAMPLE_HH, 'ThatWas 86761294');
 
@@ -205,8 +238,8 @@ test('enrichHandHistoryParsed removes showed on mandatory showdown and appends c
   );
 
   assert.equal(/\bshow(?:ed)?\b/i.test(enriched.river), false);
-  assert.match(enriched.preflop, /^5c straddle SB_HE r16bb /);
-  assert.match(enriched.flop, /^SB_HE cb75 /);
+  assert.match(enriched.preflop, /^5c straddle SB_86761294 r16bb /);
+  assert.match(enriched.flop, /^\(\d+(?:\.\d+)?\)\s+SB_86761294 cb75 /);
   assert.match(enriched.flop, /\bQhJcTdTc8c_p_wrap\b/);
   assert.equal(/\bQhJcTdTc8c_p_(?:fd|nfd)\b/i.test(enriched.flop), false);
   assert.match(enriched.flop, /\bKs6c5s5h4d_2p\b/);
@@ -286,17 +319,17 @@ Seat 2: 22222222 (¥1000 in chips)
   assert.match(enriched.flop, /\bAcJcTdTc8d_[a-z0-9_]*nfd[a-z0-9_]*\b/i);
 });
 
-test('enrichHandHistoryParsed keeps preflop order from last aggressor and uses raise multiplier token postflop', () => {
+test('enrichHandHistoryParsed keeps preflop order from first aggressor and uses raise multiplier token postflop', () => {
   const parsed = parseHandHistory(SAMPLE_HH_ORDER_AND_RAISE_X, '86761294');
   const enriched = enrichHandHistoryParsed(
     { preflop: '', flop: '', turn: '', river: '', presupposition: '' },
     parsed
   );
 
-  assert.match(enriched.preflop, /^BTN r10.5bb QcTsTh8c6h \/ BB_HE c9.5bb AhKdKh7s2h$/);
+  assert.match(enriched.preflop, /^BTN_56962166 r10.5bb QcTsTh8c6h \/ BB_86761294 c9.5bb AhKdKh7s2h$/);
   assert.equal(/\bHJ c1bb\b/.test(enriched.preflop), false);
-  assert.match(enriched.turn, /\bBB_HE b34.2\b/);
-  assert.match(enriched.turn, /\bBTN r6x\b/);
+  assert.match(enriched.turn, /\bBB_86761294 b33\b/);
+  assert.match(enriched.turn, /\bBTN_56962166 r6x\b/);
   assert.equal(/\br153\.68\b/.test(enriched.turn), false);
 });
 
@@ -309,6 +342,140 @@ test('enrichHandHistoryParsed keeps target action in natural preflop order betwe
 
   assert.match(
     enriched.preflop,
-    /^BTN r16\.5bb Qs9h8c6h3s \/ SB_HE c16bb AhKsKdQd8d \/ BB c14\.5bb \/ CO c14\.5bb$/
+    /^BTN_56962166 r16\.5bb Qs9h8c6h3s \/ SB_86761294 c16bb AhKsKdQd8d \/ BB_14461705 c14\.5bb \/ CO_15398580 c14\.5bb$/
   );
+});
+
+test('parseHandHistory ignores SUMMARY seat lines and keeps clean player ids', () => {
+  const hh = `
+PokerStars Hand #3:  5 Card Omaha Pot Limit (¥3/¥6 CNY)
+Table 'T' 6-max Seat #2 is the button
+Seat 1: 11111111 (¥1000 in chips)
+Seat 2: 22222222 (¥1000 in chips)
+11111111: posts small blind ¥3
+22222222: posts big blind ¥6
+*** HOLE CARDS ***
+11111111: calls ¥3
+22222222: checks
+*** FLOP *** [Ac Kd 7h]
+11111111: checks
+22222222: bets ¥6
+11111111: folds
+*** SUMMARY ***
+Seat 1: 11111111 folded on the Flop
+Seat 2: 22222222 showed [As Ah Td 9c 4d] and won (¥18)
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  assert.equal(parsed.targetPlayer, '11111111');
+  assert.equal(parsed.positionsByPlayer['11111111'], 'BB');
+  assert.equal(parsed.positionsByPlayer['22222222'], 'BTN');
+});
+
+test('parseHandHistory supports FIRST/SECOND run-it-twice markers and keeps first board', () => {
+  const hh = `
+PokerStars Hand #4:  5 Card Omaha Pot Limit (¥3/¥6 CNY)
+Table 'T' 6-max Seat #2 is the button
+Seat 1: 11111111 (¥1000 in chips)
+Seat 2: 22222222 (¥1000 in chips)
+11111111: posts small blind ¥3
+22222222: posts big blind ¥6
+*** HOLE CARDS ***
+11111111: raises ¥12 to ¥18
+22222222: calls ¥12
+*** FIRST FLOP *** [Ac Kd 7h]
+*** FIRST TURN *** [Ac Kd 7h] [2c]
+*** FIRST RIVER *** [Ac Kd 7h 2c] [3d]
+*** SECOND FLOP *** [Qs Qd 9h]
+*** SECOND TURN *** [Qs Qd 9h] [5s]
+*** SECOND RIVER *** [Qs Qd 9h 5s] [6s]
+*** SHOW DOWN ***
+11111111: shows [Ah As Td 9c 4d]
+22222222: shows [Ks Kc 5h 5d 2s]
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  assert.deepEqual(parsed.board.flop, ['Ac', 'Kd', '7h']);
+  assert.equal(parsed.board.turn, '2c');
+  assert.equal(parsed.board.river, '3d');
+});
+
+test('enrichHandHistoryParsed clears stale semantic text on empty postflop streets', () => {
+  const hh = `
+PokerStars Hand #5:  5 Card Omaha Pot Limit (¥3/¥6 CNY)
+Table 'T' 6-max Seat #2 is the button
+Seat 1: 11111111 (¥1000 in chips)
+Seat 2: 22222222 (¥1000 in chips)
+11111111: posts small blind ¥3
+22222222: posts big blind ¥6
+*** HOLE CARDS ***
+11111111: raises ¥12 to ¥18
+22222222: calls ¥12
+*** FLOP *** [Ac Kd 7h]
+11111111: bets ¥18
+22222222: folds
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  const enriched = enrichHandHistoryParsed(
+    {
+      preflop: 'noise',
+      flop: 'noise',
+      turn: 'qd',
+      river: 'on8k8',
+      presupposition: ''
+    },
+    parsed
+  );
+
+  assert.equal(enriched.turn, '');
+  assert.equal(enriched.river, '');
+});
+
+test('parseHandHistory handles preflop re-raise chain and uncalled-bet return in all-in pot', () => {
+  const parsed = parseHandHistory(SAMPLE_HH_STRADDLE_3BET_ALLIN_UNCALLED, '12121116');
+  const enriched = enrichHandHistoryParsed(
+    { preflop: '', flop: '', turn: '', river: '', presupposition: '' },
+    parsed
+  );
+
+  assert.equal(parsed.streetStartPot.flop, 2070);
+  assert.equal(parsed.showdown.mandatory, true);
+  assert.deepEqual(parsed.showdown.showCardsByPlayer['12121116'], ['Kh', 'Js', '9s', '8c', '7c']);
+  assert.deepEqual(parsed.showdown.showCardsByPlayer['85033665'], ['Ah', 'Ac', 'Kd', '9d', '4h']);
+  assert.match(enriched.preflop, /^BB_12121116 r31bb KhJs9s8c7c \/ SB_85033665 r100bb AhAcKd9d4h \/ BB_12121116 c69bb KhJs9s8c7c$/);
+  assert.match(enriched.flop, /\bSB_85033665 cb8\.7\b/);
+  assert.match(enriched.flop, /\bSB_85033665 cb8\.7 AhAcKd9d4h_[a-z0-9_]+\b/i);
+  assert.match(enriched.flop, /\bBB_12121116 c KhJs9s8c7c_[a-z0-9_]+\b/i);
+  assert.match(enriched.flop, /\bBB_12121116 c\b[^\n]*\ballin\b/i);
+  assert.equal(/\bcb116\.95\b/.test(enriched.flop), false);
+});
+
+test('enrichHandHistoryParsed keeps non-zero flop bet sizing when full uncalled return happens', () => {
+  const hh = `
+PokerStars Hand #999001:  5 Card Omaha Pot Limit (¥1/¥2 CNY)
+Table 'T' 2-max Seat #1 is the button
+Seat 1: 11111111 (¥500 in chips)
+Seat 2: 22222222 (¥500 in chips)
+11111111: posts small blind ¥1
+22222222: posts big blind ¥2
+*** HOLE CARDS ***
+11111111: raises ¥4 to ¥6
+22222222: calls ¥4
+*** FLOP *** [Ah Kd 7c]
+11111111: bets ¥9
+22222222: folds
+Uncalled bet (¥9) returned to 11111111
+*** SUMMARY ***
+Total pot ¥12
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  const enriched = enrichHandHistoryParsed(
+    { preflop: '', flop: '', turn: '', river: '', presupposition: '' },
+    parsed
+  );
+
+  assert.match(enriched.flop, /\bcb75\b/i);
+  assert.equal(/\bb0\b/i.test(enriched.flop), false);
 });

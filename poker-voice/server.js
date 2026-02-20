@@ -30,6 +30,17 @@ import {
   enrichHandHistoryParsed,
   parseHandHistory
 } from './src/handHistory.js';
+import {
+  buildOpponentVisualProfile
+} from './src/visualProfile.js';
+import {
+  buildHandVisualModel
+} from './src/handVisual.js';
+import {
+  extractTargetIdHint,
+  extractTargetIdentity,
+  rowMatchesTargetProfile
+} from './src/profileTarget.js';
 
 dotenv.config();
 
@@ -66,9 +77,14 @@ const NOTS_SEMANTIC_DICTIONARY_PATH = process.env.NOTS_SEMANTIC_DICTIONARY_PATH 
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || '';
 const SHEET_URL = process.env.SHEET_URL || '';
 const SHEET_NAME = process.env.SHEET_NAME || '';
+const SHEET_NAME_VOICE = process.env.SHEET_NAME_VOICE || SHEET_NAME || '';
+const SHEET_NAME_HAND_HISTORY = process.env.SHEET_NAME_HAND_HISTORY || 'Sheet2';
 const VOCAB_PATH = process.env.VOCAB_PATH || path.resolve(process.cwd(), 'vocab.json');
 const REPORTS_PATH = process.env.REPORTS_PATH || path.resolve(process.cwd(), 'reports', 'nots_reports.jsonl');
 const FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
+const VISUAL_PROFILE_CACHE_TTL_MS = Number(process.env.VISUAL_PROFILE_CACHE_TTL_MS || '180000');
+
+const visualProfileCache = new Map();
 
 function loadVocabulary() {
   try {
@@ -92,6 +108,58 @@ function loadSemanticDictionaryText() {
   } catch (error) {
     console.error(`Semantic dictionary load error (${NOTS_SEMANTIC_DICTIONARY_PATH}):`, error.message);
     return '';
+  }
+}
+
+function normalizeSheetName(value, fallback = '') {
+  const direct = String(value || '').trim();
+  if (direct) return direct;
+  return String(fallback || '').trim();
+}
+
+function voiceSheetName() {
+  return normalizeSheetName('', SHEET_NAME_VOICE);
+}
+
+function handHistorySheetName() {
+  return normalizeSheetName('', SHEET_NAME_HAND_HISTORY || SHEET_NAME_VOICE);
+}
+
+function uniqueSheetNames(names = []) {
+  const out = [];
+  const seen = new Set();
+  names.forEach((item) => {
+    const value = String(item || '').trim();
+    const key = value.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(value);
+  });
+  return out;
+}
+
+function resolveSheetNamesBySource(source = 'all') {
+  const mode = String(source || 'all').trim().toLowerCase();
+  if (mode === 'voice') {
+    return uniqueSheetNames([voiceSheetName()]);
+  }
+  if (mode === 'hh' || mode === 'handhistory' || mode === 'hand_history') {
+    return uniqueSheetNames([handHistorySheetName()]);
+  }
+  return uniqueSheetNames([voiceSheetName(), handHistorySheetName()]);
+}
+
+function makeVisualProfileCacheKey(opponent, scope = 'all') {
+  return `${String(scope || 'all').toLowerCase()}::${String(opponent || '').trim().toLowerCase()}`;
+}
+
+function clearProfileCacheForOpponent(opponent) {
+  const suffix = `::${String(opponent || '').trim().toLowerCase()}`;
+  if (!suffix || suffix === '::') return;
+  for (const key of visualProfileCache.keys()) {
+    if (String(key).endsWith(suffix)) {
+      visualProfileCache.delete(key);
+    }
   }
 }
 
@@ -158,14 +226,6 @@ function buildSemanticFieldPromptPayload(transcript, field, vocabulary, semantic
   };
 }
 
-function extractTargetIdHint(opponent) {
-  const match = String(opponent || '').match(/\d{4,}/g);
-  if (!match || !match.length) {
-    return '';
-  }
-  return match[match.length - 1];
-}
-
 function buildHandHistoryPromptPayload(handHistory, opponent, parsedContext, vocabulary, semanticDictionaryText) {
   const textAliases = Object.entries(vocabulary.textAliases || {})
     .slice(0, 240)
@@ -178,15 +238,16 @@ function buildHandHistoryPromptPayload(handHistory, opponent, parsedContext, voc
     .map(([spoken, target]) => ({ spoken, target }));
 
   return {
-    task: 'Convert poker hand history into canonical nots fields for one selected opponent.',
+    task: 'Convert poker hand history into canonical nots fields.',
     target_opponent: opponent,
     target_id_hint: extractTargetIdHint(opponent),
     hand_history: String(handHistory || '').slice(0, 120000),
     canonical_rules: [
       'Return only JSON.',
       'Keys must be exactly: preflop, flop, turn, river, presupposition, confidence, unresolved.',
-      'Focus on selected target opponent actions and opponent reactions.',
-      'Mark target position as <POS>_HE (example: HJ_HE, SB_HE).',
+      'If target_opponent is provided: focus on that target actions.',
+      'If target_opponent is empty: keep full action sequence with actor markers for all involved players.',
+      'Format actor markers as <POS>_<PLAYER_ID> (example: HJ_12121116, SB_85033665).',
       'Keep action order exactly as in hand history per street.',
       'Do NOT use actor markers i/he in output.',
       'Preflop sizings must be in BB units.',
@@ -494,6 +555,68 @@ function normalizeHandHistoryParsed(rawParsed, vocabulary) {
   return parsed;
 }
 
+function splitHandHistoryText(rawText) {
+  const text = String(rawText || '').replace(/\r\n/g, '\n').trim();
+  if (!text) return [];
+
+  const matches = text.match(/PokerStars Hand #\d+:[\s\S]*?(?=PokerStars Hand #\d+:|$)/gi);
+  if (matches && matches.length) {
+    return matches
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [text];
+}
+
+function decodeTextBuffer(buffer) {
+  if (!buffer) return '';
+  return Buffer.from(buffer).toString('utf8');
+}
+
+async function processHandHistoryToSheets(handHistory, opponent, vocabulary, targetSheetName) {
+  const parsedHH = parseHandHistory(handHistory, opponent);
+  const parsedContext = buildHandHistoryContext(parsedHH);
+
+  const semanticResult = await parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary);
+
+  let parsed = normalizeHandHistoryParsed(semanticResult.parsed, vocabulary);
+  parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
+  parsed = enrichHandHistoryParsed(parsed, parsedHH);
+
+  if (!hasAnyParsedField(parsed)) {
+    throw new Error('Не удалось извлечь структуру раздачи из hand history.');
+  }
+
+  const sheetsResult = await postToSheets({
+    source: 'hh',
+    opponent: 'HH',
+    preflop: parsed.preflop,
+    flop: parsed.flop,
+    turn: parsed.turn,
+    river: parsed.river,
+    presupposition: parsed.presupposition,
+    sheetName: targetSheetName || undefined
+  });
+
+  if (sheetsResult?.ok === false) {
+    throw new Error(sheetsResult.error || 'Apps Script вернул ошибку.');
+  }
+
+  return {
+    parsed,
+    row: sheetsResult?.row || null,
+    sheetName: sheetsResult?.sheetName || targetSheetName || null,
+    parser: {
+      source: 'semantic_llm',
+      model: semanticResult.modelUsed,
+      confidence: semanticResult.confidence,
+      unresolved: [...(semanticResult.unresolved || []), `target_player=${parsedHH.targetPlayer || 'none'}`],
+      semanticError: null
+    },
+    targetPlayer: parsedHH.targetPlayer
+  };
+}
+
 async function transcribeAudio(buffer, filename, mimetype) {
   if (!OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY не задан.');
@@ -597,18 +720,38 @@ app.get('/api/opponent-suggestions', async (req, res) => {
       return res.json({ ok: true, opponents: [] });
     }
 
-    const result = await postToSheets({
-      action: 'list_opponents',
-      query,
-      limit,
-      sheetName: SHEET_NAME || undefined
-    });
+    const sheets = resolveSheetNamesBySource('all');
+    const lists = [];
+    for (const sheetName of sheets) {
+      const result = await postToSheets({
+        action: 'list_opponents',
+        query,
+        limit,
+        sheetName: sheetName || undefined
+      });
 
-    if (result?.ok === false) {
-      return res.status(500).json({ error: result.error || 'Ошибка поиска оппонентов в Sheets.' });
+      if (result?.ok === false) {
+        return res.status(500).json({ error: result.error || `Ошибка поиска оппонентов в листе ${sheetName || 'active'}.` });
+      }
+      lists.push(Array.isArray(result?.opponents) ? result.opponents : []);
     }
 
-    const opponents = Array.isArray(result?.opponents) ? result.opponents : [];
+    const merged = [];
+    const seen = new Set();
+    for (const items of lists) {
+      for (const name of items) {
+        const value = String(name || '').trim();
+        if (!value) continue;
+        const key = value.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(value);
+        if (merged.length >= limit) break;
+      }
+      if (merged.length >= limit) break;
+    }
+
+    const opponents = merged.slice(0, limit);
     return res.json({ ok: true, opponents });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
@@ -625,17 +768,27 @@ app.get('/api/open-link', async (req, res) => {
       return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
     }
 
-    const lookupResult = await postToSheets({
-      action: 'find_first_row',
-      opponent,
-      sheetName: SHEET_NAME || undefined
-    });
+    const sheets = resolveSheetNamesBySource('all');
+    let lookupResult = null;
+    let foundSheet = '';
 
-    if (lookupResult?.ok === false) {
-      return res.status(500).json({ error: lookupResult.error || 'Ошибка поиска строки в Sheets.' });
+    for (const sheetName of sheets) {
+      const result = await postToSheets({
+        action: 'find_first_row',
+        opponent,
+        sheetName: sheetName || undefined
+      });
+      if (result?.ok === false) {
+        return res.status(500).json({ error: result.error || `Ошибка поиска строки в листе ${sheetName || 'active'}.` });
+      }
+      if (result?.found && result?.row) {
+        lookupResult = result;
+        foundSheet = result.sheetName || sheetName || '';
+        break;
+      }
     }
 
-    if (!lookupResult?.found || !lookupResult?.row) {
+    if (!lookupResult || !lookupResult?.found || !lookupResult?.row) {
       return res.status(404).json({ error: 'Никнейм не найден в таблице.' });
     }
 
@@ -654,10 +807,111 @@ app.get('/api/open-link', async (req, res) => {
       ok: true,
       opponent,
       row: lookupResult.row,
+      sheetName: foundSheet || null,
       url
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка открытия таблицы.' });
+  }
+});
+
+app.get('/api/opponent-visual-profile', async (req, res) => {
+  try {
+    const opponent = String(req.query.opponent || '').trim();
+    const targetId = extractTargetIdHint(opponent);
+    const targetIdentity = extractTargetIdentity(opponent);
+    const source = String(req.query.source || 'all').trim().toLowerCase();
+    const force = String(req.query.force || '').trim() === '1';
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(5000, Math.trunc(limitRaw)))
+      : 2000;
+
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран оппонент.' });
+    }
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    }
+
+    const sheets = resolveSheetNamesBySource(source || 'all');
+    const scopeLabel = `${source || 'all'}:${sheets.join('|').toLowerCase()}`;
+    const cacheKey = makeVisualProfileCacheKey(opponent, scopeLabel);
+    const now = Date.now();
+    const cached = visualProfileCache.get(cacheKey);
+    if (!force && cached && (now - cached.savedAt) < VISUAL_PROFILE_CACHE_TTL_MS) {
+      return res.json({ ok: true, cached: true, profile: cached.profile });
+    }
+
+    const allRows = [];
+    const bySheet = [];
+    const hhSheetNameLc = String(handHistorySheetName() || '').trim().toLowerCase();
+
+    for (const sheetName of sheets) {
+      const requestedSheetName = String(sheetName || '').trim();
+      const isHandHistorySheet = requestedSheetName.toLowerCase() === hhSheetNameLc;
+      const requiresGlobalScan = Boolean(targetIdentity) && (Boolean(targetId) || isHandHistorySheet);
+      const action = requiresGlobalScan ? 'get_all_rows' : 'get_opponent_rows';
+      const rowsResult = await postToSheets({
+        action,
+        opponent,
+        limit,
+        sheetName: sheetName || undefined
+      });
+
+      if (rowsResult?.ok === false) {
+        return res.status(500).json({ error: rowsResult.error || `Ошибка чтения строк оппонента из листа ${sheetName || 'active'}.` });
+      }
+
+      const rowsRaw = Array.isArray(rowsResult?.rows) ? rowsResult.rows : [];
+      const rows = requiresGlobalScan
+        ? rowsRaw.filter((row) => rowMatchesTargetProfile(row, opponent, targetIdentity))
+        : rowsRaw;
+      const resolvedSheetName = String(rowsResult?.sheetName || sheetName || '').trim();
+      rows.forEach((row) => {
+        allRows.push({
+          ...row,
+          rowLabel: `#${resolvedSheetName || 'Sheet'}:${row?.row ?? '?'}`
+        });
+      });
+      bySheet.push({
+        sheetName: resolvedSheetName || null,
+        rows: rows.length
+      });
+    }
+
+    const profile = buildOpponentVisualProfile(allRows, { opponent });
+    profile.sources = bySheet;
+
+    visualProfileCache.set(cacheKey, {
+      savedAt: now,
+      profile
+    });
+
+    return res.json({
+      ok: true,
+      cached: false,
+      profile
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка построения визуального профиля.' });
+  }
+});
+
+app.post('/api/visualize-hand', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    const handHistory = String(req.body?.handHistory || '').trim();
+    if (!handHistory) {
+      return res.status(400).json({ error: 'Hand history пустая.' });
+    }
+
+    const parsedHH = parseHandHistory(handHistory, opponent);
+
+    const visual = buildHandVisualModel(handHistory, parsedHH);
+    return res.json({ ok: true, visual });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка визуализации hand history.' });
   }
 });
 
@@ -700,6 +954,7 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
       return res.status(422).json({ error: `${ruleResult.error}${detail}`, transcript });
     }
 
+    const targetSheetName = voiceSheetName();
     const payload = {
       opponent,
       preflop: parsed.preflop,
@@ -707,19 +962,21 @@ app.post('/api/record', upload.single('audio'), async (req, res) => {
       turn: parsed.turn,
       river: parsed.river,
       presupposition: parsed.presupposition,
-      sheetName: SHEET_NAME || undefined
+      sheetName: targetSheetName || undefined
     };
 
     const sheetsResult = await postToSheets(payload);
     if (sheetsResult?.ok === false) {
       throw new Error(sheetsResult.error || 'Apps Script вернул ошибку.');
     }
+    clearProfileCacheForOpponent(opponent);
 
     return res.json({
       ok: true,
       transcript,
       parsed,
       row: sheetsResult?.row || null,
+      sheetName: sheetsResult?.sheetName || targetSheetName || null,
       parser: {
         source: parserSource,
         model: semanticResult.modelUsed,
@@ -738,9 +995,6 @@ app.post('/api/record-hand-history', async (req, res) => {
     const opponent = String(req.body?.opponent || '').trim();
     const handHistory = String(req.body?.handHistory || '').trim();
 
-    if (!opponent) {
-      return res.status(400).json({ error: 'Не выбран оппонент.' });
-    }
     if (!handHistory) {
       return res.status(400).json({ error: 'Hand history пустая.' });
     }
@@ -751,66 +1005,128 @@ app.post('/api/record-hand-history', async (req, res) => {
       return res.status(400).json({ error: 'Для hand history нужен semantic parser (NOTS_SEMANTIC_ENABLED=1).' });
     }
 
+    const targetSheetName = handHistorySheetName();
     const vocabulary = loadVocabulary();
-    const parsedHH = parseHandHistory(handHistory, opponent);
-    const parsedContext = buildHandHistoryContext(parsedHH);
-
-    if (!parsedHH.targetPlayer) {
-      return res.status(422).json({
-        error: 'Не удалось определить выбранного игрока в hand history. Выбери оппонента с ID из HH.',
-        transcript: handHistory
-      });
-    }
-
-    const semanticResult = await parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary);
-
-    let parsed = normalizeHandHistoryParsed(semanticResult.parsed, vocabulary);
-    parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
-    parsed = enrichHandHistoryParsed(parsed, parsedHH);
-
-    if (!hasAnyParsedField(parsed)) {
-      return res.status(422).json({
-        error: 'Не удалось извлечь структуру раздачи из hand history.',
-        transcript: handHistory,
-        parser: {
-          source: 'semantic_llm',
-          model: semanticResult.modelUsed,
-          confidence: semanticResult.confidence,
-          unresolved: semanticResult.unresolved,
-          semanticError: null
-        }
-      });
-    }
-
-    const sheetsResult = await postToSheets({
-      opponent,
-      preflop: parsed.preflop,
-      flop: parsed.flop,
-      turn: parsed.turn,
-      river: parsed.river,
-      presupposition: parsed.presupposition,
-      sheetName: SHEET_NAME || undefined
-    });
-
-    if (sheetsResult?.ok === false) {
-      throw new Error(sheetsResult.error || 'Apps Script вернул ошибку.');
-    }
+    const result = await processHandHistoryToSheets(handHistory, opponent, vocabulary, targetSheetName);
+    clearProfileCacheForOpponent(opponent || result.targetPlayer || '');
 
     return res.json({
       ok: true,
       transcript: handHistory,
-      parsed,
-      row: sheetsResult?.row || null,
-      parser: {
-        source: 'semantic_llm',
-        model: semanticResult.modelUsed,
-        confidence: semanticResult.confidence,
-        unresolved: [...(semanticResult.unresolved || []), `target_player=${parsedHH.targetPlayer}`],
-        semanticError: null
-      }
+      parsed: result.parsed,
+      row: result.row,
+      sheetName: result.sheetName,
+      targetPlayer: result.targetPlayer || null,
+      parser: result.parser
     });
   } catch (error) {
-    return res.status(500).json({ error: error.message || 'Ошибка разбора hand history.' });
+    const message = error.message || 'Ошибка разбора hand history.';
+    const code = /Не удалось извлечь структуру/i.test(message) ? 422 : 500;
+    return res.status(code).json({ error: message });
+  }
+});
+
+app.post('/api/record-hand-history-files', upload.array('files', 200), async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    const files = Array.isArray(req.files) ? req.files : [];
+    const maxHandsRaw = Number(req.body?.maxHands);
+    const maxHands = Number.isFinite(maxHandsRaw) && maxHandsRaw > 0
+      ? Math.trunc(maxHandsRaw)
+      : 0;
+
+    if (!files.length) {
+      return res.status(400).json({ error: 'Файлы hand history не загружены.' });
+    }
+    if (!SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    }
+    if (!NOTS_SEMANTIC_ENABLED) {
+      return res.status(400).json({ error: 'Для hand history нужен semantic parser (NOTS_SEMANTIC_ENABLED=1).' });
+    }
+
+    const targetSheetName = handHistorySheetName();
+    const vocabulary = loadVocabulary();
+    const affectedOpponents = new Set();
+    let totalHands = 0;
+    let savedHands = 0;
+    let failedHands = 0;
+    const errors = [];
+    const savedRows = [];
+    let lastResult = null;
+
+    outer:
+    for (const file of files) {
+      const text = decodeTextBuffer(file.buffer);
+      const hands = splitHandHistoryText(text);
+      for (let i = 0; i < hands.length; i += 1) {
+        if (maxHands > 0 && totalHands >= maxHands) {
+          break outer;
+        }
+        const handHistory = hands[i];
+        if (!handHistory) continue;
+        totalHands += 1;
+
+        try {
+          const result = await processHandHistoryToSheets(handHistory, opponent, vocabulary, targetSheetName);
+          if (opponent) affectedOpponents.add(opponent);
+          if (result?.targetPlayer) affectedOpponents.add(result.targetPlayer);
+          savedHands += 1;
+          lastResult = {
+            transcript: handHistory,
+            ...result
+          };
+          if (savedRows.length < 150) {
+            savedRows.push({
+              file: file.originalname || `file_${savedRows.length + 1}`,
+              handIndex: i + 1,
+              row: result.row,
+              sheetName: result.sheetName
+            });
+          }
+        } catch (error) {
+          failedHands += 1;
+          if (errors.length < 80) {
+            errors.push({
+              file: file.originalname || '',
+              handIndex: i + 1,
+              error: error.message || 'Ошибка разбора hand history.'
+            });
+          }
+        }
+      }
+    }
+
+    if (!totalHands) {
+      return res.status(422).json({ error: 'В загруженных файлах не найдено ни одной hand history.' });
+    }
+
+    if (savedHands > 0) {
+      affectedOpponents.forEach((name) => clearProfileCacheForOpponent(name));
+    }
+
+    return res.json({
+      ok: true,
+      opponent: opponent || null,
+      files: files.length,
+      totalHands,
+      savedHands,
+      failedHands,
+      sheetName: targetSheetName || null,
+      rows: savedRows,
+      errors,
+      last: lastResult
+        ? {
+          transcript: lastResult.transcript,
+          parsed: lastResult.parsed,
+          row: lastResult.row,
+          sheetName: lastResult.sheetName,
+          parser: lastResult.parser
+        }
+        : null
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка пакетного разбора hand history.' });
   }
 });
 
@@ -819,6 +1135,7 @@ app.post('/api/record-field', upload.single('audio'), async (req, res) => {
     const opponent = String(req.body.opponent || '').trim();
     const field = String(req.body.field || '').trim().toLowerCase();
     const row = Number(req.body.row);
+    const targetSheetName = normalizeSheetName(req.body.sheetName, voiceSheetName());
 
     if (!opponent) {
       return res.status(400).json({ error: 'Не выбран оппонент.' });
@@ -863,12 +1180,13 @@ app.post('/api/record-field', upload.single('audio'), async (req, res) => {
       field,
       value,
       opponent,
-      sheetName: SHEET_NAME || undefined
+      sheetName: targetSheetName || undefined
     });
 
     if (sheetsResult?.ok === false) {
       throw new Error(sheetsResult.error || 'Apps Script вернул ошибку при обновлении поля.');
     }
+    clearProfileCacheForOpponent(opponent);
 
     return res.json({
       ok: true,
@@ -876,6 +1194,7 @@ app.post('/api/record-field', upload.single('audio'), async (req, res) => {
       row,
       field,
       value,
+      sheetName: sheetsResult?.sheetName || targetSheetName || null,
       parser: {
         source: parserSource,
         model: semanticResult.modelUsed,
@@ -895,6 +1214,7 @@ app.post('/api/update-field-text', async (req, res) => {
     const field = String(req.body.field || '').trim().toLowerCase();
     const row = Number(req.body.row);
     const value = normalizeOutputPunctuation(String(req.body.value || ''));
+    const targetSheetName = normalizeSheetName(req.body.sheetName, voiceSheetName());
 
     if (!opponent) {
       return res.status(400).json({ error: 'Не выбран оппонент.' });
@@ -915,18 +1235,20 @@ app.post('/api/update-field-text', async (req, res) => {
       field,
       value,
       opponent,
-      sheetName: SHEET_NAME || undefined
+      sheetName: targetSheetName || undefined
     });
 
     if (sheetsResult?.ok === false) {
       throw new Error(sheetsResult.error || 'Apps Script вернул ошибку при ручной правке поля.');
     }
+    clearProfileCacheForOpponent(opponent);
 
     return res.json({
       ok: true,
       row,
       field,
-      value
+      value,
+      sheetName: sheetsResult?.sheetName || targetSheetName || null
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Ошибка сервера.' });
@@ -952,6 +1274,7 @@ const server = app.listen(port, host, () => {
   console.log(`Poker Voice Logger: http://${host}:${port}`);
   console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE || 'auto'} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
   console.log(`Semantic parser: ${NOTS_SEMANTIC_ENABLED ? 'on' : 'off'} primary=${NOTS_SEMANTIC_MODEL} fallbacks=[${NOTS_SEMANTIC_MODEL_FALLBACKS.join(', ')}] dict=${NOTS_SEMANTIC_DICTIONARY_PATH}`);
+  console.log(`Sheets config: voice=${voiceSheetName() || 'active-sheet'} hand_history=${handHistorySheetName() || voiceSheetName() || 'active-sheet'}`);
   console.log(`Reports path: ${REPORTS_PATH}`);
 });
 

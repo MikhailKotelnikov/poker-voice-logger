@@ -60,10 +60,10 @@
       <section class="panel" id="hand-history-panel">
         <div class="panel-head">
           <h2>Hand History</h2>
-          <span class="hint">вставь HH и запиши на выбранного оппа</span>
+          <span class="hint">вставь HH и запиши (выбор оппа необязателен)</span>
         </div>
         <div class="hh-target-picker">
-          <p class="label">Целевой оппонент для HH</p>
+          <p class="label">Опциональный таргет для HH</p>
           <div id="hh-opponent-list" class="hh-opponent-list"></div>
         </div>
         <textarea
@@ -72,10 +72,16 @@
           rows="10"
           placeholder="Вставь hand history из PokerTracker / Hand2Note..."
         ></textarea>
+        <div class="hh-files-row">
+          <input id="hand-history-files" type="file" multiple accept=".txt,.log,.hh,.json,text/plain" />
+          <button id="submit-hand-history-files" class="ghost" type="button" disabled>Разобрать файлы HH</button>
+        </div>
         <div class="hand-history-actions">
           <button id="submit-hand-history" type="button" disabled>Разобрать HH и записать</button>
+          <button id="preview-hand-history" class="ghost" type="button" disabled>Визуализировать HH</button>
           <button id="clear-hand-history" class="ghost" type="button" disabled>Очистить</button>
         </div>
+        <div id="hand-visual" class="hand-visual hidden"></div>
       </section>
 
       <section class="panel" id="result-panel">
@@ -101,6 +107,18 @@
         <div class="status" id="status">Готово к записи.</div>
       </section>
     </div>
+
+    <div id="profile-modal" class="profile-modal hidden" aria-hidden="true">
+      <div class="profile-modal-card" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+        <div class="profile-head">
+          <h3 id="profile-title">Профиль оппонента</h3>
+          <button id="profile-close" class="ghost" type="button">закрыть</button>
+        </div>
+        <div id="profile-meta" class="profile-meta">—</div>
+        <div id="profile-content" class="profile-content"></div>
+      </div>
+    </div>
+    <div id="profile-tooltip" class="profile-tooltip hidden" aria-hidden="true"></div>
 
     <script src="/app.js"></script>
   </body>

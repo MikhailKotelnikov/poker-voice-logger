@@ -66,7 +66,20 @@ function doPost(e) {
       }, 200);
     }
 
-    if (!data.opponent) {
+    if (data.action === 'get_opponent_rows') {
+      if (!data.opponent) {
+        return jsonResponse({ ok: false, error: 'Нет opponent.' }, 400);
+      }
+      return jsonResponse(listOpponentRowsPayload_(sheet, data.opponent, data.limit), 200);
+    }
+
+    if (data.action === 'get_all_rows') {
+      return jsonResponse(listAllRowsPayload_(sheet, data.limit), 200);
+    }
+
+    var sourceMode = asText_(data.source).toLowerCase();
+    var isHandHistorySource = sourceMode === 'hh' || sourceMode === 'hand_history' || sourceMode === 'handhistory';
+    if (!data.opponent && !isHandHistorySource) {
       return jsonResponse({ ok: false, error: 'Нет opponent.' }, 400);
     }
 
@@ -74,7 +87,11 @@ function doPost(e) {
     var targetRow = 0;
     var separatorRow = 0;
 
-    if (lastOpponentRow) {
+    if (isHandHistorySource && !data.opponent) {
+      var anchorRow = findLastContentRow_(sheet);
+      sheet.insertRowAfter(anchorRow);
+      targetRow = anchorRow + 1;
+    } else if (lastOpponentRow) {
       sheet.insertRowAfter(lastOpponentRow);
       targetRow = lastOpponentRow + 1;
     } else {
@@ -84,7 +101,7 @@ function doPost(e) {
     }
 
     var rowValues = emptyRow_();
-    rowValues[COL_NICKNAME - 1] = data.opponent || '';
+    rowValues[COL_NICKNAME - 1] = data.opponent || (isHandHistorySource ? 'HH' : '');
     rowValues[COL_PREFLOP - 1] = data.preflop || '';
     rowValues[COL_FLOP - 1] = data.flop || '';
     rowValues[COL_TURN - 1] = data.turn || '';
@@ -146,6 +163,31 @@ function createRowForNewOpponent_(sheet) {
   return { targetRow: lastRow + 2, separatorRow: lastRow + 1 };
 }
 
+function findLastContentRow_(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < FIRST_DATA_ROW) {
+    return HEADER_ROW;
+  }
+
+  var scanToCol = COL_PRESUPPOSITION + 2;
+  var values = sheet.getRange(FIRST_DATA_ROW, 1, lastRow - HEADER_ROW, scanToCol).getValues();
+  for (var i = values.length - 1; i >= 0; i--) {
+    var row = values[i];
+    var hasContent = false;
+    for (var col = 0; col < row.length; col++) {
+      if (asText_(row[col]) !== '') {
+        hasContent = true;
+        break;
+      }
+    }
+    if (hasContent) {
+      return FIRST_DATA_ROW + i;
+    }
+  }
+
+  return HEADER_ROW;
+}
+
 function findFirstRowPayload_(sheet, opponent) {
   var result = {
     ok: true,
@@ -162,10 +204,12 @@ function findFirstRowPayload_(sheet, opponent) {
     return result;
   }
 
-  var values = sheet.getRange(FIRST_DATA_ROW, COL_NICKNAME, lastRow - HEADER_ROW, 1).getValues();
+  var values = sheet.getRange(FIRST_DATA_ROW, 1, lastRow - HEADER_ROW, TOTAL_COLUMNS).getValues();
+  var idHint = extractIdHint_(opponent);
   for (var i = 0; i < values.length; i++) {
-    var nick = asText_(values[i][0]);
-    if (nick === opponent) {
+    var row = values[i];
+    var nick = asText_(row[COL_NICKNAME - 1]);
+    if (nick === opponent || (idHint && rowContainsIdHint_(row, idHint))) {
       result.row = FIRST_DATA_ROW + i;
       result.found = true;
       return result;
@@ -181,7 +225,7 @@ function listOpponentsPayload_(sheet, query, limit) {
     return { ok: true, opponents: [] };
   }
 
-  var values = sheet.getRange(FIRST_DATA_ROW, COL_NICKNAME, lastRow - HEADER_ROW, 1).getValues();
+  var values = sheet.getRange(FIRST_DATA_ROW, 1, lastRow - HEADER_ROW, TOTAL_COLUMNS).getValues();
   var q = asText_(query).toLowerCase();
   var max = Number(limit);
   if (!max || max < 1) max = 50;
@@ -191,19 +235,148 @@ function listOpponentsPayload_(sheet, query, limit) {
   var items = [];
 
   for (var i = values.length - 1; i >= 0; i--) {
-    var nick = asText_(values[i][0]);
-    if (!nick) continue;
+    var row = values[i];
+    var nick = asText_(row[COL_NICKNAME - 1]);
+    var candidates = [];
+    if (nick) {
+      candidates.push(nick);
+    }
+    candidates = candidates.concat(extractActorIdsFromRow_(row));
 
-    var lower = nick.toLowerCase();
-    if (q && lower.indexOf(q) === -1) continue;
-    if (seen[lower]) continue;
+    for (var c = 0; c < candidates.length; c++) {
+      var candidate = asText_(candidates[c]);
+      if (!candidate) continue;
+      var lower = candidate.toLowerCase();
+      if (q && lower.indexOf(q) === -1) continue;
+      if (seen[lower]) continue;
 
-    seen[lower] = true;
-    items.push(nick);
+      seen[lower] = true;
+      items.push(candidate);
+      if (items.length >= max) break;
+    }
     if (items.length >= max) break;
   }
 
   return { ok: true, opponents: items };
+}
+
+function listOpponentRowsPayload_(sheet, opponent, limit) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < FIRST_DATA_ROW) {
+    return { ok: true, opponent: opponent, sheetName: sheet.getName(), rows: [] };
+  }
+
+  var max = Number(limit);
+  if (!max || max < 1) max = 500;
+  if (max > 5000) max = 5000;
+
+  var values = sheet.getRange(FIRST_DATA_ROW, 1, lastRow - HEADER_ROW, TOTAL_COLUMNS).getValues();
+  var rows = [];
+
+  for (var i = values.length - 1; i >= 0; i--) {
+    var row = values[i];
+    var nick = asText_(row[COL_NICKNAME - 1]);
+    if (nick !== opponent) continue;
+
+    rows.push({
+      row: FIRST_DATA_ROW + i,
+      preflop: joinRowCells_(row, COL_PREFLOP, COL_PREFLOP_2),
+      flop: joinRowCells_(row, COL_FLOP, COL_FLOP + 2),
+      turn: joinRowCells_(row, COL_TURN, COL_TURN + 2),
+      river: joinRowCells_(row, COL_RIVER, COL_RIVER + 2),
+      presupposition: joinRowCells_(row, COL_PRESUPPOSITION, COL_PRESUPPOSITION + 2),
+      date: asText_(row[COL_DATE - 1])
+    });
+
+    if (rows.length >= max) break;
+  }
+
+  rows.reverse();
+  return { ok: true, opponent: opponent, sheetName: sheet.getName(), rows: rows };
+}
+
+function listAllRowsPayload_(sheet, limit) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < FIRST_DATA_ROW) {
+    return { ok: true, sheetName: sheet.getName(), rows: [] };
+  }
+
+  var max = Number(limit);
+  if (!max || max < 1) max = 500;
+  if (max > 5000) max = 5000;
+
+  var values = sheet.getRange(FIRST_DATA_ROW, 1, lastRow - HEADER_ROW, TOTAL_COLUMNS).getValues();
+  var rows = [];
+
+  for (var i = values.length - 1; i >= 0; i--) {
+    var row = values[i];
+    rows.push({
+      row: FIRST_DATA_ROW + i,
+      nickname: asText_(row[COL_NICKNAME - 1]),
+      preflop: joinRowCells_(row, COL_PREFLOP, COL_PREFLOP_2),
+      flop: joinRowCells_(row, COL_FLOP, COL_FLOP + 2),
+      turn: joinRowCells_(row, COL_TURN, COL_TURN + 2),
+      river: joinRowCells_(row, COL_RIVER, COL_RIVER + 2),
+      presupposition: joinRowCells_(row, COL_PRESUPPOSITION, COL_PRESUPPOSITION + 2),
+      date: asText_(row[COL_DATE - 1])
+    });
+
+    if (rows.length >= max) break;
+  }
+
+  rows.reverse();
+  return { ok: true, sheetName: sheet.getName(), rows: rows };
+}
+
+function joinRowCells_(rowValues, startCol, endCol) {
+  var parts = [];
+  var from = Math.max(1, Number(startCol) || 1);
+  var to = Math.max(from, Number(endCol) || from);
+  for (var col = from; col <= to; col++) {
+    if (col > rowValues.length) break;
+    var value = asText_(rowValues[col - 1]);
+    if (value) parts.push(value);
+  }
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function extractIdHint_(value) {
+  var source = asText_(value);
+  if (!source) return '';
+  var match = source.match(/\d{4,}/g);
+  if (!match || !match.length) return '';
+  return match[match.length - 1];
+}
+
+function rowContainsIdHint_(rowValues, idHint) {
+  if (!idHint) return false;
+  var regex = new RegExp('\\b[A-Za-z0-9]+_' + idHint + '\\b', 'i');
+  for (var col = COL_PREFLOP; col <= COL_PRESUPPOSITION + 2; col++) {
+    if (col > rowValues.length) break;
+    var value = asText_(rowValues[col - 1]);
+    if (!value) continue;
+    if (regex.test(value)) return true;
+  }
+  return false;
+}
+
+function extractActorIdsFromRow_(rowValues) {
+  var out = [];
+  var seen = {};
+  for (var col = COL_PREFLOP; col <= COL_PRESUPPOSITION + 2; col++) {
+    if (col > rowValues.length) break;
+    var value = asText_(rowValues[col - 1]);
+    if (!value) continue;
+    var matches = value.match(/[A-Za-z0-9]+_(\d{4,})/g) || [];
+    for (var i = 0; i < matches.length; i++) {
+      var actor = matches[i];
+      var id = actor.split('_')[1] || '';
+      if (!id || seen[id]) continue;
+      seen[id] = true;
+      out.push(id);
+    }
+  }
+  return out;
 }
 
 function ensureLayout_(sheet) {
