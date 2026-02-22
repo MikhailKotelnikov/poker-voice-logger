@@ -5,6 +5,7 @@ const STRENGTH_ORDER = [
   'nuts',
   'strong',
   'conditionalStrong',
+  'fragileStrong',
   'overpair',
   'twoPair',
   'topPair',
@@ -18,7 +19,8 @@ const STRENGTH_ORDER = [
 const LEGEND = [
   { key: 'nuts', label: 'nuts / top full+', color: '#8f2a5c' },
   { key: 'strong', label: 'strong made', color: '#d76575' },
-  { key: 'conditionalStrong', label: 'Sx fold-out strong', color: 'rgba(227, 74, 85, 0.45)' },
+  { key: 'conditionalStrong', label: 'Sx fold-out strong', color: '#efb8bf' },
+  { key: 'fragileStrong', label: 'fragile strong (board discount)', color: '#f8d8df' },
   { key: 'overpair', label: 'overpair', color: '#c9a77a' },
   { key: 'twoPair', label: 'two pair', color: '#f09b4e' },
   { key: 'topPair', label: 'top pair', color: '#f1c84c' },
@@ -85,6 +87,7 @@ function createBucketCounters() {
       nuts: 0,
       strong: 0,
       conditionalStrong: 0,
+      fragileStrong: 0,
       overpair: 0,
       twoPair: 0,
       topPair: 0,
@@ -98,6 +101,7 @@ function createBucketCounters() {
         nuts: [],
         strong: [],
         conditionalStrong: [],
+        fragileStrong: [],
         overpair: [],
         twoPair: [],
         topPair: [],
@@ -127,9 +131,18 @@ function detectBucket(textRaw) {
   const text = cleanText(textRaw).toLowerCase();
   if (!text) return null;
 
-  const sizingMatch = text.match(/\b(?:cb|bbb|bb|bxb|tpb|tp|fp|d|r|b)\s*(\d+(?:\.\d+)?)\b/i);
-  if (sizingMatch) {
-    const size = Number(sizingMatch[1]);
+  const sizingTokenRegex = /\b(cb|bbb|bb|bxb|tpb|tp|fp|d|r|b)\s*(\d+(?:\.\d+)?)(x)?\b/ig;
+  let hasSizedAction = false;
+  let hasRaiseByX = false;
+  for (const match of text.matchAll(sizingTokenRegex)) {
+    const prefix = String(match?.[1] || '').toLowerCase();
+    const isRaiseByX = prefix === 'r' && String(match?.[3] || '').toLowerCase() === 'x';
+    if (isRaiseByX) {
+      hasRaiseByX = true;
+      continue;
+    }
+    hasSizedAction = true;
+    const size = Number(match?.[2]);
     if (Number.isFinite(size)) {
       if (size <= 0) return null;
       if (size < 30) return '2';
@@ -143,8 +156,7 @@ function detectBucket(textRaw) {
 
   if (/\bmiss\b/i.test(text)) return 'Miss';
   const hasCheck = /\b(?:x|xb|xc|xf)\b/i.test(text);
-  const hasSizedAction = /\b(?:cb|bbb|bb|bxb|tpb|tp|fp|d|r|b)\s*\d+(?:\.\d+)?\b/i.test(text);
-  if (hasCheck && !hasSizedAction) return 'Miss';
+  if (hasCheck && !hasSizedAction && !hasRaiseByX) return 'Miss';
 
   return null;
 }
@@ -171,6 +183,7 @@ function parseStreetActionToken(actionRaw) {
   if (/^(?:x|xb)$/.test(token)) return { kind: 'check', size: null };
   if (/^(?:f|xf)$/.test(token)) return { kind: 'fold', size: null };
   if (/^c(?:\d+(?:\.\d+)?(?:bb)?)?$/.test(token)) return { kind: 'call', size: null };
+  if (/^r\d+(?:\.\d+)?x$/i.test(token)) return { kind: 'raise', size: null };
   const sizeMatch = token.match(/^(?:cb|bbb|bb|bxb|tpb|tp|fp|d|r|b)(\d+(?:\.\d+)?)(?:x)?$/i);
   if (sizeMatch) {
     const size = Number(sizeMatch[1]);
@@ -222,7 +235,7 @@ function extractStreetActionSummary(textRaw) {
   for (const parsed of segments) {
     if (parsed.kind === 'other') continue;
     hasAction = true;
-    if (parsed.kind === 'bet') hasBet = true;
+    if (parsed.kind === 'bet' || parsed.kind === 'raise') hasBet = true;
     if (parsed.kind === 'check') hasCheck = true;
     if (parsed.kind === 'call') hasCall = true;
     if (parsed.kind === 'fold') hasFold = true;
@@ -293,6 +306,107 @@ function boardIsPairedFromText(textRaw) {
   return false;
 }
 
+function boardCardsFromText(textRaw) {
+  const token = extractCardsToken(textRaw, 3);
+  const cards = String(token || '').match(/([2-9TJQKA])([cdhs])/ig) || [];
+  return cards
+    .map((card) => ({
+      rank: String(card[0] || '').toUpperCase(),
+      suit: String(card[1] || '').toLowerCase()
+    }))
+    .filter((card) => card.rank && card.suit);
+}
+
+function boardMaxSuitCountFromText(textRaw) {
+  const cards = boardCardsFromText(textRaw);
+  if (!cards.length) return 0;
+  const counts = new Map();
+  cards.forEach((card) => counts.set(card.suit, (counts.get(card.suit) || 0) + 1));
+  return Math.max(0, ...Array.from(counts.values()));
+}
+
+function choose(values, size) {
+  const out = [];
+  if (!Array.isArray(values) || size <= 0 || values.length < size) return out;
+  const stack = [];
+  function walk(start) {
+    if (stack.length === size) {
+      out.push(stack.slice());
+      return;
+    }
+    for (let i = start; i < values.length; i += 1) {
+      stack.push(values[i]);
+      walk(i + 1);
+      stack.pop();
+    }
+  }
+  walk(0);
+  return out;
+}
+
+function boardRankVariants(textRaw) {
+  const ranks = boardCardsFromText(textRaw)
+    .map((card) => RANK_VALUE[card.rank])
+    .filter(Number.isFinite);
+  if (!ranks.length) return [];
+  const uniqueHigh = Array.from(new Set(ranks)).sort((a, b) => a - b);
+  const variants = [uniqueHigh];
+  if (uniqueHigh.includes(14)) {
+    variants.push(Array.from(new Set(uniqueHigh.map((value) => (value === 14 ? 1 : value)))).sort((a, b) => a - b));
+  }
+  return variants;
+}
+
+function boardHasNToStraight(textRaw, n) {
+  if (!Number.isInteger(n) || n < 3 || n > 5) return false;
+  const variants = boardRankVariants(textRaw);
+  for (const values of variants) {
+    if (values.length < n) continue;
+    const combos = choose(values, n);
+    for (const combo of combos) {
+      const min = Math.min(...combo);
+      const max = Math.max(...combo);
+      if (max - min <= 4) return true;
+    }
+  }
+  return false;
+}
+
+function hasTagLike(tags, text, values = []) {
+  return values.some((tag) => tags.has(tag) || new RegExp(`\\b${tag}\\b`, 'i').test(text));
+}
+
+function isFragileStrong(textRaw) {
+  const text = ` ${cleanText(textRaw).toLowerCase()} `;
+  const tags = new Set(extractClassTags(textRaw));
+  if (!tags.size) return false;
+
+  const hasStrBoardTag = hasTagLike(tags, text, ['strb', 'strboard']);
+  const hasFlushBoardTag = hasTagLike(tags, text, ['flb', 'flushboard']);
+  const hasPairedBoardTag = hasTagLike(tags, text, ['pairedboard']);
+  const hasLowStraightTag = hasTagLike(tags, text, ['lowstr']);
+
+  if (hasStrBoardTag || hasFlushBoardTag || hasPairedBoardTag || hasLowStraightTag) {
+    return true;
+  }
+
+  const boardPaired = boardIsPairedFromText(textRaw);
+  const boardFlushy = boardMaxSuitCountFromText(textRaw) >= 3;
+  const boardThreeToStraight = boardHasNToStraight(textRaw, 3);
+  const boardFourOrFiveToStraight = boardHasNToStraight(textRaw, 4) || boardHasNToStraight(textRaw, 5);
+
+  const setLike = hasTagLike(tags, text, ['set', 'topset', 'tri']);
+  const straightLike = hasTagLike(tags, text, ['str', '2ndstr']);
+  const flushLike = hasTagLike(tags, text, ['flush']);
+  const nutStraight = hasTagLike(tags, text, ['nutstr']);
+
+  if (setLike && boardThreeToStraight) return true;
+  if ((setLike || straightLike) && boardFlushy) return true;
+  if ((straightLike || flushLike) && boardPaired) return true;
+  if (straightLike && !nutStraight && boardFourOrFiveToStraight) return true;
+  return false;
+}
+
 function classifyPairSubtype(textRaw) {
   const text = cleanText(textRaw).toLowerCase();
   if (!text) return '';
@@ -353,9 +467,9 @@ function detectLightFoldTag(actionByStreet, hasShowdownClass) {
   const turn = actionByStreet.turn || {};
   const river = actionByStreet.river || {};
 
-  if (river.hasFold && (flop.hasBet || turn.hasBet || river.hasBet)) return 'Lr';
-  if (turn.hasFold && (flop.hasBet || turn.hasBet)) return 'Lt';
-  if (flop.hasFold && flop.hasBet) return 'Lf';
+  if (river.hasFold) return 'Lr';
+  if (turn.hasFold) return 'Lt';
+  if (flop.hasFold) return 'Lf';
   return '';
 }
 
@@ -395,7 +509,11 @@ function classifyStrength(textRaw) {
   const pairSubtype = classifyPairSubtype(textRaw);
   if (pairSubtype) return pairSubtype;
 
-  if (['topset', 'set', 'tri', 'full', 'str', 'lowfull', '2ndstr', '3rdfull'].some((tag) => tags.has(tag)) || /\b(?:lowfull|2ndstr|3rdfull)\b/.test(text)) {
+  if (isFragileStrong(textRaw)) {
+    return 'fragileStrong';
+  }
+
+  if (['topset', 'set', 'tri', 'full', 'str', 'flush', 'lowfull', '2ndstr', '3rdfull'].some((tag) => tags.has(tag)) || /\b(?:lowfull|2ndstr|3rdfull)\b/.test(text)) {
     return 'strong';
   }
 
@@ -497,6 +615,7 @@ function groupToRows(groupCounters) {
         nuts: row.nuts,
         strong: row.strong,
         conditionalStrong: row.conditionalStrong,
+        fragileStrong: row.fragileStrong,
         overpair: row.overpair,
         twoPair: row.twoPair,
         topPair: row.topPair,

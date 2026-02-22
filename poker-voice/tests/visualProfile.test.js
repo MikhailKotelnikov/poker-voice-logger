@@ -15,6 +15,7 @@ test('visual profile bucket detection maps sizing and miss', () => {
   assert.equal(__testables.detectBucket('b100 nuts'), 'P');
   assert.equal(__testables.detectBucket('x/x miss'), 'Miss');
   assert.equal(__testables.detectBucket('b0 onAhKd2c'), null);
+  assert.equal(__testables.detectBucket('x / r5x onAhKd2c'), null);
 });
 
 test('visual profile action summary detects street action kinds', () => {
@@ -385,4 +386,118 @@ test('visual profile marks Lt when player folds on turn after own turn aggressio
 
   assert.equal(bucket6.total, 1);
   assert.equal(bucket6.counts.lightFold, 1);
+});
+
+test('visual profile marks flop Miss as lightFold when line ends with turn fold after flop check', () => {
+  const rows = [
+    {
+      flop: '(8.2) BB_spirituallybroken x on6cJd5h / UTG_other cb24.39 / BB_spirituallybroken c',
+      turn: '(8.2) UTG_other b24.39 on6cJd5h2d / BB_spirituallybroken f',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const miss = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(miss.total, 1);
+  assert.equal(miss.counts.lightFold, 1);
+  assert.equal(miss.counts.unknown, 0);
+});
+
+test('visual profile marks flop Miss as lightFold when line ends with river fold after checks', () => {
+  const rows = [
+    {
+      flop: '(9.1) BB_spirituallybroken x on2dTdJs / BTN_other x',
+      turn: '(9.1) BB_spirituallybroken x on2dTdJs9c / BTN_other x',
+      river: '(9.1) BTN_other b31.34 on2dTdJs9cQh / BB_spirituallybroken f'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const miss = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(miss.total, 1);
+  assert.equal(miss.counts.lightFold, 1);
+  assert.equal(miss.counts.unknown, 0);
+});
+
+test('visual profile marks flop Miss as lightFold on same-street check-fold sequence', () => {
+  const rows = [
+    {
+      flop: '(8.2) BB_spirituallybroken x onTd3c9h / BTN_other cb71.24 / BB_spirituallybroken f',
+      turn: '',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const miss = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(miss.total, 1);
+  assert.equal(miss.counts.lightFold, 1);
+  assert.equal(miss.counts.unknown, 0);
+});
+
+test('visual profile marks MW flop Miss as lightFold on same-street check-fold sequence', () => {
+  const rows = [
+    {
+      flop: '(11.7) BB_other x on6d8c3h / UTG_spirituallybroken x / CO_villain b77 / BB_other f / UTG_spirituallybroken f',
+      turn: '',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const miss = flop.groups.find((group) => group.id === 'MW').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(miss.total, 1);
+  assert.equal(miss.counts.lightFold, 1);
+  assert.equal(miss.counts.unknown, 0);
+});
+
+test('visual profile does not classify check-raise multiplier (r5x) as micro bet bucket', () => {
+  const rows = [
+    {
+      flop: '(8.1) BB_spirituallybroken x on9cKcQd / HJ_other cb47.49 / BB_spirituallybroken r5x / HJ_other f',
+      turn: '',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucket2 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '2');
+  const miss = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(bucket2.total, 0);
+  assert.equal(miss.total, 0);
+});
+
+test('visual profile classifies board-discounted strong made as fragileStrong', () => {
+  const setOnStraightBoard = __testables.classifyStrength('SB_hero b60 AhAcKd9d4h_set on9cKcQd');
+  const straightOnPairedBoard = __testables.classifyStrength('SB_hero b60 AhTc9d8d7h_str on9c9dJcQh');
+  const flushOnPairedBoard = __testables.classifyStrength('SB_hero b60 AhKhQd9d4h_flush on9c9dJdQd');
+  const explicitTags = __testables.classifyStrength('SB_hero b60 AhTc9d8d7h_str_lowstr_STRB on6c7d8h9sKs');
+
+  assert.equal(setOnStraightBoard, 'fragileStrong');
+  assert.equal(straightOnPairedBoard, 'fragileStrong');
+  assert.equal(flushOnPairedBoard, 'fragileStrong');
+  assert.equal(explicitTags, 'fragileStrong');
+});
+
+test('visual profile uses opaque light-red palette for conditionalStrong legend on dark background', () => {
+  const profile = buildOpponentVisualProfile([], { opponent: 'spirituallybroken' });
+  const item = (profile.legend || []).find((entry) => entry.key === 'conditionalStrong');
+  assert.equal(item?.color, '#efb8bf');
+});
+
+test('visual profile uses dedicated lighter color for fragileStrong legend', () => {
+  const profile = buildOpponentVisualProfile([], { opponent: 'spirituallybroken' });
+  const item = (profile.legend || []).find((entry) => entry.key === 'fragileStrong');
+  assert.equal(item?.color, '#f8d8df');
 });

@@ -33,6 +33,12 @@ Load this file before any substantial task. Then load only relevant rule files.
 27. [Risky Changes Use Worktree And Test-First](./process-risky-change-worktree-and-test-first.md)
 28. [Verify Linked Resources After Third-Party Skill Install](./process-skill-install-verify-linked-resources.md)
 29. [Visual Class Tags Must Be Parsed From Hand Suffix Tokens](./visual-profile-class-tags-must-parse-from-hand-suffix.md)
+30. [HH Recalculation Must Produce Run-Scoped Artifacts](./process-hh-recalc-run-scoped-artifacts.md)
+31. [Visual Semantic Colors On Dark Bars Must Be Opaque](./visual-profile-semantic-colors-on-dark-bars-must-be-opaque.md)
+32. [Raise-Multiplier Tokens Must Not Map To Sizing Buckets](./visual-profile-raise-multiplier-must-not-map-to-sizing-bucket.md)
+33. [Board Context Tags Must Use Compact Marker Tokens](./parser-hh-board-context-tags-must-use-compact-markers.md)
+34. [Visual Miss Check-Fold Lines Must Map To Lx](./visual-profile-miss-check-fold-must-map-to-lx.md)
+35. [Propagate Target Lx Tags To Earlier Streets In HH Notes](./parser-hh-propagate-target-lx-to-earlier-streets.md)
 
 ## How to Add a Rule
 

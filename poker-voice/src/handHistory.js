@@ -605,6 +605,89 @@ function boardMaxSuitCount(boardCardsRaw) {
   return Math.max(0, ...counts.values());
 }
 
+function boardRankValues(boardCardsRaw) {
+  return (boardCardsRaw || [])
+    .map(parseCardToken)
+    .filter(Boolean)
+    .map((card) => card.value);
+}
+
+function boardRankVariants(boardCardsRaw) {
+  const unique = Array.from(new Set(boardRankValues(boardCardsRaw))).sort((a, b) => a - b);
+  if (!unique.length) return [];
+  const variants = [unique];
+  if (unique.includes(14)) {
+    variants.push(
+      Array.from(new Set(unique.map((value) => (value === 14 ? 1 : value))))
+        .sort((a, b) => a - b)
+    );
+  }
+  return variants;
+}
+
+function choose(items, size) {
+  const out = [];
+  if (!Array.isArray(items) || size <= 0 || items.length < size) return out;
+  const stack = [];
+  function walk(start) {
+    if (stack.length === size) {
+      out.push(stack.slice());
+      return;
+    }
+    for (let i = start; i < items.length; i += 1) {
+      stack.push(items[i]);
+      walk(i + 1);
+      stack.pop();
+    }
+  }
+  walk(0);
+  return out;
+}
+
+function boardHasNToStraight(boardCardsRaw, n) {
+  if (!Number.isInteger(n) || n < 3 || n > 5) return false;
+  for (const values of boardRankVariants(boardCardsRaw)) {
+    if (values.length < n) continue;
+    for (const combo of choose(values, n)) {
+      const min = Math.min(...combo);
+      const max = Math.max(...combo);
+      if (max - min <= 4) return true;
+    }
+  }
+  return false;
+}
+
+function deriveFragileStrongTokens(streetClassToken, boardCardsRaw, detail = null) {
+  const classToken = String(streetClassToken || '').toLowerCase();
+  if (!classToken) return [];
+
+  const boardPaired = boardIsPaired(boardCardsRaw);
+  const boardFlushy = boardMaxSuitCount(boardCardsRaw) >= 3;
+  const board3Str = boardHasNToStraight(boardCardsRaw, 3);
+  const board4Or5Str = boardHasNToStraight(boardCardsRaw, 4) || boardHasNToStraight(boardCardsRaw, 5);
+
+  const isSetLike = classToken === 'set' || classToken === 'topset' || classToken === 'tri';
+  const isStraightLike = classToken === 'str';
+  const isFlushLike = classToken === 'flush';
+
+  const tags = [];
+
+  if (isSetLike && board3Str) tags.push('STRB');
+  if ((isSetLike || isStraightLike) && boardFlushy) tags.push('FLB');
+  if ((isStraightLike || isFlushLike) && boardPaired) tags.push('pairedboard');
+
+  if (isStraightLike && board4Or5Str) {
+    const straightHigh = Number(detail?.straightHigh);
+    const nutHigh = nutStraightHighOnBoard(boardCardsRaw);
+    if (!Number.isFinite(straightHigh) || !Number.isFinite(nutHigh) || straightHigh < nutHigh) {
+      tags.push('lowstr');
+      tags.push('STRB');
+    }
+  }
+
+  return Array.from(new Set(tags));
+}
+
 function cardDeckExcluding(boardCardsRaw) {
   const excluded = new Set(
     (boardCardsRaw || [])
@@ -1261,7 +1344,10 @@ function playerStreetHandToken(parsedHistory, player, street) {
   if (!cards) return '';
   const cls = parsedHistory?.showdown?.streetClassByPlayer?.[player]?.[street] || '';
   const drawTokens = parsedHistory?.showdown?.streetDrawByPlayer?.[player]?.[street] || [];
-  const suffix = [cls, ...drawTokens].filter(Boolean).join('_');
+  const classDetails = parsedHistory?.showdown?.streetClassByPlayer?.[player]?._details?.[street] || null;
+  const boardCards = streetBoardCards(parsedHistory, street);
+  const fragileTokens = deriveFragileStrongTokens(cls, boardCards, classDetails);
+  const suffix = [cls, ...drawTokens, ...fragileTokens].filter(Boolean).join('_');
   return suffix ? `${cards}_${suffix}` : cards;
 }
 
@@ -1434,6 +1520,35 @@ function streetTagLetter(street) {
   return 'f';
 }
 
+function streetOrderIndex(street) {
+  const order = ['flop', 'turn', 'river'];
+  return order.indexOf(street);
+}
+
+function inferTargetLineLightFoldTag(parsedHistory) {
+  const target = parsedHistory?.targetPlayer || '';
+  if (!target) return { tag: '', foldStreet: '', foldStreetIndex: -1 };
+  const shownCards = parsedHistory?.showdown?.showCardsByPlayer?.[target] || [];
+  if (Array.isArray(shownCards) && shownCards.length) {
+    return { tag: '', foldStreet: '', foldStreetIndex: -1 };
+  }
+
+  const order = ['flop', 'turn', 'river'];
+  for (const street of order) {
+    const events = (parsedHistory?.events?.[street] || [])
+      .filter((event) => event?.player === target && ['check', 'fold', 'call', 'bet', 'raise'].includes(event.type));
+    if (events.some((event) => event.type === 'fold')) {
+      return {
+        tag: `L${streetTagLetter(street)}`,
+        foldStreet: street,
+        foldStreetIndex: streetOrderIndex(street)
+      };
+    }
+  }
+
+  return { tag: '', foldStreet: '', foldStreetIndex: -1 };
+}
+
 function hasPriorAggressionByPlayer(parsedHistory, player, street, indexInStreet) {
   const currentStreetEvents = parsedHistory?.events?.[street] || [];
   for (let i = 0; i < indexInStreet; i += 1) {
@@ -1481,6 +1596,8 @@ function buildPostflopSequenceNote(parsedHistory, street) {
 
   const aggressor = lastPreflopAggressor(parsedHistory);
   const target = parsedHistory?.targetPlayer || '';
+  const targetLineLightFold = inferTargetLineLightFoldTag(parsedHistory);
+  const currentStreetIndex = streetOrderIndex(street);
   let boardAddedWithoutTarget = false;
   const parts = [];
 
@@ -1509,8 +1626,17 @@ function buildPostflopSequenceNote(parsedHistory, street) {
     if (handToken) {
       tokenParts.push(handToken);
     }
+    const shouldPropagateTargetLx = Boolean(targetLineLightFold.tag)
+      && event.player === target
+      && !handToken
+      && currentStreetIndex >= 0
+      && targetLineLightFold.foldStreetIndex >= 0
+      && currentStreetIndex <= targetLineLightFold.foldStreetIndex;
+    if (shouldPropagateTargetLx) {
+      tokenParts.push(targetLineLightFold.tag);
+    }
     const inferredTag = inferPostflopInferenceTag(parsedHistory, street, events, index, event, Boolean(handToken));
-    if (inferredTag) {
+    if (inferredTag && !tokenParts.includes(inferredTag)) {
       tokenParts.push(inferredTag);
     }
     if (target && event.player === target) {
