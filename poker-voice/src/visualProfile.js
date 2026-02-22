@@ -1,13 +1,30 @@
 import { extractTargetIdentity } from './profileTarget.js';
 
 const BUCKET_ORDER = ['2', '3', '5', '6', '7', 'P', 'Miss'];
-const STRENGTH_ORDER = ['nuts', 'strong', 'strongDraw', 'weakDraw', 'weak', 'unknown'];
+const STRENGTH_ORDER = [
+  'nuts',
+  'strong',
+  'conditionalStrong',
+  'overpair',
+  'twoPair',
+  'topPair',
+  'strongDraw',
+  'weakDraw',
+  'lightFold',
+  'weak',
+  'unknown'
+];
 
 const LEGEND = [
   { key: 'nuts', label: 'nuts / top full+', color: '#8f2a5c' },
   { key: 'strong', label: 'strong made', color: '#d76575' },
+  { key: 'conditionalStrong', label: 'Sx fold-out strong', color: 'rgba(227, 74, 85, 0.45)' },
+  { key: 'overpair', label: 'overpair', color: '#c9a77a' },
+  { key: 'twoPair', label: 'two pair', color: '#f09b4e' },
+  { key: 'topPair', label: 'top pair', color: '#f1c84c' },
   { key: 'strongDraw', label: 'strong draw', color: '#325cbc' },
   { key: 'weakDraw', label: 'weak draw', color: '#73b7ff' },
+  { key: 'lightFold', label: 'Lx fold after bet', color: '#d2d7dd' },
   { key: 'weak', label: 'weak / one pair / air', color: '#97d578' },
   { key: 'unknown', label: 'no showdown / unknown', color: '#f2f5f3' }
 ];
@@ -67,16 +84,26 @@ function createBucketCounters() {
       total: 0,
       nuts: 0,
       strong: 0,
+      conditionalStrong: 0,
+      overpair: 0,
+      twoPair: 0,
+      topPair: 0,
       strongDraw: 0,
       weakDraw: 0,
+      lightFold: 0,
       weak: 0,
       unknown: 0,
       samples: {
         all: [],
         nuts: [],
         strong: [],
+        conditionalStrong: [],
+        overpair: [],
+        twoPair: [],
+        topPair: [],
         strongDraw: [],
         weakDraw: [],
+        lightFold: [],
         weak: [],
         unknown: []
       }
@@ -122,20 +149,259 @@ function detectBucket(textRaw) {
   return null;
 }
 
+const RANK_VALUE = {
+  '2': 2,
+  '3': 3,
+  '4': 4,
+  '5': 5,
+  '6': 6,
+  '7': 7,
+  '8': 8,
+  '9': 9,
+  T: 10,
+  J: 11,
+  Q: 12,
+  K: 13,
+  A: 14
+};
+
+function parseStreetActionToken(actionRaw) {
+  const token = String(actionRaw || '').trim().toLowerCase();
+  if (!token) return { kind: 'other', size: null };
+  if (/^(?:x|xb)$/.test(token)) return { kind: 'check', size: null };
+  if (/^(?:f|xf)$/.test(token)) return { kind: 'fold', size: null };
+  if (/^c(?:\d+(?:\.\d+)?(?:bb)?)?$/.test(token)) return { kind: 'call', size: null };
+  const sizeMatch = token.match(/^(?:cb|bbb|bb|bxb|tpb|tp|fp|d|r|b)(\d+(?:\.\d+)?)(?:x)?$/i);
+  if (sizeMatch) {
+    const size = Number(sizeMatch[1]);
+    if (Number.isFinite(size) && size > 0) return { kind: 'bet', size };
+  }
+  if (/^(?:cb|bbb|bb|bxb|tpb|tp|fp|d|r|b)$/i.test(token)) return { kind: 'bet', size: null };
+  return { kind: 'other', size: null };
+}
+
+function parseStreetSegments(textRaw) {
+  const text = cleanText(textRaw);
+  if (!text) return [];
+  const segments = text.split(/\s*\/\s*/).map(cleanText).filter(Boolean);
+  return segments.map((segment) => {
+    const actor = parseActorToken(segment);
+    const match = segment.match(/^(?:\(\d+(?:\.\d+)?\)\s*)?(?:[A-Za-z0-9]+_[A-Za-z0-9]{2,24})\s+([^\s/]+)/i);
+    const actionToken = String(match?.[1] || '').trim();
+    const action = parseStreetActionToken(actionToken);
+    return {
+      segment,
+      actor: actor?.actor || '',
+      identity: actor?.identity || '',
+      actionToken,
+      ...action
+    };
+  });
+}
+
+function extractStreetActionSummary(textRaw) {
+  const segments = parseStreetSegments(textRaw);
+  if (!segments.length) {
+    return {
+      hasAction: false,
+      hasBet: false,
+      hasCheck: false,
+      hasCall: false,
+      hasFold: false,
+      bucket: null
+    };
+  }
+
+  let hasAction = false;
+  let hasBet = false;
+  let hasCheck = false;
+  let hasCall = false;
+  let hasFold = false;
+  let bucket = null;
+
+  for (const parsed of segments) {
+    if (parsed.kind === 'other') continue;
+    hasAction = true;
+    if (parsed.kind === 'bet') hasBet = true;
+    if (parsed.kind === 'check') hasCheck = true;
+    if (parsed.kind === 'call') hasCall = true;
+    if (parsed.kind === 'fold') hasFold = true;
+    if (!bucket && parsed.kind === 'bet' && Number.isFinite(parsed.size) && parsed.size > 0) {
+      bucket = detectBucket(`b${parsed.size}`);
+    }
+  }
+
+  return { hasAction, hasBet, hasCheck, hasCall, hasFold, bucket };
+}
+
+function extractCardsToken(textRaw, expectedCards = 5) {
+  const text = cleanText(textRaw);
+  if (!text) return '';
+  const regex = expectedCards === 5
+    ? /\b((?:[2-9TJQKA][cdhs]){5})\b/i
+    : /\bon((?:[2-9TJQKA][cdhs]){3,5})\b/i;
+  const match = text.match(regex);
+  return String(match?.[1] || '').trim();
+}
+
+function extractClassToken(textRaw) {
+  const tags = extractClassTags(textRaw);
+  return tags[0] || '';
+}
+
+function extractClassTags(textRaw) {
+  const text = cleanText(textRaw).toLowerCase();
+  if (!text) return [];
+
+  const tags = [];
+  const tokenSet = new Set();
+  const cardWithTagsRegex = /\b(?:[2-9tjqka][cdhs]){2,5}_([a-z0-9_+.-]+)\b/ig;
+  for (const match of text.matchAll(cardWithTagsRegex)) {
+    const suffix = String(match?.[1] || '').trim();
+    if (!suffix) continue;
+    suffix
+      .split('_')
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean)
+      .forEach((tag) => tokenSet.add(tag));
+  }
+
+  const flatTokenRegex = /\b(?:nutfull|nutstr|nutflush|topfull|quads?|strflush|topset|set|2p|tri|full|str|wrap|oe|g|nfd|fd|air|mp|bp|bu|p|l[frt]|s[frt])\b/ig;
+  for (const match of text.matchAll(flatTokenRegex)) {
+    const token = String(match?.[0] || '').trim().toLowerCase();
+    if (token) tokenSet.add(token);
+  }
+
+  tokenSet.forEach((tag) => tags.push(tag));
+  return tags;
+}
+
+function ranksFromCardsToken(token) {
+  const chunks = String(token || '').match(/([2-9TJQKA])[cdhs]/ig) || [];
+  return chunks.map((card) => String(card[0] || '').toUpperCase()).filter(Boolean);
+}
+
+function boardIsPairedFromText(textRaw) {
+  const boardToken = extractCardsToken(textRaw, 3);
+  const boardRanks = ranksFromCardsToken(boardToken);
+  if (!boardRanks.length) return false;
+  const seen = new Set();
+  for (const rank of boardRanks) {
+    if (seen.has(rank)) return true;
+    seen.add(rank);
+  }
+  return false;
+}
+
+function classifyPairSubtype(textRaw) {
+  const text = cleanText(textRaw).toLowerCase();
+  if (!text) return '';
+  const boardPaired = boardIsPairedFromText(textRaw);
+  const tags = new Set(extractClassTags(textRaw));
+  if (tags.has('2p') && !boardPaired) return 'twoPair';
+
+  const classToken = extractClassToken(textRaw);
+  const normalizedClassToken = classToken === '2p' && boardPaired ? 'p' : classToken || (tags.has('2p') ? 'p' : '');
+  if (!['p', 'mp', 'bp', 'bu'].includes(normalizedClassToken)) return '';
+
+  const holeToken = extractCardsToken(textRaw, 5);
+  const boardToken = extractCardsToken(textRaw, 3);
+  if (!holeToken || !boardToken) return '';
+
+  const holeRanks = ranksFromCardsToken(holeToken);
+  const boardRanks = ranksFromCardsToken(boardToken);
+  if (!holeRanks.length || !boardRanks.length) return '';
+
+  const boardValues = boardRanks.map((rank) => RANK_VALUE[rank]).filter(Number.isFinite);
+  if (!boardValues.length) return '';
+  const boardTop = Math.max(...boardValues);
+
+  const holeCounts = new Map();
+  holeRanks.forEach((rank) => {
+    holeCounts.set(rank, (holeCounts.get(rank) || 0) + 1);
+  });
+  for (const [rank, count] of holeCounts.entries()) {
+    if (count < 2) continue;
+    const rankValue = RANK_VALUE[rank];
+    const boardHasRank = boardRanks.includes(rank);
+    if (Number.isFinite(rankValue) && rankValue > boardTop && !boardHasRank) {
+      return 'overpair';
+    }
+  }
+
+  const topBoardRanks = boardRanks.filter((rank) => RANK_VALUE[rank] === boardTop);
+  if (topBoardRanks.some((rank) => holeRanks.includes(rank))) {
+    return 'topPair';
+  }
+  return '';
+}
+
+function hasShowdownClassToken(textRaw) {
+  const tags = new Set(extractClassTags(textRaw));
+  if (!tags.size) return false;
+  return [
+    'nutfull', 'nutstr', 'nutflush', 'topfull', 'quads', 'quad', 'strflush',
+    'topset', 'set', '2p', 'tri', 'full', 'str',
+    'wrap', 'oe', 'g', 'nfd', 'fd',
+    'air', 'mp', 'bp', 'bu', 'p'
+  ].some((tag) => tags.has(tag));
+}
+
+function detectLightFoldTag(actionByStreet, hasShowdownClass) {
+  if (hasShowdownClass) return '';
+  const flop = actionByStreet.flop || {};
+  const turn = actionByStreet.turn || {};
+  const river = actionByStreet.river || {};
+
+  if (river.hasFold && (flop.hasBet || turn.hasBet || river.hasBet)) return 'Lr';
+  if (turn.hasFold && (flop.hasBet || turn.hasBet)) return 'Lt';
+  if (flop.hasFold && flop.hasBet) return 'Lf';
+  return '';
+}
+
+function detectConditionalStrongTag(streetTextRaw, targetIdentity, street) {
+  if (!targetIdentity) return '';
+  const segments = parseStreetSegments(streetTextRaw);
+  if (!segments.length) return '';
+
+  const letter = street === 'river' ? 'r' : street === 'turn' ? 't' : 'f';
+  for (let i = 0; i < segments.length; i += 1) {
+    const current = segments[i];
+    if (!current || current.identity !== targetIdentity || current.kind !== 'bet') continue;
+    const later = segments
+      .slice(i + 1)
+      .filter((item) => item && item.identity !== targetIdentity && item.kind !== 'other');
+    if (!later.length) continue;
+    if (later.every((item) => item.kind === 'fold')) {
+      return `S${letter}`;
+    }
+  }
+  return '';
+}
+
 function classifyStrength(textRaw) {
   const text = ` ${cleanText(textRaw).toLowerCase()} `;
+  const tags = new Set(extractClassTags(textRaw));
+  const boardPaired = boardIsPairedFromText(textRaw);
 
-  if (/\b(?:nuts|nutstr|nutfull|nutflush|topfull|quads?|strflush)\b/.test(text)) {
+  if (['nuts', 'nutstr', 'nutfull', 'nutflush', 'topfull', 'quads', 'quad', 'strflush'].some((tag) => tags.has(tag))) {
     return 'nuts';
   }
 
-  if (/\b(?:topset|set|2p|tri|full|lowfull|2ndstr|3rdfull)\b/.test(text) || /_(?:topset|set|2p|tri|full|str)\b/.test(text)) {
+  if (tags.has('2p') && !boardPaired) {
+    return 'twoPair';
+  }
+
+  const pairSubtype = classifyPairSubtype(textRaw);
+  if (pairSubtype) return pairSubtype;
+
+  if (['topset', 'set', 'tri', 'full', 'str', 'lowfull', '2ndstr', '3rdfull'].some((tag) => tags.has(tag)) || /\b(?:lowfull|2ndstr|3rdfull)\b/.test(text)) {
     return 'strong';
   }
 
-  const hasFd = /\b(?:nfd|fd)\b/.test(text);
-  const hasStraightDraw = /\b(?:wrap|oe|g)\b/.test(text);
-  if (/\bwrap\b/.test(text) || (hasFd && hasStraightDraw) || /\bnfd\b/.test(text)) {
+  const hasFd = tags.has('nfd') || tags.has('fd');
+  const hasStraightDraw = tags.has('wrap') || tags.has('oe') || tags.has('g');
+  if (tags.has('wrap') || (hasFd && hasStraightDraw) || tags.has('nfd')) {
     return 'strongDraw';
   }
 
@@ -143,7 +409,15 @@ function classifyStrength(textRaw) {
     return 'weakDraw';
   }
 
-  const hasWeakToken = /\b(?:air|weak|mp|bp|bu|p)\b/.test(text) || /_(?:p|mp|bp|air)\b/.test(text);
+  if (tags.has('sf') || tags.has('st') || tags.has('sr')) {
+    return 'conditionalStrong';
+  }
+
+  if (tags.has('lf') || tags.has('lt') || tags.has('lr')) {
+    return 'lightFold';
+  }
+
+  const hasWeakToken = tags.has('air') || tags.has('mp') || tags.has('bp') || tags.has('bu') || tags.has('p') || /\bweak\b/.test(text);
   if (hasWeakToken) {
     return 'weak';
   }
@@ -222,8 +496,13 @@ function groupToRows(groupCounters) {
       counts: {
         nuts: row.nuts,
         strong: row.strong,
+        conditionalStrong: row.conditionalStrong,
+        overpair: row.overpair,
+        twoPair: row.twoPair,
+        topPair: row.topPair,
         strongDraw: row.strongDraw,
         weakDraw: row.weakDraw,
+        lightFold: row.lightFold,
         weak: row.weak,
         unknown: row.unknown
       },
@@ -262,12 +541,45 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       turn: turnRaw,
       river: riverRaw
     };
+    const actionByStreet = {
+      flop: extractStreetActionSummary(flopText),
+      turn: extractStreetActionSummary(turnText),
+      river: extractStreetActionSummary(riverText)
+    };
+    const hasShowdownClassByStreet = {
+      flop: hasShowdownClassToken(flopText),
+      turn: hasShowdownClassToken(turnText),
+      river: hasShowdownClassToken(riverText)
+    };
+    const hasShowdownClass = hasShowdownClassByStreet.flop || hasShowdownClassByStreet.turn || hasShowdownClassByStreet.river;
+    const lightFoldTag = detectLightFoldTag(actionByStreet, hasShowdownClass);
+    const explicitConditionalStrongTag = (() => {
+      const combined = [flopText, turnText, riverText].filter(Boolean).join(' ');
+      if (/\bsr\b/i.test(combined)) return 'Sr';
+      if (/\bst\b/i.test(combined)) return 'St';
+      if (/\bsf\b/i.test(combined)) return 'Sf';
+      return '';
+    })();
+    const conditionalStrongTag = hasShowdownClass
+      ? ''
+      : explicitConditionalStrongTag
+        || detectConditionalStrongTag(riverRaw || riverText, targetIdentity, 'river')
+        || detectConditionalStrongTag(turnRaw || turnText, targetIdentity, 'turn')
+        || detectConditionalStrongTag(flopRaw || flopText, targetIdentity, 'flop');
+    const strengthFor = (street, streetText) => {
+      if (!streetText) return 'unknown';
+      if (lightFoldTag) return 'lightFold';
+      if (conditionalStrongTag) {
+        return 'conditionalStrong';
+      }
+      return classifyStrength(streetText);
+    };
 
     if (flopText) {
-      const bucket = detectBucket(flopText);
+      const bucket = actionByStreet.flop.bucket || detectBucket(flopText);
       if (bucket) {
         const group = detectMultiway(flopRaw || flopText) ? 'MW' : 'HU';
-        const strength = classifyStrength(flopText);
+        const strength = strengthFor('flop', flopText);
         addCount(
           sections.flop,
           group,
@@ -280,14 +592,15 @@ export function buildOpponentVisualProfile(rows, options = {}) {
     }
 
     if (turnText) {
-      const bucket = detectBucket(turnText);
+      const bucket = actionByStreet.turn.bucket || detectBucket(turnText);
       if (bucket) {
-        const strength = classifyStrength(turnText);
-        const targetFlopHasBet = /\b(?:cb|b)\s*\d+(?:\.\d+)?\b/i.test(flopText);
-        const targetFlopChecked = /\b(?:^|[\s/])(?:x|xb)\b/i.test(flopText) && !targetFlopHasBet;
-        const targetTurnHasBet = /\b(?:cb|b)\s*\d+(?:\.\d+)?\b/i.test(turnText);
-        const isTurnBetBet = detectBetBetLine(turnText) || (targetFlopHasBet && targetTurnHasBet);
-        if (isTurnBetBet) {
+        const strength = strengthFor('turn', turnText);
+        const targetFlopHasBet = actionByStreet.flop.hasBet;
+        const targetFlopChecked = actionByStreet.flop.hasCheck && !targetFlopHasBet;
+        const targetTurnHasBet = actionByStreet.turn.hasBet;
+        const riverHasAction = actionByStreet.river.hasAction;
+        const isTurnBetBetFallback = targetFlopHasBet && targetTurnHasBet && !riverHasAction;
+        if (isTurnBetBetFallback) {
           addCount(sections.betbet, 'All', bucket, strength, buildSamplePayload(rowLabel, sampleBase, 'turn'));
         }
         const isTurnProbe = detectProbeLine(turnText) || (targetFlopChecked && targetTurnHasBet);
@@ -299,15 +612,39 @@ export function buildOpponentVisualProfile(rows, options = {}) {
     }
 
     if (riverText) {
-      const bucket = detectBucket(riverText);
+      const bucket = actionByStreet.river.bucket || detectBucket(riverText);
       if (bucket) {
-        const strength = classifyStrength(riverText);
+        const strength = strengthFor('river', riverText);
         addCount(sections.total, 'All', bucket, strength, buildSamplePayload(rowLabel, sampleBase, 'river'));
-        if (detectTripleBarrelLine(riverText)) {
+        const hasFlopBet = actionByStreet.flop.hasBet;
+        const hasTurnBet = actionByStreet.turn.hasBet;
+        const hasRiverBet = actionByStreet.river.hasBet;
+        const hasRiverAction = actionByStreet.river.hasAction;
+        const isTriple = hasFlopBet && hasTurnBet && hasRiverBet;
+        const isBetBetRiver = hasRiverBet && ((hasFlopBet && !hasTurnBet) || (!hasFlopBet && hasTurnBet));
+        const isBetBetMiss = !hasRiverBet && (hasFlopBet ^ hasTurnBet) && hasRiverAction;
+        const isTripleMiss = hasFlopBet && hasTurnBet && !hasRiverBet && hasRiverAction;
+
+        if (detectTripleBarrelLine(riverText) || isTriple) {
           addCount(sections.betbetbet, 'All', bucket, strength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+        } else if (isTripleMiss) {
+          addCount(
+            sections.betbetbet,
+            'All',
+            'Miss',
+            strengthFor('river', riverText),
+            buildSamplePayload(rowLabel, sampleBase, 'river')
+          );
         }
-        if (detectBetBetLine(riverText)) {
+        if (detectBetBetLine(riverText) || isBetBetRiver) {
           addCount(sections.riverBetBet, 'All', bucket, strength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(sections.betbet, 'All', bucket, strength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+        } else if (isBetBetMiss) {
+          const missStreet = hasFlopBet && !hasTurnBet ? 'turn' : 'river';
+          const missStrength = missStreet === 'turn'
+            ? strengthFor('turn', turnText || riverText)
+            : strengthFor('river', riverText);
+          addCount(sections.betbet, 'All', 'Miss', missStrength, buildSamplePayload(rowLabel, sampleBase, missStreet));
         }
         if (detectSingleRiverBetLine(riverText)) {
           addCount(sections.riverOnce, 'All', bucket, strength, buildSamplePayload(rowLabel, sampleBase, 'river'));
@@ -378,5 +715,6 @@ export const __testables = {
   detectMultiwayByActorCount,
   detectTripleBarrelLine,
   detectSingleRiverBetLine,
-  filterStreetByTargetActor
+  filterStreetByTargetActor,
+  extractStreetActionSummary
 };

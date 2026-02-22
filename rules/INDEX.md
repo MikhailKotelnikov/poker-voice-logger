@@ -19,6 +19,20 @@ Load this file before any substantial task. Then load only relevant rule files.
 13. [HH Uncalled Return Must Not Create Zero-Sized Bets](./parser-hh-uncalled-return-effective-vs-declared-sizing.md)
 14. [Visual Profile Tooltip Must Expose All Counted Samples](./visual-profile-sample-count-must-match-bucket-count.md)
 15. [Visual Profile Must Separate No-Showdown Strength as Unknown](./visual-profile-no-showdown-use-unknown-strength.md)
+16. [Sheets Batch Upload Must Use Timeout and Checkpoint](./process-sheets-batch-upload-timeout-and-checkpoint.md)
+17. [Showdown Class Tokens Must Override Unknown In Visual Strength](./visual-profile-showdown-class-must-win-over-unknown.md)
+18. [BetBet And BetBetBet Must Be Derived From Street Sequence](./visual-profile-betbet-lines-from-street-sequence.md)
+19. [Tooltip Hole Cards Must Be Sorted High-To-Low](./visual-tooltip-hole-cards-desc-sorting.md)
+20. [Paired Board Must Downgrade `2p` To Pair Class In HH Notes](./parser-hh-paired-board-two-pair-downgrade.md)
+21. [Infer `Lx` And `Sx` Tags From No-Showdown Postflop Outcomes](./parser-hh-infer-lx-sx-no-showdown-tags.md)
+22. [BetBet Miss Strength Must Use The Street Where Bet Was Missed](./visual-profile-betbet-miss-strength-from-miss-street.md)
+23. [Postflop Sizing Tokens Must Never Round To `b0`/`r0`](./parser-hh-postflop-sizing-must-not-round-to-zero.md)
+24. [Visual Strength Is Street-Local Except Lx/Sx Line Overrides](./visual-profile-street-strength-with-lx-sx-line-override.md)
+25. [Clarify Gate Before Implementation](./process-clarify-gate-before-implementation.md)
+26. [Verify Gate Before Completion](./process-verify-gate-before-completion.md)
+27. [Risky Changes Use Worktree And Test-First](./process-risky-change-worktree-and-test-first.md)
+28. [Verify Linked Resources After Third-Party Skill Install](./process-skill-install-verify-linked-resources.md)
+29. [Visual Class Tags Must Be Parsed From Hand Suffix Tokens](./visual-profile-class-tags-must-parse-from-hand-suffix.md)
 
 ## How to Add a Rule
 

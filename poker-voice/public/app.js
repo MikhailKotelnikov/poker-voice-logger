@@ -173,6 +173,34 @@ function parsePackedCards(token) {
   }));
 }
 
+const TOOLTIP_RANK_VALUE = {
+  '2': 2,
+  '3': 3,
+  '4': 4,
+  '5': 5,
+  '6': 6,
+  '7': 7,
+  '8': 8,
+  '9': 9,
+  T: 10,
+  J: 11,
+  Q: 12,
+  K: 13,
+  A: 14
+};
+
+function sortHoleCardsDesc(cards = []) {
+  return cards
+    .map((card, index) => ({ ...card, __i: index }))
+    .sort((a, b) => {
+      const av = TOOLTIP_RANK_VALUE[a.rank] || 0;
+      const bv = TOOLTIP_RANK_VALUE[b.rank] || 0;
+      if (bv !== av) return bv - av;
+      return a.__i - b.__i;
+    })
+    .map(({ __i, ...card }) => card);
+}
+
 function isPositionToken(token) {
   const value = String(token || '').trim();
   if (!value) return false;
@@ -257,7 +285,7 @@ function parseTooltipSegment(text) {
     }
     const cardsWithTags = token.match(/^([2-9TJQKA][cdhs](?:[2-9TJQKA][cdhs]){1,})_([a-z0-9_+.-]+)$/i);
     if (cardsWithTags?.[1] && cardsWithTags?.[2] && isPackedCardsToken(cardsWithTags[1], 2)) {
-      parsed.cards = parsePackedCards(cardsWithTags[1]);
+      parsed.cards = sortHoleCardsDesc(parsePackedCards(cardsWithTags[1]));
       parsed.handTags = cardsWithTags[2]
         .split('_')
         .map((item) => item.trim())
@@ -265,7 +293,7 @@ function parseTooltipSegment(text) {
       continue;
     }
     if (!parsed.cards.length && isPackedCardsToken(token, 2)) {
-      parsed.cards = parsePackedCards(token);
+      parsed.cards = sortHoleCardsDesc(parsePackedCards(token));
       continue;
     }
     if (lower === 'allin' || lower === 'all-in') {
@@ -600,7 +628,7 @@ function renderProfileRows(rows = [], legend = []) {
     bar.className = `profile-bar ${row.total > 0 ? '' : 'profile-empty'}`.trim();
 
     if (row.total > 0) {
-      const order = ['nuts', 'strong', 'strongDraw', 'weakDraw', 'weak', 'unknown'];
+      const order = ['nuts', 'strong', 'conditionalStrong', 'overpair', 'twoPair', 'topPair', 'strongDraw', 'weakDraw', 'lightFold', 'weak', 'unknown'];
       order.forEach((key) => {
         const count = Number(row?.counts?.[key] || 0);
         if (!count) return;

@@ -17,6 +17,15 @@ test('visual profile bucket detection maps sizing and miss', () => {
   assert.equal(__testables.detectBucket('b0 onAhKd2c'), null);
 });
 
+test('visual profile action summary detects street action kinds', () => {
+  const summary = __testables.extractStreetActionSummary('(24.6) SB_player cb96.75 AhKdQcJcTc_set / SB_player c allin');
+  assert.equal(summary.hasAction, true);
+  assert.equal(summary.hasBet, true);
+  assert.equal(summary.hasCall, true);
+  assert.equal(summary.hasFold, false);
+  assert.equal(summary.bucket, 'P');
+});
+
 test('visual profile builder aggregates sections and strengths', () => {
   const rows = [
     { flop: 'cb25 weak', turn: '', river: '' },
@@ -197,4 +206,183 @@ test('visual profile marks no-showdown target action as unknown strength (white)
   assert.equal(bucket5.total, 1);
   assert.equal(bucket5.counts.unknown, 1);
   assert.equal(bucket5.counts.weak, 0);
+});
+
+test('visual profile classifies two pair with dedicated color bucket', () => {
+  const rows = [
+    {
+      flop: '(11.7) UTG_spirituallybroken cb58 AsKhQh9d8d_2p onQhTs5s / BTN_other c'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucket6 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '6');
+
+  assert.equal(bucket6.total, 1);
+  assert.equal(bucket6.counts.twoPair, 1);
+  assert.equal(bucket6.counts.strong, 0);
+});
+
+test('visual profile does not classify 2p as two pair on paired board', () => {
+  const strength = __testables.classifyStrength('SB_hero b50 AhTc9d4c3h_2p onAsAd7c');
+  assert.notEqual(strength, 'twoPair');
+});
+
+test('visual profile detects underscore class tokens like _set_oe and _2p_g', () => {
+  const strong = __testables.classifyStrength('SB_hero b60 AhTc9d4c3h_set_oe onAsKd7c');
+  const twoPair = __testables.classifyStrength('SB_hero b60 AhTc9d4c3h_2p_g onAsKd7c');
+
+  assert.equal(strong, 'strong');
+  assert.equal(twoPair, 'twoPair');
+});
+
+test('visual profile marks light-fold after prior bet as dedicated class', () => {
+  const rows = [
+    {
+      flop: '(8.2) HJ_spirituallybroken cb47.49 onAjQh8s / BB_other c',
+      turn: '(15.9) BB_other x onAjQh8s4d / HJ_spirituallybroken xb',
+      river: '(15.9) BB_other b62.55 onAjQh8s4d8c / HJ_spirituallybroken f'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const missRow = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '5');
+  assert.equal(missRow.total, 1);
+  assert.equal(missRow.counts.lightFold, 1);
+});
+
+test('visual profile marks no-showdown fold-out aggression as conditional strong (Sx)', () => {
+  const rows = [
+    {
+      flop: '(8.7) SB_spirituallybroken b68 onAh2dTc / BB_other f'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucket6 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '6');
+
+  assert.equal(bucket6.total, 1);
+  assert.equal(bucket6.counts.conditionalStrong, 1);
+});
+
+test('visual profile derives BetBet and BetBetBet lines without explicit bb tokens', () => {
+  const rows = [
+    {
+      // x-b-b
+      flop: '(10) UTG_spirituallybroken x onAhKd2c / BB_other x',
+      turn: '(10) BB_other x onAhKd2c7d / UTG_spirituallybroken b52',
+      river: '(20) BB_other x onAhKd2c7d9s / UTG_spirituallybroken b63'
+    },
+    {
+      // b-b-b
+      flop: '(10) UTG_spirituallybroken cb33 onAhKd2c / BB_other c',
+      turn: '(16) BB_other x onAhKd2c7d / UTG_spirituallybroken b58',
+      river: '(28) BB_other x onAhKd2c7d9s / UTG_spirituallybroken b71'
+    },
+    {
+      // b-x-x -> betbet miss
+      flop: '(10) UTG_spirituallybroken cb33 onAhKd2c / BB_other c',
+      turn: '(16) BB_other x onAhKd2c7d / UTG_spirituallybroken xb',
+      river: '(16) BB_other x onAhKd2c7d9s / UTG_spirituallybroken x'
+    },
+    {
+      // b-b-x -> betbetbet miss
+      flop: '(10) UTG_spirituallybroken cb33 onAhKd2c / BB_other c',
+      turn: '(16) BB_other x onAhKd2c7d / UTG_spirituallybroken b58',
+      river: '(28) BB_other x onAhKd2c7d9s / UTG_spirituallybroken x'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const betbetbet = profile.sections.find((section) => section.id === 'betbetbet');
+
+  const betbet6 = betbet.groups[0].rows.find((row) => row.bucket === '6');
+  const betbetMiss = betbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+  const bbb7 = betbetbet.groups[0].rows.find((row) => row.bucket === '7');
+  const bbbMiss = betbetbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(betbet6.total, 1);
+  assert.equal(betbetMiss.total, 1);
+  assert.equal(bbb7.total, 1);
+  assert.equal(bbbMiss.total, 1);
+});
+
+test('visual profile uses miss-street strength for BetBet miss (b-x-x)', () => {
+  const rows = [
+    {
+      flop: '(10) UTG_spirituallybroken cb33 onAhKd2c / BB_other c',
+      turn: '(16) BB_other x onAhKd2c7d / UTG_spirituallybroken xb KhQsJdTd9d_2p',
+      river: '(16) BB_other x onAhKd2c7d9s / UTG_spirituallybroken x KhQsJdTd9d_str'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const missRow = betbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(missRow.total, 1);
+  assert.equal(missRow.counts.twoPair, 1);
+  assert.equal(missRow.counts.strong, 0);
+  assert.equal(missRow.counts.nuts, 0);
+});
+
+test('visual profile uses river strength for BetBet miss (x-b-x)', () => {
+  const rows = [
+    {
+      flop: '(10) UTG_spirituallybroken x onAhKd2c / BB_other x',
+      turn: '(16) BB_other x onAhKd2c7d / UTG_spirituallybroken b58 KhQsJdTd9d_2p',
+      river: '(16) BB_other x onAhKd2c7d9s / UTG_spirituallybroken x KhQsJdTd9d_str'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const missRow = betbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(missRow.total, 1);
+  assert.equal(missRow.counts.strong, 1);
+  assert.equal(missRow.counts.twoPair, 0);
+});
+
+test('visual profile propagates conditional Sx strength across streets in the same line', () => {
+  const rows = [
+    {
+      flop: '(10) UTG_spirituallybroken cb52 onAhKd2c / BB_other c',
+      turn: '(22) BB_other x onAhKd2c7d / UTG_spirituallybroken b66 / BB_other f',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const flop5 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '5');
+  const betbet6 = betbet.groups[0].rows.find((row) => row.bucket === '6');
+
+  assert.equal(flop5.total, 1);
+  assert.equal(flop5.counts.conditionalStrong, 1);
+  assert.equal(flop5.counts.unknown, 0);
+  assert.equal(betbet6.total, 1);
+  assert.equal(betbet6.counts.conditionalStrong, 1);
+});
+
+test('visual profile marks Lt when player folds on turn after own turn aggression', () => {
+  const rows = [
+    {
+      flop: '(9.1) BB_other x onQhTs5s / HJ_spirituallybroken x',
+      turn: '(9.1) BB_other x onQhTs5s4d / HJ_spirituallybroken b62 / BB_other r3x / HJ_spirituallybroken f',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const probes = profile.sections.find((section) => section.id === 'probes');
+  const bucket6 = probes.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '6');
+
+  assert.equal(bucket6.total, 1);
+  assert.equal(bucket6.counts.lightFold, 1);
 });

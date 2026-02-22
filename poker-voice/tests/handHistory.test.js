@@ -189,7 +189,7 @@ test('parseHandHistory extracts blinds target and pot-based sizing context', () 
   assert.equal(parsed.showdown.targetStreetClass.river, 'str');
   assert.equal(parsed.showdown.opponentStreetClass.flop, '2p');
   assert.equal(parsed.showdown.opponentStreetClass.turn, '2p');
-  assert.equal(parsed.showdown.opponentStreetClass.river, '2p');
+  assert.equal(parsed.showdown.opponentStreetClass.river, 'p');
 
   const flopBet = parsed.events.flop.find((event) => event.player === '86761294' && event.type === 'bet');
   assert.ok(flopBet);
@@ -478,4 +478,98 @@ Total pot ¥12
 
   assert.match(enriched.flop, /\bcb75\b/i);
   assert.equal(/\bb0\b/i.test(enriched.flop), false);
+});
+
+test('parseHandHistory downgrades paired-board 2p to pair token in showdown classes', () => {
+  const hh = `
+PokerStars Hand #999002:  5 Card Omaha Pot Limit (¥1/¥2 CNY)
+Table 'T' 2-max Seat #1 is the button
+Seat 1: 11111111 (¥500 in chips)
+Seat 2: 22222222 (¥500 in chips)
+11111111: posts small blind ¥1
+22222222: posts big blind ¥2
+*** HOLE CARDS ***
+11111111: raises ¥4 to ¥6
+22222222: calls ¥4
+*** FLOP *** [As Ad 7c]
+11111111: checks
+22222222: checks
+*** TURN *** [As Ad 7c] [2h]
+11111111: checks
+22222222: checks
+*** RIVER *** [As Ad 7c 2h] [3d]
+11111111: checks
+22222222: checks
+*** SHOW DOWN ***
+11111111: shows [7h Tc 9d 4c 3h]
+22222222: shows [Kh Qc Jd 8c 5s]
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  const enriched = enrichHandHistoryParsed(
+    { preflop: '', flop: '', turn: '', river: '', presupposition: '' },
+    parsed
+  );
+
+  assert.equal(parsed.showdown.targetStreetClass.flop, 'p');
+  assert.match(enriched.flop, /\b7hTc9d4c3h_p\b/);
+  assert.equal(/\b7hTc9d4c3h_2p\b/.test(enriched.flop), false);
+});
+
+test('enrichHandHistoryParsed adds Sf when target aggression causes folds without showdown', () => {
+  const hh = `
+PokerStars Hand #999003:  5 Card Omaha Pot Limit (¥1/¥2 CNY)
+Table 'T' 2-max Seat #1 is the button
+Seat 1: 11111111 (¥500 in chips)
+Seat 2: 22222222 (¥500 in chips)
+11111111: posts small blind ¥1
+22222222: posts big blind ¥2
+*** HOLE CARDS ***
+11111111: raises ¥4 to ¥6
+22222222: calls ¥4
+*** FLOP *** [Ac Kd 7h]
+11111111: bets ¥9
+22222222: folds
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  const enriched = enrichHandHistoryParsed(
+    { preflop: '', flop: '', turn: '', river: '', presupposition: '' },
+    parsed
+  );
+
+  assert.match(enriched.flop, /\b[A-Z0-9]+_11111111 cb75\b/);
+  assert.match(enriched.flop, /\bSf\b/);
+});
+
+test('enrichHandHistoryParsed adds Lr when target folds river after earlier aggression', () => {
+  const hh = `
+PokerStars Hand #999004:  5 Card Omaha Pot Limit (¥1/¥2 CNY)
+Table 'T' 2-max Seat #1 is the button
+Seat 1: 11111111 (¥500 in chips)
+Seat 2: 22222222 (¥500 in chips)
+11111111: posts small blind ¥1
+22222222: posts big blind ¥2
+*** HOLE CARDS ***
+11111111: raises ¥4 to ¥6
+22222222: calls ¥4
+*** FLOP *** [Ac Kd 7h]
+11111111: bets ¥6
+22222222: calls ¥6
+*** TURN *** [Ac Kd 7h] [2c]
+11111111: checks
+22222222: checks
+*** RIVER *** [Ac Kd 7h 2c] [9s]
+22222222: bets ¥10
+11111111: folds
+`.trim();
+
+  const parsed = parseHandHistory(hh, '11111111');
+  const enriched = enrichHandHistoryParsed(
+    { preflop: '', flop: '', turn: '', river: '', presupposition: '' },
+    parsed
+  );
+
+  assert.match(enriched.river, /\b[A-Z0-9]+_11111111 f\b/);
+  assert.match(enriched.river, /\bLr\b/);
 });

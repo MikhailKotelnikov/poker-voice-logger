@@ -402,6 +402,15 @@ function computeStreetClasses(cards, board) {
     }
   }
 
+  for (const street of ['flop', 'turn', 'river']) {
+    const boardCards = boards[street] || [];
+    if (!boardIsPaired(boardCards)) continue;
+    const detail = out._details[street];
+    if (!detail || detail.classToken !== '2p') continue;
+    out[street] = 'p';
+    out._details[street] = { ...detail, classToken: 'p', downgradedFrom: '2p_on_paired_board' };
+  }
+
   return out;
 }
 
@@ -1109,6 +1118,15 @@ function isTargetPreflopAggressor(parsedHistory) {
   return false;
 }
 
+function formatSizingNonZero(valueRaw) {
+  if (!Number.isFinite(valueRaw)) return '';
+  const value = Number(valueRaw);
+  if (value <= 0) return '';
+  const normalized = value > 0 && value < 0.01 ? 0.01 : value;
+  const formatted = formatNum(normalized);
+  return formatted === '0' ? '0.01' : formatted;
+}
+
 function eventActionToken(event, street, isCheckBehind = false) {
   if (!event) return '';
   if (event.type === 'fold') return 'f';
@@ -1126,7 +1144,8 @@ function eventActionToken(event, street, isCheckBehind = false) {
         ? event.rawPctPot
         : null;
     if (street !== 'preflop' && Number.isFinite(pctPot)) {
-      return `b${formatNum(pctPot)}`;
+      const formatted = formatSizingNonZero(pctPot);
+      return formatted ? `b${formatted}` : 'b';
     }
     if (street === 'preflop' && Number.isFinite(event.amountBb)) {
       return `b${formatNum(event.amountBb)}bb`;
@@ -1149,8 +1168,14 @@ function eventActionToken(event, street, isCheckBehind = false) {
       : Number.isFinite(event.rawPctPot) && event.rawPctPot > 0
         ? event.rawPctPot
         : null;
-    if (Number.isFinite(toPctPot)) return `r${formatNum(toPctPot)}`;
-    if (Number.isFinite(pctPot)) return `r${formatNum(pctPot)}`;
+    if (Number.isFinite(toPctPot)) {
+      const formattedTo = formatSizingNonZero(toPctPot);
+      return formattedTo ? `r${formattedTo}` : 'r';
+    }
+    if (Number.isFinite(pctPot)) {
+      const formatted = formatSizingNonZero(pctPot);
+      return formatted ? `r${formatted}` : 'r';
+    }
     return 'r';
   }
   return '';
@@ -1403,6 +1428,52 @@ function buildTargetStreetPrefix(parsedHistory, street) {
   return parts.join(' ').trim();
 }
 
+function streetTagLetter(street) {
+  if (street === 'river') return 'r';
+  if (street === 'turn') return 't';
+  return 'f';
+}
+
+function hasPriorAggressionByPlayer(parsedHistory, player, street, indexInStreet) {
+  const currentStreetEvents = parsedHistory?.events?.[street] || [];
+  for (let i = 0; i < indexInStreet; i += 1) {
+    const event = currentStreetEvents[i];
+    if (event?.player === player && (event.type === 'bet' || event.type === 'raise')) {
+      return true;
+    }
+  }
+
+  const order = ['flop', 'turn', 'river'];
+  const streetIndex = order.indexOf(street);
+  const priorStreets = streetIndex > 0 ? order.slice(0, streetIndex) : [];
+  for (const priorStreet of priorStreets) {
+    const hasAggression = (parsedHistory?.events?.[priorStreet] || [])
+      .some((event) => event?.player === player && (event.type === 'bet' || event.type === 'raise'));
+    if (hasAggression) return true;
+  }
+  return false;
+}
+
+function inferPostflopInferenceTag(parsedHistory, street, events, index, event, hasShowdownHandToken) {
+  if (!event || hasShowdownHandToken) return '';
+  const letter = streetTagLetter(street);
+
+  if (event.type === 'fold' && hasPriorAggressionByPlayer(parsedHistory, event.player, street, index)) {
+    return `L${letter}`;
+  }
+
+  if (event.type === 'bet' || event.type === 'raise') {
+    const later = (events || [])
+      .slice(index + 1)
+      .filter((item) => item && item.player !== event.player && ['check', 'fold', 'call', 'bet', 'raise'].includes(item.type));
+    if (later.length && later.some((item) => item.type === 'fold') && later.every((item) => item.type === 'fold')) {
+      return `S${letter}`;
+    }
+  }
+
+  return '';
+}
+
 function buildPostflopSequenceNote(parsedHistory, street) {
   const events = (parsedHistory?.events?.[street] || [])
     .filter((event) => ['check', 'fold', 'call', 'bet', 'raise'].includes(event.type));
@@ -1437,6 +1508,10 @@ function buildPostflopSequenceNote(parsedHistory, street) {
     const handToken = playerStreetHandToken(parsedHistory, event.player, street);
     if (handToken) {
       tokenParts.push(handToken);
+    }
+    const inferredTag = inferPostflopInferenceTag(parsedHistory, street, events, index, event, Boolean(handToken));
+    if (inferredTag) {
+      tokenParts.push(inferredTag);
     }
     if (target && event.player === target) {
       const board = boardToken(parsedHistory, street);
