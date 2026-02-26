@@ -225,6 +225,35 @@ test('visual profile classifies two pair with dedicated color bucket', () => {
   assert.equal(bucket6.counts.strong, 0);
 });
 
+test('visual profile classifies overpair token as overpair bucket', () => {
+  const strength = __testables.classifyStrength('HJ_spirituallybroken cb97.71 ov_p onTd4h5c');
+  assert.equal(strength, 'overpair');
+});
+
+test('visual profile parses mixed suffix tokens like monster_wrap+nutfd as strong draw', () => {
+  const strength = __testables.classifyStrength('MISS d monster_wrap+nutfd 4w 6c');
+  assert.equal(strength, 'strongDraw');
+});
+
+test('visual profile keeps voice miss+draw rows in draw color (not Lx/unknown)', () => {
+  const rows = [
+    {
+      flop: 'MISS d monster_wrap+nutfd 4w 6c',
+      turn: '',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'process phenom' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const missMw = flop.groups.find((group) => group.id === 'MW').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(missMw.total, 1);
+  assert.equal(missMw.counts.strongDraw, 1);
+  assert.equal(missMw.counts.lightFold, 0);
+  assert.equal(missMw.counts.unknown, 0);
+});
+
 test('visual profile does not classify 2p as two pair on paired board', () => {
   const strength = __testables.classifyStrength('SB_hero b50 AhTc9d4c3h_2p onAsAd7c');
   assert.notEqual(strength, 'twoPair');
@@ -306,10 +335,144 @@ test('visual profile derives BetBet and BetBetBet lines without explicit bb toke
   const bbb7 = betbetbet.groups[0].rows.find((row) => row.bucket === '7');
   const bbbMiss = betbetbet.groups[0].rows.find((row) => row.bucket === 'Miss');
 
-  assert.equal(betbet6.total, 1);
+  assert.equal(betbet6.total, 2);
   assert.equal(betbetMiss.total, 1);
   assert.equal(bbb7.total, 1);
   assert.equal(bbbMiss.total, 1);
+});
+
+test('visual profile tracks turn Donk and Miss Donk in dedicated non-sized rows', () => {
+  const rows = [
+    {
+      flop: '(12) BB_target x onAh7d4c / BTN_other b50 / BB_target c',
+      turn: '(25) BB_target b40 onAh7d4c2s / BTN_other f',
+      river: ''
+    },
+    {
+      flop: '(12) BB_target x onAh7d4c / BTN_other b50 / BB_target c',
+      turn: '(25) BB_target x onAh7d4c2s / BTN_other b60 / BB_target f',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const donk = betbet.groups[0].rows.find((row) => row.bucket === 'Donk');
+  const missDonk = betbet.groups[0].rows.find((row) => row.bucket === 'Miss Donk');
+
+  assert.equal(donk.total, 1);
+  assert.equal(missDonk.total, 1);
+});
+
+test('visual profile splits river into Check-Bet-Bet and Bet-Check-Bet with miss and donk rows', () => {
+  const rows = [
+    // XBB bet
+    {
+      flop: '(10) BB_target x onAhKd2c / BTN_other x',
+      turn: '(10) BB_target b55 onAhKd2c7d / BTN_other c',
+      river: '(20) BB_target b62 onAhKd2c7d9s / BTN_other f'
+    },
+    // XBB miss
+    {
+      flop: '(10) BB_target x onAhKd2c / BTN_other x',
+      turn: '(10) BB_target b55 onAhKd2c7d / BTN_other c',
+      river: '(20) BB_target x onAhKd2c7d9s / BTN_other x'
+    },
+    // XBB donk
+    {
+      flop: '(10) BB_target x onAhKd2c / BTN_other x',
+      turn: '(10) BB_target x onAhKd2c7d / BTN_other b60 / BB_target c',
+      river: '(32) BB_target b50 onAhKd2c7d9s / BTN_other f'
+    },
+    // XBB miss donk
+    {
+      flop: '(10) BB_target x onAhKd2c / BTN_other x',
+      turn: '(10) BB_target x onAhKd2c7d / BTN_other b60 / BB_target c',
+      river: '(32) BB_target x onAhKd2c7d9s / BTN_other x'
+    },
+    // BXB bet
+    {
+      flop: '(10) BB_target cb50 onAhKd2c / BTN_other c',
+      turn: '(20) BB_target x onAhKd2c7d / BTN_other x',
+      river: '(20) BB_target b60 onAhKd2c7d9s / BTN_other f'
+    },
+    // BXB miss
+    {
+      flop: '(10) BB_target cb50 onAhKd2c / BTN_other c',
+      turn: '(20) BB_target x onAhKd2c7d / BTN_other x',
+      river: '(20) BB_target x onAhKd2c7d9s / BTN_other x'
+    },
+    // BXB donk
+    {
+      flop: '(10) BB_target cb50 onAhKd2c / BTN_other c',
+      turn: '(20) BB_target x onAhKd2c7d / BTN_other b60 / BB_target c',
+      river: '(40) BB_target b50 onAhKd2c7d9s / BTN_other f'
+    },
+    // BXB miss donk
+    {
+      flop: '(10) BB_target cb50 onAhKd2c / BTN_other c',
+      turn: '(20) BB_target x onAhKd2c7d / BTN_other b60 / BB_target c',
+      river: '(40) BB_target x onAhKd2c7d9s / BTN_other x'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const xbb = profile.sections.find((section) => section.id === 'riverXbb');
+  const bxb = profile.sections.find((section) => section.id === 'riverBxb');
+
+  assert.equal(xbb.groups[0].rows.find((row) => row.bucket === '6').total, 1);
+  assert.equal(xbb.groups[0].rows.find((row) => row.bucket === 'Miss').total, 1);
+  assert.equal(xbb.groups[0].rows.find((row) => row.bucket === 'Donk').total, 1);
+  assert.equal(xbb.groups[0].rows.find((row) => row.bucket === 'Miss Donk').total, 1);
+
+  assert.equal(bxb.groups[0].rows.find((row) => row.bucket === '6').total, 1);
+  assert.equal(bxb.groups[0].rows.find((row) => row.bucket === 'Miss').total, 1);
+  assert.equal(bxb.groups[0].rows.find((row) => row.bucket === 'Donk').total, 1);
+  assert.equal(bxb.groups[0].rows.find((row) => row.bucket === 'Miss Donk').total, 1);
+});
+
+test('visual profile adds River Once miss row when x-x flop and x-x turn end in river check', () => {
+  const rows = [
+    {
+      flop: '(8.2) BB_target x onAh7d4c / BTN_other x',
+      turn: '(8.2) BB_target x onAh7d4c2s / BTN_other x',
+      river: '(8.2) BB_target b52 onAh7d4c2s9h / BTN_other f'
+    },
+    {
+      flop: '(8.2) BB_target x onAh7d4c / BTN_other x',
+      turn: '(8.2) BB_target x onAh7d4c2s / BTN_other x',
+      river: '(8.2) BB_target x onAh7d4c2s9h / BTN_other x'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const riverOnce = profile.sections.find((section) => section.id === 'riverOnce');
+  const bucket5 = riverOnce.groups[0].rows.find((row) => row.bucket === '5');
+  const miss = riverOnce.groups[0].rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(bucket5.total, 1);
+  assert.equal(miss.total, 1);
+});
+
+test('visual profile tracks BetBetBet donk and miss-donk rows', () => {
+  const rows = [
+    {
+      flop: '(10) BB_other b50 onAhKd2c / BTN_target c',
+      turn: '(20) BB_other b60 onAhKd2c7d / BTN_target c',
+      river: '(40) BTN_target b52 onAhKd2c7d9s / BB_other f'
+    },
+    {
+      flop: '(10) BB_other b50 onAhKd2c / BTN_target c',
+      turn: '(20) BB_other b60 onAhKd2c7d / BTN_target c',
+      river: '(40) BTN_target x onAhKd2c7d9s / BB_other x'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const bbb = profile.sections.find((section) => section.id === 'betbetbet');
+
+  assert.equal(bbb.groups[0].rows.find((row) => row.bucket === 'Donk').total, 1);
+  assert.equal(bbb.groups[0].rows.find((row) => row.bucket === 'Miss Donk').total, 1);
 });
 
 test('visual profile uses miss-street strength for BetBet miss (b-x-x)', () => {
@@ -331,7 +494,7 @@ test('visual profile uses miss-street strength for BetBet miss (b-x-x)', () => {
   assert.equal(missRow.counts.nuts, 0);
 });
 
-test('visual profile uses river strength for BetBet miss (x-b-x)', () => {
+test('visual profile does not count x-b-x as BetBet miss (kept in probes)', () => {
   const rows = [
     {
       flop: '(10) UTG_spirituallybroken x onAhKd2c / BB_other x',
@@ -342,11 +505,31 @@ test('visual profile uses river strength for BetBet miss (x-b-x)', () => {
 
   const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
   const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const probes = profile.sections.find((section) => section.id === 'probes');
   const missRow = betbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+  const probe6 = probes.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '6');
 
-  assert.equal(missRow.total, 1);
-  assert.equal(missRow.counts.strong, 1);
-  assert.equal(missRow.counts.twoPair, 0);
+  assert.equal(missRow.total, 0);
+  assert.equal(probe6.total, 1);
+});
+
+test('visual profile does not map multiway turn bet (x-b-x) to BetBet miss', () => {
+  const rows = [
+    {
+      flop: '(31) SB_other x on6s8c9c / BB_other x / UTG_spirituallybroken x / CO_other x / BTN_other xb',
+      turn: '(31) SB_other x on6s8c9c6d / BB_other x / UTG_spirituallybroken b50 AhAcTd8s6h_full / CO_other f / BTN_other f / SB_other f / BB_other c',
+      river: '(62) BB_other x on6s8c9c6d2s / UTG_spirituallybroken xb AhAcTd8s6h_full'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const probes = profile.sections.find((section) => section.id === 'probes');
+  const missRow = betbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+  const probe5Mw = probes.groups.find((group) => group.id === 'MW').rows.find((row) => row.bucket === '5');
+
+  assert.equal(missRow.total, 0);
+  assert.equal(probe5Mw.total, 1);
 });
 
 test('visual profile propagates conditional Sx strength across streets in the same line', () => {
