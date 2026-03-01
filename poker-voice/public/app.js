@@ -50,8 +50,83 @@ let suggestionsRequestId = 0;
 let lastTranscript = '';
 let reportDraft = null;
 let profileModalOpponent = '';
+let profileModalSource = 'voice';
 let isBatchProcessing = false;
 const profileCache = new Map();
+const profileListCache = new Map();
+const PROFILE_DEFAULT_SOURCE = 'voice';
+const PROFILE_VS_DEFAULTS_KEY = 'pokerVoiceProfileVsDefaultsV1';
+const PROFILE_VS_DEFAULT_KEY = '__all__';
+let profileViewMode = 'chart';
+
+function loadProfileVsDefaults() {
+  try {
+    const raw = localStorage.getItem(PROFILE_VS_DEFAULTS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveProfileVsDefaults(defaults = {}) {
+  try {
+    localStorage.setItem(PROFILE_VS_DEFAULTS_KEY, JSON.stringify(defaults));
+  } catch {}
+}
+
+let profileVsDefaults = loadProfileVsDefaults();
+
+function createDefaultProfileFilters() {
+  return {
+    playerGroups: [],
+    datePreset: 'all',
+    gameCards: [],
+    rooms: [],
+    potBuckets: [],
+    limits: [],
+    vsOpponent: String(profileVsDefaults?.[PROFILE_VS_DEFAULT_KEY] || '').trim(),
+    recentLimit: 'all'
+  };
+}
+
+let profileFilters = createDefaultProfileFilters();
+let profileFilterOptions = { rooms: [] };
+
+function normalizeProfileSource(source) {
+  const value = String(source || PROFILE_DEFAULT_SOURCE).trim().toLowerCase();
+  if (['hh', 'handhistory', 'hand_history'].includes(value)) return 'hh';
+  if (value === 'voice') return 'voice';
+  return 'all';
+}
+
+function serializeProfileFilters(filters = profileFilters) {
+  const normalizeList = (value) => {
+    const list = Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+    list.sort();
+    return list.join(',');
+  };
+  return [
+    `players=${normalizeList(filters.playerGroups)}`,
+    `date=${String(filters.datePreset || 'all')}`,
+    `games=${normalizeList(filters.gameCards)}`,
+    `rooms=${normalizeList(filters.rooms)}`,
+    `pots=${normalizeList(filters.potBuckets)}`,
+    `limits=${normalizeList(filters.limits)}`,
+    `vs=${String(filters.vsOpponent || '').trim().toLowerCase()}`,
+    `recent=${String(filters.recentLimit || 'all')}`
+  ].join('|');
+}
+
+function profileCacheKey(opponent, source = PROFILE_DEFAULT_SOURCE, filters = profileFilters) {
+  return `${normalizeProfileSource(source)}::${serializeProfileFilters(filters)}::${String(opponent || '').trim()}`;
+}
+
+function profileListCacheKey(opponent, source = PROFILE_DEFAULT_SOURCE, filters = profileFilters) {
+  return `${normalizeProfileSource(source)}::${serializeProfileFilters(filters)}::${String(opponent || '').trim()}`;
+}
 
 function loadOpponents() {
   try {
@@ -313,6 +388,7 @@ function parseTooltipSampleLegacy(sampleText) {
     return {
       rowId: '',
       focusStreet: '',
+      meta: null,
       streets: order.map((name) => ({
         name,
         raw: name === 'FLOP' ? text : '',
@@ -325,6 +401,7 @@ function parseTooltipSampleLegacy(sampleText) {
   return {
     rowId: match[1],
     focusStreet: focus,
+    meta: null,
     streets: order.map((name) => {
       const raw = name === focus ? details : '';
       return {
@@ -379,6 +456,7 @@ function parseTooltipSample(sampleText) {
       return {
         rowId: String(parsed.rowLabel || '').trim(),
         focusStreet: String(parsed.focusStreet || '').toUpperCase(),
+        meta: parsed?.meta && typeof parsed.meta === 'object' ? parsed.meta : null,
         streets
       };
     }
@@ -397,6 +475,30 @@ function normalizeTooltipSamples(sampleInput) {
     return [sampleInput];
   }
   return [];
+}
+
+function tooltipMetaTokens(metaRaw) {
+  const meta = metaRaw && typeof metaRaw === 'object' ? metaRaw : null;
+  if (!meta) return [];
+  const out = [];
+  const handNumber = String(meta.handNumber || '').trim();
+  const playedAt = String(meta.playedAtUtc || '').trim();
+  const game = String(meta.game || '').trim();
+  const players = Number(meta.activePlayers);
+  const room = String(meta.room || '').trim();
+  const limit = String(meta.limit || '').trim();
+  const finalPotBb = Number(meta.finalPotBb);
+  const potBucket = String(meta.potBucket || '').trim();
+
+  if (handNumber) out.push(`#${handNumber}`);
+  if (playedAt) out.push(playedAt);
+  if (game) out.push(game);
+  if (Number.isFinite(players) && players > 0) out.push(`${players}p`);
+  if (limit) out.push(limit);
+  if (room) out.push(room);
+  if (Number.isFinite(finalPotBb) && finalPotBb > 0) out.push(`${Math.round(finalPotBb * 100) / 100}bb`);
+  if (potBucket) out.push(potBucket);
+  return out;
 }
 
 function extractTargetId(value) {
@@ -429,7 +531,15 @@ function markHeroSegments(streets = [], targetIdentity = '') {
   return streets;
 }
 
-function renderTooltipSegmentLine(segments = []) {
+function renderTooltipSegmentLine(segments = [], options = {}) {
+  const showPot = options.showPot !== false;
+  const showAction = options.showAction !== false;
+  const showCards = options.showCards !== false;
+  const showTags = options.showTags !== false;
+  const showBoard = options.showBoard !== false;
+  const showExtras = options.showExtras !== false;
+  const showAllIn = options.showAllIn !== false;
+
   const line = document.createElement('div');
   line.className = 'pt-line';
 
@@ -443,11 +553,11 @@ function renderTooltipSegmentLine(segments = []) {
 
     const item = document.createElement('span');
     item.className = 'pt-segment';
-    if (segment.allIn) {
+    if (showAllIn && segment.allIn) {
       item.classList.add('pt-segment-allin');
     }
 
-    if (segment.pot) {
+    if (showPot && segment.pot) {
       const pot = document.createElement('span');
       pot.className = 'pt-pot';
       pot.textContent = `(${segment.pot})`;
@@ -461,16 +571,18 @@ function renderTooltipSegmentLine(segments = []) {
       item.appendChild(pos);
     }
 
-    const action = buildTooltipAction(segment.action, segment.hero);
-    if (action) {
-      item.appendChild(action);
+    if (showAction) {
+      const action = buildTooltipAction(segment.action, segment.hero);
+      if (action) {
+        item.appendChild(action);
+      }
     }
 
-    if (segment.cards.length) {
+    if (showCards && segment.cards.length) {
       item.appendChild(buildTooltipCards(segment.cards));
     }
 
-    if (segment.handTags.length) {
+    if (showTags && segment.handTags.length) {
       const tags = document.createElement('span');
       tags.className = 'pt-hand-tags';
       segment.handTags.forEach((tag) => {
@@ -482,7 +594,7 @@ function renderTooltipSegmentLine(segments = []) {
       item.appendChild(tags);
     }
 
-    if (segment.board.length) {
+    if (showBoard && segment.board.length) {
       const on = document.createElement('span');
       on.className = 'pt-on';
       on.textContent = 'on';
@@ -490,7 +602,7 @@ function renderTooltipSegmentLine(segments = []) {
       item.appendChild(buildTooltipCards(segment.board, { board: true }));
     }
 
-    if (segment.extras.length) {
+    if (showExtras && segment.extras.length) {
       const extra = document.createElement('span');
       extra.className = 'pt-extra';
       extra.textContent = segment.extras.join(' ');
@@ -508,6 +620,53 @@ function renderTooltipSegmentLine(segments = []) {
   });
 
   return line;
+}
+
+function collectTooltipHandsSegments(streets = []) {
+  const byActor = new Map();
+  const order = [];
+
+  streets.forEach((street) => {
+    (street?.segments || []).forEach((segment) => {
+      const pos = String(segment?.pos || '').trim();
+      if (!pos || !Array.isArray(segment?.cards) || !segment.cards.length) return;
+      const key = pos.toLowerCase();
+      if (!byActor.has(key)) {
+        byActor.set(key, {
+          pos,
+          hero: Boolean(segment.hero),
+          cards: segment.cards.map((card) => ({ ...card }))
+        });
+        order.push(key);
+        return;
+      }
+      const existing = byActor.get(key);
+      existing.hero = existing.hero || Boolean(segment.hero);
+      if (!existing.cards.length) {
+        existing.cards = segment.cards.map((card) => ({ ...card }));
+      }
+    });
+  });
+
+  const heroKeys = order.filter((key) => byActor.get(key)?.hero);
+  const otherKeys = order.filter((key) => !byActor.get(key)?.hero);
+  const finalOrder = [...heroKeys, ...otherKeys];
+
+  return finalOrder.map((key) => {
+    const item = byActor.get(key);
+    return {
+      pos: item?.pos || '',
+      hero: Boolean(item?.hero),
+      cards: Array.isArray(item?.cards) ? item.cards : [],
+      handTags: [],
+      board: [],
+      extras: [],
+      action: '',
+      pot: '',
+      allIn: false,
+      raw: ''
+    };
+  });
 }
 
 function handleProfileTooltipWheel(event) {
@@ -546,8 +705,45 @@ function buildProfileTooltipContent(sampleInput) {
       entry.appendChild(head);
     }
 
+    const metaTokens = tooltipMetaTokens(parsed.meta);
+    if (metaTokens.length) {
+      const metaRow = document.createElement('div');
+      metaRow.className = 'pt-meta-row';
+      metaTokens.forEach((token) => {
+        const item = document.createElement('span');
+        item.className = 'pt-meta-token';
+        item.textContent = token;
+        metaRow.appendChild(item);
+      });
+      entry.appendChild(metaRow);
+    }
+
     const streets = Array.isArray(parsed.streets) ? parsed.streets : [];
     markHeroSegments(streets, extractTargetIdentity(profileModalOpponent));
+
+    const handsSegments = collectTooltipHandsSegments(streets);
+    if (handsSegments.length) {
+      const handsRow = document.createElement('div');
+      handsRow.className = 'pt-street-row';
+
+      const handsLabel = document.createElement('span');
+      handsLabel.className = 'pt-street-label';
+      handsLabel.textContent = 'HANDS';
+      handsRow.appendChild(handsLabel);
+
+      handsRow.appendChild(
+        renderTooltipSegmentLine(handsSegments, {
+          showPot: false,
+          showAction: false,
+          showTags: false,
+          showBoard: false,
+          showExtras: false,
+          showAllIn: false
+        })
+      );
+      entry.appendChild(handsRow);
+    }
+
     streets.forEach((street) => {
       const row = document.createElement('div');
       row.className = 'pt-street-row';
@@ -567,7 +763,7 @@ function buildProfileTooltipContent(sampleInput) {
         const segments = street.segments?.length
           ? street.segments
           : [parseTooltipSegment(raw)];
-        row.appendChild(renderTooltipSegmentLine(segments));
+        row.appendChild(renderTooltipSegmentLine(segments, { showCards: false }));
       }
       entry.appendChild(row);
     });
@@ -613,6 +809,38 @@ function hideProfileTooltip() {
 
 function renderProfileRows(rows = [], legend = []) {
   const fragment = document.createDocumentFragment();
+  const order = ['nuts', 'strong', 'conditionalStrong', 'fragileStrong', 'overpair', 'twoPair', 'topPair', 'strongDraw', 'weakDraw', 'lightFold', 'weak', 'unknown'];
+
+  const appendLaneSegments = (laneEl, laneTotal, counts = {}, samples = {}, fallbackSamples = []) => {
+    if (!(laneTotal > 0)) {
+      laneEl.classList.add('profile-lane-empty');
+      return;
+    }
+    order.forEach((key) => {
+      const count = Number(counts?.[key] || 0);
+      if (!count) return;
+      const width = (count / laneTotal) * 100;
+      const segment = document.createElement('div');
+      segment.className = 'profile-segment';
+      segment.style.width = `${width}%`;
+      segment.style.background = profileLegendColor(legend, key);
+      const samplesForKey = Array.isArray(samples?.[key]) ? samples[key] : [];
+      const samplesAll = Array.isArray(samples?.all) ? samples.all : [];
+      const tooltipSamples = samplesForKey.length
+        ? samplesForKey
+        : (samplesAll.length ? samplesAll : fallbackSamples);
+      if (tooltipSamples.length) {
+        segment.addEventListener('mouseenter', (event) => showProfileTooltip(tooltipSamples, event));
+        segment.addEventListener('mousemove', moveProfileTooltip);
+        segment.addEventListener('mouseleave', hideProfileTooltip);
+      }
+      if (width >= 22) {
+        segment.textContent = String(count);
+      }
+      laneEl.appendChild(segment);
+    });
+  };
+
   rows.forEach((row) => {
     const rowEl = document.createElement('div');
     rowEl.className = 'profile-row';
@@ -627,30 +855,29 @@ function renderProfileRows(rows = [], legend = []) {
     const bar = document.createElement('div');
     bar.className = `profile-bar ${row.total > 0 ? '' : 'profile-empty'}`.trim();
 
-    if (row.total > 0) {
-      const order = ['nuts', 'strong', 'conditionalStrong', 'overpair', 'twoPair', 'topPair', 'strongDraw', 'weakDraw', 'lightFold', 'weak', 'unknown'];
-      order.forEach((key) => {
-        const count = Number(row?.counts?.[key] || 0);
-        if (!count) return;
-        const width = (count / row.total) * 100;
-        const segment = document.createElement('div');
-        segment.className = 'profile-segment';
-        segment.style.width = `${width}%`;
-        segment.style.background = profileLegendColor(legend, key);
-        const samples = Array.isArray(row?.samples?.[key]) ? row.samples[key] : [];
-        const fallbackSamples = Array.isArray(row?.samples?.all) ? row.samples.all : [];
-        const tooltipSamples = samples.length ? samples : fallbackSamples;
-        if (tooltipSamples.length) {
-          segment.addEventListener('mouseenter', (event) => showProfileTooltip(tooltipSamples, event));
-          segment.addEventListener('mousemove', moveProfileTooltip);
-          segment.addEventListener('mouseleave', hideProfileTooltip);
-        }
-        if (width >= 12) {
-          segment.textContent = String(count);
-        }
-        bar.appendChild(segment);
-      });
-    }
+    const normalLane = document.createElement('div');
+    normalLane.className = 'profile-lane profile-lane-normal';
+    const allInLane = document.createElement('div');
+    allInLane.className = 'profile-lane profile-lane-allin';
+
+    const fallbackSamples = Array.isArray(row?.samples?.all) ? row.samples.all : [];
+    appendLaneSegments(
+      normalLane,
+      Number(row?.normalTotal || 0),
+      row?.countsNormal || {},
+      row?.samplesNormal || {},
+      fallbackSamples
+    );
+    appendLaneSegments(
+      allInLane,
+      Number(row?.allInTotal || 0),
+      row?.countsAllIn || {},
+      row?.samplesAllIn || {},
+      fallbackSamples
+    );
+
+    bar.appendChild(normalLane);
+    bar.appendChild(allInLane);
 
     rowEl.appendChild(bucket);
     rowEl.appendChild(total);
@@ -658,6 +885,299 @@ function renderProfileRows(rows = [], legend = []) {
     fragment.appendChild(rowEl);
   });
   return fragment;
+}
+
+function createFilterButton(label, active, onClick) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `profile-filter-btn ${active ? 'active' : ''}`.trim();
+  button.textContent = label;
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function activeProfileRoomKey() {
+  const rooms = Array.isArray(profileFilters.rooms) ? profileFilters.rooms : [];
+  if (rooms.length === 1) {
+    return String(rooms[0] || '').trim().toLowerCase() || PROFILE_VS_DEFAULT_KEY;
+  }
+  return PROFILE_VS_DEFAULT_KEY;
+}
+
+function persistVsDefaultForCurrentRoom(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return;
+  const roomKey = activeProfileRoomKey();
+  profileVsDefaults = {
+    ...profileVsDefaults,
+    [roomKey]: normalized,
+    [PROFILE_VS_DEFAULT_KEY]: String(profileVsDefaults[PROFILE_VS_DEFAULT_KEY] || normalized).trim() || normalized
+  };
+  if (roomKey === PROFILE_VS_DEFAULT_KEY) {
+    profileVsDefaults[PROFILE_VS_DEFAULT_KEY] = normalized;
+  }
+  saveProfileVsDefaults(profileVsDefaults);
+}
+
+function applyVsDefaultForCurrentRoom() {
+  const roomKey = activeProfileRoomKey();
+  const exact = String(profileVsDefaults?.[roomKey] || '').trim();
+  const fallback = String(profileVsDefaults?.[PROFILE_VS_DEFAULT_KEY] || '').trim();
+  const nextVs = exact || fallback || '';
+  profileFilters = { ...profileFilters, vsOpponent: nextVs };
+}
+
+function toggleMultiFilter(key, value) {
+  const current = Array.isArray(profileFilters[key]) ? [...profileFilters[key]] : [];
+  const normalizedValue = String(value);
+  const index = current.indexOf(normalizedValue);
+  if (index >= 0) current.splice(index, 1);
+  else current.push(normalizedValue);
+  profileFilters = { ...profileFilters, [key]: current };
+  if (key === 'rooms') {
+    applyVsDefaultForCurrentRoom();
+  }
+}
+
+function setSingleFilter(key, value) {
+  const nextValue = String(value);
+  const currentValue = String(profileFilters[key] || 'all');
+  profileFilters = { ...profileFilters, [key]: currentValue === nextValue ? 'all' : nextValue };
+}
+
+function setVsFilter(value, options = {}) {
+  const normalized = String(value || '').trim();
+  profileFilters = { ...profileFilters, vsOpponent: normalized };
+  if (options.persist !== false) {
+    persistVsDefaultForCurrentRoom(normalized);
+  }
+}
+
+function setFiltersAndReload() {
+  if (!profileModalOpponent) return;
+  renderProfileModalState(profileModalOpponent, profileModalSource);
+  if (profileViewMode === 'list') {
+    prefetchOpponentProfileList(profileModalOpponent, { force: true, source: profileModalSource });
+    return;
+  }
+  prefetchOpponentProfile(profileModalOpponent, { force: true, source: profileModalSource });
+}
+
+function renderProfileFilters() {
+  const wrap = document.createElement('div');
+  wrap.className = 'profile-filters';
+
+  const modeRow = document.createElement('div');
+  modeRow.className = 'profile-filter-row';
+  const modeTitle = document.createElement('div');
+  modeTitle.className = 'profile-filter-title';
+  modeTitle.textContent = 'Режим';
+  modeRow.appendChild(modeTitle);
+  const modeActions = document.createElement('div');
+  modeActions.className = 'profile-filter-actions';
+  modeActions.appendChild(createFilterButton('График', profileViewMode === 'chart', () => {
+    if (profileViewMode === 'chart') return;
+    profileViewMode = 'chart';
+    renderProfileModalState(profileModalOpponent, profileModalSource);
+    prefetchOpponentProfile(profileModalOpponent, { force: false, source: profileModalSource });
+  }));
+  modeActions.appendChild(createFilterButton('Визуализировать списком', profileViewMode === 'list', () => {
+    if (profileViewMode === 'list') return;
+    profileViewMode = 'list';
+    renderProfileModalState(profileModalOpponent, profileModalSource);
+    prefetchOpponentProfileList(profileModalOpponent, { force: false, source: profileModalSource });
+  }));
+  modeRow.appendChild(modeActions);
+  wrap.appendChild(modeRow);
+
+  const groups = [
+    {
+      title: 'Игроков в раздаче',
+      buttons: [
+        { label: '2', value: '2' },
+        { label: '3-4', value: '3-4' },
+        { label: '5-6', value: '5-6' },
+        { label: '7-9', value: '7-9' }
+      ],
+      key: 'playerGroups',
+      single: false
+    },
+    {
+      title: 'Период',
+      buttons: [
+        { label: '6м', value: '6m' },
+        { label: '3м', value: '3m' },
+        { label: '1м', value: '1m' },
+        { label: '1н', value: '1w' },
+        { label: '3д', value: '3d' },
+        { label: 'Сегодня', value: 'today' }
+      ],
+      key: 'datePreset',
+      single: true
+    },
+    {
+      title: 'Последние раздачи',
+      buttons: [
+        { label: '50', value: '50' },
+        { label: '20', value: '20' }
+      ],
+      key: 'recentLimit',
+      single: true
+    },
+    {
+      title: 'Игра',
+      buttons: [
+        { label: 'PLO4', value: '4' },
+        { label: 'PLO5', value: '5' },
+        { label: 'PLO6', value: '6' }
+      ],
+      key: 'gameCards',
+      single: false
+    },
+    {
+      title: 'Размер банка (BB)',
+      buttons: [
+        { label: 'small 0-15', value: 'small' },
+        { label: 'medium 15-35', value: 'medium' },
+        { label: 'large 35-90', value: 'large' },
+        { label: 'huge 90+', value: 'huge' }
+      ],
+      key: 'potBuckets',
+      single: false
+    },
+    {
+      title: 'Лимит',
+      buttons: [
+        { label: '2-4', value: '2-4' },
+        { label: '2,5-5', value: '2.5-5' },
+        { label: '3-6', value: '3-6' },
+        { label: '5-10', value: '5-10' },
+        { label: '10-20', value: '10-20' },
+        { label: '25-50', value: '25-50' },
+        { label: '50-100', value: '50-100' },
+        { label: '100-200', value: '100-200' }
+      ],
+      key: 'limits',
+      single: false
+    }
+  ];
+
+  const roomValues = Array.isArray(profileFilterOptions.rooms)
+    ? profileFilterOptions.rooms
+    : [];
+  if (roomValues.length > 0) {
+    groups.push({
+      title: 'Room',
+      buttons: [
+        ...roomValues.map((room) => ({ label: room, value: room }))
+      ],
+      key: 'rooms',
+      single: false
+    });
+  }
+
+  groups.forEach((group) => {
+    const row = document.createElement('div');
+    row.className = 'profile-filter-row';
+
+    const title = document.createElement('div');
+    title.className = 'profile-filter-title';
+    title.textContent = group.title;
+    row.appendChild(title);
+
+    const actions = document.createElement('div');
+    actions.className = 'profile-filter-actions';
+
+    group.buttons.forEach((item) => {
+      let active = false;
+      if (group.single) {
+        active = String(profileFilters[group.key] || '') === String(item.value);
+      } else {
+        active = Array.isArray(profileFilters[group.key]) && profileFilters[group.key].includes(String(item.value));
+      }
+
+      const button = createFilterButton(item.label, active, () => {
+        if (group.single) {
+          setSingleFilter(group.key, item.value);
+          setFiltersAndReload();
+          return;
+        }
+        toggleMultiFilter(group.key, item.value);
+        setFiltersAndReload();
+      });
+      actions.appendChild(button);
+    });
+
+    row.appendChild(actions);
+    wrap.appendChild(row);
+  });
+
+  if (profileModalSource === 'hh') {
+    const vsRow = document.createElement('div');
+    vsRow.className = 'profile-filter-row';
+
+    const vsTitle = document.createElement('div');
+    vsTitle.className = 'profile-filter-title';
+    vsTitle.textContent = 'VS игрок';
+    vsRow.appendChild(vsTitle);
+
+    const vsActions = document.createElement('div');
+    vsActions.className = 'profile-filter-actions profile-filter-actions-vs';
+
+    const vsInput = document.createElement('input');
+    vsInput.type = 'text';
+    vsInput.className = 'profile-vs-input';
+    vsInput.placeholder = 'выбери оппонента';
+    vsInput.value = String(profileFilters.vsOpponent || '');
+
+    const suggestionList = document.createElement('datalist');
+    suggestionList.id = 'profile-vs-suggestions';
+    const refillVsSuggestions = (query = '') => {
+      suggestionList.innerHTML = '';
+      const items = mergedSuggestions(query);
+      items.forEach((name) => {
+        const option = document.createElement('option');
+        option.value = name;
+        suggestionList.appendChild(option);
+      });
+    };
+    refillVsSuggestions(vsInput.value);
+    vsInput.setAttribute('list', suggestionList.id);
+    vsInput.addEventListener('input', () => {
+      refillVsSuggestions(vsInput.value);
+    });
+
+    const applyVs = () => {
+      const currentValue = String(profileFilters.vsOpponent || '').trim();
+      const nextValue = String(vsInput.value || '').trim();
+      if (currentValue === nextValue) return;
+      setVsFilter(nextValue);
+      setFiltersAndReload();
+    };
+
+    vsInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      applyVs();
+    });
+    vsInput.addEventListener('blur', applyVs);
+
+    const clearVsButton = createFilterButton('сбросить', false, () => {
+      if (!profileFilters.vsOpponent) return;
+      setVsFilter('', { persist: false });
+      vsInput.value = '';
+      refillVsSuggestions('');
+      setFiltersAndReload();
+    });
+
+    vsActions.appendChild(vsInput);
+    vsActions.appendChild(suggestionList);
+    vsActions.appendChild(clearVsButton);
+    vsRow.appendChild(vsActions);
+    wrap.appendChild(vsRow);
+  }
+
+  return wrap;
 }
 
 function renderProfileModal(profile) {
@@ -668,7 +1188,13 @@ function renderProfileModal(profile) {
   const sourceText = sources.length
     ? ` • источники: ${sources.map((item) => `${item.sheetName || 'active'}=${item.rows || 0}`).join(', ')}`
     : '';
-  profileMetaEl.textContent = `строк: ${profile?.totalRows || 0} • проанализировано: ${profile?.analyzedRows || 0}${sourceText}`;
+  profileMetaEl.textContent = `строк в выборке: ${profile?.totalRows || 0} • учтено в секциях: ${profile?.analyzedRows || 0}${sourceText}`;
+
+  const rooms = Array.isArray(profile?.filters?.options?.rooms)
+    ? profile.filters.options.rooms
+    : [];
+  profileFilterOptions = { rooms };
+  profileContentEl.appendChild(renderProfileFilters());
 
   const legend = document.createElement('div');
   legend.className = 'profile-legend';
@@ -716,20 +1242,89 @@ function renderProfileModal(profile) {
   profileContentEl.appendChild(grid);
 }
 
-function renderProfileModalState(opponent) {
+function renderProfileListPayload(payload) {
+  if (!profileContentEl || !profileMetaEl || !profileTitleEl) return;
+  profileContentEl.innerHTML = '';
+  profileTitleEl.textContent = `Профиль: ${payload?.opponent || '—'}`;
+  const sources = Array.isArray(payload?.sources) ? payload.sources : [];
+  const sourceText = sources.length
+    ? ` • источники: ${sources.map((item) => `${item.sheetName || 'active'}=${item.rows || 0}`).join(', ')}`
+    : '';
+  profileMetaEl.textContent = `строк в списке: ${payload?.totalRows || 0}${sourceText}`;
+
+  const rooms = Array.isArray(payload?.filters?.options?.rooms)
+    ? payload.filters.options.rooms
+    : [];
+  profileFilterOptions = { rooms };
+  profileContentEl.appendChild(renderProfileFilters());
+
+  const samples = Array.isArray(payload?.list)
+    ? payload.list
+      .map((row) => {
+        const rowLabel = String(row?.rowLabel || '').trim() || `#DB:${row?.row ?? '?'}`;
+        return JSON.stringify({
+          type: 'profile_sample_v2',
+          rowLabel,
+          focusStreet: '',
+          streets: {
+            preflop: String(row?.preflop || ''),
+            flop: String(row?.flop || ''),
+            turn: String(row?.turn || ''),
+            river: String(row?.river || '')
+          }
+        });
+      })
+      .filter(Boolean)
+    : [];
+
+  if (!samples.length) {
+    const empty = document.createElement('div');
+    empty.className = 'profile-list-empty';
+    empty.textContent = 'По текущим фильтрам раздач нет.';
+    profileContentEl.appendChild(empty);
+    return;
+  }
+
+  const listWrap = document.createElement('div');
+  listWrap.className = 'profile-list-view';
+  listWrap.appendChild(buildProfileTooltipContent(samples));
+  profileContentEl.appendChild(listWrap);
+}
+
+function renderProfileModalState(opponent, source = PROFILE_DEFAULT_SOURCE) {
   if (!profileContentEl || !profileMetaEl || !profileTitleEl) return;
   hideProfileTooltip();
-  const entry = profileCache.get(opponent);
+  const sourceMode = normalizeProfileSource(source);
+  const cache = profileViewMode === 'list' ? profileListCache : profileCache;
+  const key = profileViewMode === 'list'
+    ? profileListCacheKey(opponent, sourceMode, profileFilters)
+    : profileCacheKey(opponent, sourceMode, profileFilters);
+  const entry = cache.get(key);
+  const sourceLabel = sourceMode === 'hh' ? 'HH DB' : (sourceMode === 'voice' ? 'Voice' : 'All');
   profileTitleEl.textContent = `Профиль: ${opponent}`;
 
   if (!entry || entry.status === 'loading') {
-    profileMetaEl.textContent = 'Подготовка профиля...';
-    profileContentEl.textContent = 'Собираю строки оппонента из Google Sheets и считаю визуализацию.';
+    profileMetaEl.textContent = profileViewMode === 'list'
+      ? `Подготовка списка (${sourceLabel})...`
+      : `Подготовка профиля (${sourceLabel})...`;
+    profileContentEl.textContent = sourceMode === 'hh'
+      ? (profileViewMode === 'list'
+        ? 'Собираю список раздач из HH DB.'
+        : 'Собираю строки оппонента из HH DB и считаю визуализацию.')
+      : (profileViewMode === 'list'
+        ? 'Собираю список раздач из источников.'
+        : 'Собираю строки оппонента из источников и считаю визуализацию.');
     return;
   }
   if (entry.status === 'error') {
-    profileMetaEl.textContent = 'Ошибка';
+    profileMetaEl.textContent = profileViewMode === 'list'
+      ? `Ошибка списка (${sourceLabel})`
+      : `Ошибка (${sourceLabel})`;
     profileContentEl.textContent = entry.error || 'Не удалось построить профиль.';
+    return;
+  }
+  if (profileViewMode === 'list') {
+    renderProfileListPayload(entry.payload);
     return;
   }
   renderProfileModal(entry.profile);
@@ -738,49 +1333,160 @@ function renderProfileModalState(opponent) {
 async function prefetchOpponentProfile(opponent, options = {}) {
   const name = String(opponent || '').trim();
   if (!name) return null;
+  const source = normalizeProfileSource(options.source || PROFILE_DEFAULT_SOURCE);
+  const key = profileCacheKey(name, source, profileFilters);
   const force = options.force === true;
-  const current = profileCache.get(name);
+  const current = profileCache.get(key);
   if (!force && current && (current.status === 'loading' || current.status === 'ready')) {
     return current.profile || null;
   }
 
-  profileCache.set(name, { status: 'loading', profile: null, error: '' });
-  if (profileModalOpponent === name) {
-    renderProfileModalState(name);
+  profileCache.set(key, { status: 'loading', profile: null, error: '' });
+  if (profileModalOpponent === name && profileModalSource === source) {
+    renderProfileModalState(name, source);
   }
 
   try {
-    const response = await fetch(`/api/opponent-visual-profile?opponent=${encodeURIComponent(name)}`);
+    const params = new URLSearchParams({ opponent: name, source });
+    if (Array.isArray(profileFilters.playerGroups) && profileFilters.playerGroups.length) {
+      params.set('players', profileFilters.playerGroups.join(','));
+    }
+    if (profileFilters.datePreset && profileFilters.datePreset !== 'all') {
+      params.set('date', profileFilters.datePreset);
+    }
+    if (Array.isArray(profileFilters.gameCards) && profileFilters.gameCards.length) {
+      params.set('games', profileFilters.gameCards.join(','));
+    }
+    if (Array.isArray(profileFilters.rooms) && profileFilters.rooms.length) {
+      params.set('rooms', profileFilters.rooms.join(','));
+    }
+    if (Array.isArray(profileFilters.potBuckets) && profileFilters.potBuckets.length) {
+      params.set('pots', profileFilters.potBuckets.join(','));
+    }
+    if (Array.isArray(profileFilters.limits) && profileFilters.limits.length) {
+      params.set('limits', profileFilters.limits.join(','));
+    }
+    if (profileFilters.vsOpponent) {
+      params.set('vs', profileFilters.vsOpponent);
+    }
+    if (profileFilters.recentLimit && profileFilters.recentLimit !== 'all') {
+      params.set('recent', profileFilters.recentLimit);
+      params.set('limit', profileFilters.recentLimit);
+    }
+    if (force) params.set('force', '1');
+    const response = await fetch(`/api/opponent-visual-profile?${params.toString()}`);
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.error || 'Не удалось собрать визуализацию.');
     }
-    profileCache.set(name, { status: 'ready', profile: data.profile, error: '' });
-    if (profileModalOpponent === name) {
-      renderProfileModalState(name);
+    profileCache.set(key, { status: 'ready', profile: data.profile, error: '' });
+    if (profileModalOpponent === name && profileModalSource === source) {
+      renderProfileModalState(name, source);
     }
     return data.profile;
   } catch (error) {
-    profileCache.set(name, { status: 'error', profile: null, error: error.message || 'Ошибка профиля.' });
-    if (profileModalOpponent === name) {
-      renderProfileModalState(name);
+    profileCache.set(key, { status: 'error', profile: null, error: error.message || 'Ошибка профиля.' });
+    if (profileModalOpponent === name && profileModalSource === source) {
+      renderProfileModalState(name, source);
     }
     return null;
   }
 }
 
-function openProfileModal(opponent) {
+async function prefetchOpponentProfileList(opponent, options = {}) {
+  const name = String(opponent || '').trim();
+  if (!name) return null;
+  const source = normalizeProfileSource(options.source || PROFILE_DEFAULT_SOURCE);
+  const key = profileListCacheKey(name, source, profileFilters);
+  const force = options.force === true;
+  const current = profileListCache.get(key);
+  if (!force && current && (current.status === 'loading' || current.status === 'ready')) {
+    return current.payload || null;
+  }
+
+  profileListCache.set(key, { status: 'loading', payload: null, error: '' });
+  if (profileModalOpponent === name && profileModalSource === source) {
+    renderProfileModalState(name, source);
+  }
+
+  try {
+    const params = new URLSearchParams({ opponent: name, source });
+    if (Array.isArray(profileFilters.playerGroups) && profileFilters.playerGroups.length) {
+      params.set('players', profileFilters.playerGroups.join(','));
+    }
+    if (profileFilters.datePreset && profileFilters.datePreset !== 'all') {
+      params.set('date', profileFilters.datePreset);
+    }
+    if (Array.isArray(profileFilters.gameCards) && profileFilters.gameCards.length) {
+      params.set('games', profileFilters.gameCards.join(','));
+    }
+    if (Array.isArray(profileFilters.rooms) && profileFilters.rooms.length) {
+      params.set('rooms', profileFilters.rooms.join(','));
+    }
+    if (Array.isArray(profileFilters.potBuckets) && profileFilters.potBuckets.length) {
+      params.set('pots', profileFilters.potBuckets.join(','));
+    }
+    if (Array.isArray(profileFilters.limits) && profileFilters.limits.length) {
+      params.set('limits', profileFilters.limits.join(','));
+    }
+    if (profileFilters.vsOpponent) {
+      params.set('vs', profileFilters.vsOpponent);
+    }
+    if (profileFilters.recentLimit && profileFilters.recentLimit !== 'all') {
+      params.set('recent', profileFilters.recentLimit);
+      params.set('limit', profileFilters.recentLimit);
+    }
+
+    const response = await fetch(`/api/opponent-visual-list?${params.toString()}`);
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Не удалось собрать список раздач.');
+    }
+    const payload = {
+      opponent: name,
+      list: Array.isArray(data.list) ? data.list : [],
+      totalRows: Number(data.totalRows || 0),
+      sources: Array.isArray(data.sources) ? data.sources : [],
+      filters: data.filters || { options: { rooms: [] } }
+    };
+    profileListCache.set(key, { status: 'ready', payload, error: '' });
+    if (profileModalOpponent === name && profileModalSource === source) {
+      renderProfileModalState(name, source);
+    }
+    return payload;
+  } catch (error) {
+    profileListCache.set(key, { status: 'error', payload: null, error: error.message || 'Ошибка списка.' });
+    if (profileModalOpponent === name && profileModalSource === source) {
+      renderProfileModalState(name, source);
+    }
+    return null;
+  }
+}
+
+function openProfileModal(opponent, options = {}) {
   if (!profileModalEl) return;
+  const source = normalizeProfileSource(options.source || PROFILE_DEFAULT_SOURCE);
   profileModalOpponent = opponent;
+  profileModalSource = source;
+  profileViewMode = 'chart';
+  profileFilters = createDefaultProfileFilters();
+  if (source === 'hh') {
+    applyVsDefaultForCurrentRoom();
+  } else {
+    setVsFilter('', { persist: false });
+  }
+  profileFilterOptions = { rooms: [] };
   profileModalEl.classList.remove('hidden');
   profileModalEl.setAttribute('aria-hidden', 'false');
-  renderProfileModalState(opponent);
-  prefetchOpponentProfile(opponent, { force: true });
+  renderProfileModalState(opponent, source);
+  prefetchOpponentProfile(opponent, { force: true, source });
 }
 
 function closeProfileModal() {
   if (!profileModalEl) return;
   profileModalOpponent = '';
+  profileModalSource = PROFILE_DEFAULT_SOURCE;
+  profileViewMode = 'chart';
   profileModalEl.classList.add('hidden');
   profileModalEl.setAttribute('aria-hidden', 'true');
   hideProfileTooltip();
@@ -1038,14 +1744,20 @@ function renderOpponents() {
     profileButton.className = 'profile-btn';
     profileButton.textContent = 'профиль';
 
+    const profileDbButton = document.createElement('button');
+    profileDbButton.className = 'profile-db-btn';
+    profileDbButton.textContent = 'профиль DB';
+
     recordButton.addEventListener('click', () => handleOpponentClick(name));
     openButton.addEventListener('click', () => openOpponentInSheet(name));
-    profileButton.addEventListener('click', () => openProfileModal(name));
+    profileButton.addEventListener('click', () => openProfileModal(name, { source: 'voice' }));
+    profileDbButton.addEventListener('click', () => openProfileModal(name, { source: 'hh' }));
 
     card.appendChild(removeButton);
     card.appendChild(recordButton);
     card.appendChild(openButton);
     card.appendChild(profileButton);
+    card.appendChild(profileDbButton);
     opponentList.appendChild(card);
 
     // Build profile in background for active opponents to make popup instant.
@@ -1160,6 +1872,19 @@ function addOpponent() {
   updateRecordUI();
 }
 
+function clearProfileCacheByOpponent(name) {
+  const suffix = `::${String(name || '').trim()}`;
+  const clearBySuffix = (cache) => {
+    for (const key of cache.keys()) {
+      if (String(key).endsWith(suffix)) {
+        cache.delete(key);
+      }
+    }
+  };
+  clearBySuffix(profileCache);
+  clearBySuffix(profileListCache);
+}
+
 function removeOpponent(name) {
   const next = opponents.filter((item) => item !== name);
   if (next.length === opponents.length) {
@@ -1167,7 +1892,7 @@ function removeOpponent(name) {
   }
   opponents = next;
   saveOpponents();
-  profileCache.delete(name);
+  clearProfileCacheByOpponent(name);
 
   if (activeOpponent === name) {
     resetCurrentSelection();
@@ -1189,6 +1914,7 @@ function clearActiveOpponents() {
   opponents = [];
   saveOpponents();
   profileCache.clear();
+  profileListCache.clear();
   resetCurrentSelection();
   closeProfileModal();
   setStatus('Активный список оппонентов очищен.', 'ok');

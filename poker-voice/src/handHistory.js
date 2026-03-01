@@ -173,7 +173,7 @@ function parseActionLine(line) {
   if (!m) return null;
   const player = m[1].trim();
   const action = m[2].trim();
-  const allIn = /\ball-?in\b/i.test(action);
+  const allIn = /\ball(?:[\s-]+)?in\b/i.test(action);
 
   if (/^checks\b/i.test(action)) return { player, type: 'check', raw: action };
   if (/^folds\b/i.test(action)) return { player, type: 'fold', raw: action };
@@ -254,6 +254,21 @@ function parseCardToken(token) {
   const value = RANK_VALUE[rank];
   if (!Number.isFinite(value)) return null;
   return { rank, suit, value, raw: `${rank}${suit}` };
+}
+
+function toParsedCard(cardRaw) {
+  if (cardRaw && typeof cardRaw === 'object') {
+    const raw = String(cardRaw.raw || '').trim();
+    if (raw) return parseCardToken(raw);
+    const rank = String(cardRaw.rank || '').toUpperCase();
+    const suit = String(cardRaw.suit || '').toLowerCase();
+    if (rank && suit) return parseCardToken(`${rank}${suit}`);
+  }
+  return parseCardToken(cardRaw);
+}
+
+function toParsedCards(cardsRaw) {
+  return (cardsRaw || []).map(toParsedCard).filter(Boolean);
 }
 
 function combinations(items, size) {
@@ -369,6 +384,199 @@ function evaluateOmahaStreetClass(holeCardsRaw, boardCardsRaw) {
   };
 }
 
+function makeFlushDescriptor(category, straightHigh, values = [], extra = {}) {
+  return {
+    category: Number(category),
+    straightHigh: Number(straightHigh || 0),
+    values: Array.isArray(values) ? values.map((value) => Number(value)).filter(Number.isFinite).sort((a, b) => b - a) : [],
+    suit: String(extra?.suit || '').toLowerCase(),
+    holeTop: Number(extra?.holeTop || 0)
+  };
+}
+
+function flushDescriptorKey(descriptor) {
+  if (!descriptor || !Number.isFinite(descriptor.category)) return '';
+  const category = Number(descriptor.category);
+  if (category === 8) {
+    return `8:${Number(descriptor.straightHigh || 0)}`;
+  }
+  return `5:${(descriptor.values || []).join('-')}`;
+}
+
+function compareFlushDescriptors(a, b) {
+  const left = a || {};
+  const right = b || {};
+  const leftCategory = Number(left.category || 0);
+  const rightCategory = Number(right.category || 0);
+  if (leftCategory !== rightCategory) return leftCategory - rightCategory;
+  if (leftCategory === 8) {
+    return Number(left.straightHigh || 0) - Number(right.straightHigh || 0);
+  }
+  const leftValues = Array.isArray(left.values) ? left.values : [];
+  const rightValues = Array.isArray(right.values) ? right.values : [];
+  const size = Math.max(leftValues.length, rightValues.length);
+  for (let i = 0; i < size; i += 1) {
+    const lv = Number(leftValues[i] || 0);
+    const rv = Number(rightValues[i] || 0);
+    if (lv !== rv) return lv - rv;
+  }
+  return 0;
+}
+
+function boardSuitCardsMap(boardCardsRaw) {
+  const map = new Map();
+  const cards = toParsedCards(boardCardsRaw);
+  cards.forEach((card) => {
+    const list = map.get(card.suit) || [];
+    list.push(card);
+    map.set(card.suit, list);
+  });
+  return map;
+}
+
+function holeSuitCardsMap(holeCardsRaw) {
+  const map = new Map();
+  const cards = toParsedCards(holeCardsRaw);
+  cards.forEach((card) => {
+    const list = map.get(card.suit) || [];
+    list.push(card);
+    map.set(card.suit, list);
+  });
+  return map;
+}
+
+function buildFlushDescriptorFromSuit(holeSuitCards, boardSuitCards, suit = '') {
+  const holeCombos = combinations(holeSuitCards || [], 2);
+  const boardCombos = combinations(boardSuitCards || [], 3);
+  if (!holeCombos.length || !boardCombos.length) return null;
+  let best = null;
+  for (const holeCombo of holeCombos) {
+    const holeTop = holeCombo
+      .map((card) => Number(card?.value || 0))
+      .filter(Number.isFinite)
+      .sort((a, b) => b - a)[0] || 0;
+    for (const boardCombo of boardCombos) {
+      const cards = [...holeCombo, ...boardCombo];
+      const values = cards.map((card) => Number(card.value || 0)).filter(Number.isFinite).sort((a, b) => b - a);
+      if (values.length !== 5) continue;
+      const straightHigh = evaluateStraightHigh(values);
+      const descriptor = straightHigh > 0
+        ? makeFlushDescriptor(8, straightHigh, values, { suit, holeTop })
+        : makeFlushDescriptor(5, 0, values, { suit, holeTop });
+      if (!best || compareFlushDescriptors(descriptor, best) > 0) {
+        best = descriptor;
+      }
+    }
+  }
+  return best;
+}
+
+function allPossibleFlushDescriptors(boardCardsRaw) {
+  const boardCards = toParsedCards(boardCardsRaw);
+  if (boardCards.length < 3) return [];
+
+  const boardBySuit = boardSuitCardsMap(boardCards);
+  const descriptorsByKey = new Map();
+
+  for (const suit of CARD_SUITS) {
+    const suitedBoard = boardBySuit.get(suit) || [];
+    if (suitedBoard.length < 3) continue;
+
+    const deckSuitCards = CARD_RANKS
+      .map((rank) => parseCardToken(`${rank}${suit}`))
+      .filter(Boolean)
+      .filter((card) => !suitedBoard.some((boardCard) => boardCard.raw === card.raw));
+
+    for (const holeCombo of combinations(deckSuitCards, 2)) {
+      const descriptor = buildFlushDescriptorFromSuit(holeCombo, suitedBoard, suit);
+      if (!descriptor) continue;
+      const key = flushDescriptorKey(descriptor);
+      if (!key || descriptorsByKey.has(key)) continue;
+      descriptorsByKey.set(key, descriptor);
+    }
+  }
+
+  return Array.from(descriptorsByKey.values()).sort((a, b) => compareFlushDescriptors(b, a));
+}
+
+function classifyFlushStrengthToken(holeCardsRaw, boardCardsRaw) {
+  const boardCards = toParsedCards(boardCardsRaw);
+  const holeCards = toParsedCards(holeCardsRaw);
+  if (boardCards.length < 3 || holeCards.length < 2) return '';
+
+  const boardBySuit = boardSuitCardsMap(boardCards);
+  const holeBySuit = holeSuitCardsMap(holeCards);
+  let playerBest = null;
+
+  for (const suit of CARD_SUITS) {
+    const suitedBoard = boardBySuit.get(suit) || [];
+    const suitedHole = holeBySuit.get(suit) || [];
+    if (suitedBoard.length < 3 || suitedHole.length < 2) continue;
+    const descriptor = buildFlushDescriptorFromSuit(suitedHole, suitedBoard, suit);
+    if (!descriptor) continue;
+    if (!playerBest || compareFlushDescriptors(descriptor, playerBest) > 0) {
+      playerBest = descriptor;
+    }
+  }
+
+  if (!playerBest) return '';
+  if (playerBest.category === 8) return 'strflush';
+
+  const allDescriptors = allPossibleFlushDescriptors(boardCardsRaw);
+  const relevantDescriptors = playerBest?.suit
+    ? allDescriptors.filter((item) => String(item?.suit || '') === playerBest.suit)
+    : allDescriptors;
+  const hasStraightFlushOnBoard = relevantDescriptors.some((item) => Number(item?.category || 0) === 8);
+  const regularTopRanks = Array.from(new Set(
+    relevantDescriptors
+      .filter((item) => Number(item?.category || 0) === 5)
+      .map((item) => Number(item?.holeTop || 0))
+      .filter((item) => Number.isFinite(item) && item > 0)
+  )).sort((a, b) => b - a);
+  const playerTopRank = Number(playerBest?.holeTop || 0);
+  const regularRankIndex = regularTopRanks.findIndex((item) => item === playerTopRank);
+  if (regularRankIndex < 0) return hasStraightFlushOnBoard ? '2ndflush' : 'flush';
+
+  const rankIndex = regularRankIndex + (hasStraightFlushOnBoard ? 1 : 0);
+  if (rankIndex === 0) return 'nutflush';
+  if (rankIndex === 1) return '2ndflush';
+  if (rankIndex === 2 || rankIndex === 3) return 'midflush';
+  return 'lowflush';
+}
+
+function hasPocketOverpair(holeCardsRaw, boardCardsRaw) {
+  const holeCards = (holeCardsRaw || []).map(parseCardToken).filter(Boolean);
+  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  if (holeCards.length < 2 || boardCards.length < 3) return false;
+
+  const boardRanks = new Set(boardCards.map((card) => card.rank));
+  const boardTop = Math.max(...boardCards.map((card) => card.value));
+  if (!Number.isFinite(boardTop)) return false;
+
+  const holeCounts = new Map();
+  for (const card of holeCards) {
+    holeCounts.set(card.rank, (holeCounts.get(card.rank) || 0) + 1);
+  }
+
+  for (const [rank, count] of holeCounts.entries()) {
+    if (count < 2) continue;
+    if (boardRanks.has(rank)) continue;
+    const rankValue = RANK_VALUE[rank];
+    if (Number.isFinite(rankValue) && rankValue > boardTop) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasPairToBoard(holeCardsRaw, boardCardsRaw) {
+  const holeCards = (holeCardsRaw || []).map(parseCardToken).filter(Boolean);
+  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  if (!holeCards.length || !boardCards.length) return false;
+  const boardRanks = new Set(boardCards.map((card) => card.rank));
+  return holeCards.some((card) => boardRanks.has(card.rank));
+}
+
 function buildStreetBoards(board) {
   const flop = Array.isArray(board?.flop) ? board.flop.filter(Boolean) : [];
   const turn = board?.turn ? [...flop, board.turn] : [...flop];
@@ -392,6 +600,17 @@ function computeStreetClasses(cards, board) {
   for (const street of ['flop', 'turn', 'river']) {
     const boardCards = boards[street] || [];
     const detail = out._details[street];
+    if (!detail || !detail.classToken) continue;
+    if (!['flush', 'strflush'].includes(detail.classToken)) continue;
+    const flushToken = classifyFlushStrengthToken(cards, boardCards);
+    if (!flushToken) continue;
+    out[street] = flushToken;
+    out._details[street] = { ...detail, classToken: flushToken, upgradedFrom: detail.classToken };
+  }
+
+  for (const street of ['flop', 'turn', 'river']) {
+    const boardCards = boards[street] || [];
+    const detail = out._details[street];
     if (!detail || detail.classToken !== 'str' || !detail.straightHigh) continue;
     if (boardIsPaired(boardCards)) continue;
     if (boardMaxSuitCount(boardCards) >= 3) continue;
@@ -406,9 +625,23 @@ function computeStreetClasses(cards, board) {
     const boardCards = boards[street] || [];
     if (!boardIsPaired(boardCards)) continue;
     const detail = out._details[street];
+    if (detail?.classToken === 'set') {
+      out[street] = 'tri';
+      out._details[street] = { ...detail, classToken: 'tri', upgradedFrom: 'set_on_paired_board' };
+      continue;
+    }
     if (!detail || detail.classToken !== '2p') continue;
     out[street] = 'p';
     out._details[street] = { ...detail, classToken: 'p', downgradedFrom: '2p_on_paired_board' };
+  }
+
+  for (const street of ['flop', 'turn', 'river']) {
+    const boardCards = boards[street] || [];
+    const detail = out._details[street];
+    if (!detail || detail.classToken !== 'p') continue;
+    if (!hasPocketOverpair(cards, boardCards)) continue;
+    out[street] = 'ov';
+    out._details[street] = { ...detail, classToken: 'ov', upgradedFrom: 'p_overpair' };
   }
 
   return out;
@@ -447,7 +680,7 @@ function deriveStreetDrawTokens(holeCards, boardCards, madeClass) {
 }
 
 function detectFlushDrawToken(holeCards, boardCardsRaw, cardsToCome, madeClass) {
-  if (['flush', 'strflush', 'full', 'quads'].includes(madeClass)) {
+  if (['flush', 'nutflush', '2ndflush', 'midflush', 'lowflush', 'strflush', 'full', 'quads'].includes(madeClass)) {
     return '';
   }
 
@@ -668,7 +901,7 @@ function deriveFragileStrongTokens(streetClassToken, boardCardsRaw, detail = nul
 
   const isSetLike = classToken === 'set' || classToken === 'topset' || classToken === 'tri';
   const isStraightLike = classToken === 'str';
-  const isFlushLike = classToken === 'flush';
+  const isFlushLike = ['flush', 'nutflush', '2ndflush', 'midflush', 'lowflush'].includes(classToken);
 
   const tags = [];
 
@@ -1346,8 +1579,14 @@ function playerStreetHandToken(parsedHistory, player, street) {
   const drawTokens = parsedHistory?.showdown?.streetDrawByPlayer?.[player]?.[street] || [];
   const classDetails = parsedHistory?.showdown?.streetClassByPlayer?.[player]?._details?.[street] || null;
   const boardCards = streetBoardCards(parsedHistory, street);
+  const pairedBoardModifier = (
+    cls === 'ov'
+    && hasPairToBoard(parsedHistory?.showdown?.showCardsByPlayer?.[player] || [], boardCards)
+  )
+    ? ['p']
+    : [];
   const fragileTokens = deriveFragileStrongTokens(cls, boardCards, classDetails);
-  const suffix = [cls, ...drawTokens, ...fragileTokens].filter(Boolean).join('_');
+  const suffix = [cls, ...pairedBoardModifier, ...drawTokens, ...fragileTokens].filter(Boolean).join('_');
   return suffix ? `${cards}_${suffix}` : cards;
 }
 

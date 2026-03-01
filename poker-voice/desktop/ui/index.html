@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Poker Voice Launcher</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>Poker Voice Launcher</h1>
+        <p class="subtitle">Windows-оболочка для HH-автоимпорта, локальной БД и web UI.</p>
+      </header>
+
+      <section class="card">
+        <h2>Сервер</h2>
+        <div class="grid">
+          <label>
+            Host
+            <input id="hostInput" type="text" placeholder="127.0.0.1" />
+          </label>
+          <label>
+            Port
+            <input id="portInput" type="number" min="1" step="1" placeholder="8787" />
+          </label>
+        </div>
+        <div class="status-row">
+          <div id="statusBadge" class="badge">инициализация</div>
+          <div id="urlText" class="muted">—</div>
+        </div>
+        <div class="actions">
+          <button id="openWebBtn" class="primary">Открыть web-приложение</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Автоимпорт Hand History</h2>
+        <label class="checkbox-row">
+          <input id="autoImportEnabledInput" type="checkbox" />
+          Включить автоимпорт
+        </label>
+
+        <div class="folder-row">
+          <label>
+            Inbox (куда кладешь новые HH)
+            <div class="inline">
+              <input id="inboxInput" type="text" placeholder="C:\\Poker\\HH\\inbox" />
+              <button id="chooseInboxBtn" type="button">Выбрать…</button>
+            </div>
+          </label>
+        </div>
+
+        <div class="folder-row">
+          <label>
+            Imported (куда переносить обработанные)
+            <div class="inline">
+              <input id="importedInput" type="text" placeholder="C:\\Poker\\HH\\imported" />
+              <button id="chooseImportedBtn" type="button">Выбрать…</button>
+            </div>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="saveBtn" class="primary">Сохранить и перезапустить сервер</button>
+          <button id="openRuntimeBtn" type="button">Открыть runtime-папку</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Логи</h2>
+        <pre id="logs"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="./renderer.js"></script>
+  </body>
+</html>

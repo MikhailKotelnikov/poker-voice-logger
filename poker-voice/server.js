@@ -41,6 +41,19 @@ import {
   extractTargetIdentity,
   rowMatchesTargetProfile
 } from './src/profileTarget.js';
+import {
+  beginHhImportRun,
+  clearAllHhHands,
+  clearHhHandsByOpponent,
+  finishHhImportRun,
+  getHhNoteMetaById,
+  getHhOpponentSuggestions,
+  getHhProfileRows,
+  hhStorageUsesDb,
+  initHhDb,
+  saveHhParsedRecord,
+  upsertHhManualPresupposition
+} from './src/hhDb.js';
 
 dotenv.config();
 
@@ -78,13 +91,35 @@ const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || '';
 const SHEET_URL = process.env.SHEET_URL || '';
 const SHEET_NAME = process.env.SHEET_NAME || '';
 const SHEET_NAME_VOICE = process.env.SHEET_NAME_VOICE || SHEET_NAME || '';
-const SHEET_NAME_HAND_HISTORY = process.env.SHEET_NAME_HAND_HISTORY || 'Sheet2';
+const HH_STORAGE = 'db';
+const HH_DB_PATH = process.env.HH_DB_PATH || path.resolve(process.cwd(), 'data', 'hh.db');
+const HH_PARSER_MODE = String(process.env.HH_PARSER_MODE || 'deterministic').trim().toLowerCase() === 'semantic'
+  ? 'semantic'
+  : 'deterministic';
+const HH_PARSER_VERSION = process.env.HH_PARSER_VERSION || 'hh_v2';
+const HH_IMPORT_INBOX_DIR = String(process.env.HH_IMPORT_INBOX_DIR || '').trim();
+const HH_IMPORT_IMPORTED_DIR = String(process.env.HH_IMPORT_IMPORTED_DIR || '').trim();
+const HH_IMPORT_ENABLED = String(process.env.HH_IMPORT_ENABLED || '0').trim() === '1';
+const HH_IMPORT_INTERVAL_SEC = Math.max(15, Number(process.env.HH_IMPORT_INTERVAL_SEC || '60') || 60);
+const HH_RUNTIME_LOG_ENABLED = String(process.env.HH_RUNTIME_LOG_ENABLED || '1').trim() !== '0';
+const HH_IMPORT_LOG_PATH = process.env.HH_IMPORT_LOG_PATH || path.resolve(process.cwd(), 'logs', 'hh-import.log');
+const VISUAL_PROFILE_LOG_PATH = process.env.VISUAL_PROFILE_LOG_PATH || path.resolve(process.cwd(), 'logs', 'visual-profile.log');
+const HH_PROFILE_ROWS_DEFAULT = Math.max(1000, Number(process.env.HH_PROFILE_ROWS_DEFAULT || '50000') || 50000);
+const HH_PROFILE_ROWS_MAX = Math.max(HH_PROFILE_ROWS_DEFAULT, Number(process.env.HH_PROFILE_ROWS_MAX || '500000') || 500000);
 const VOCAB_PATH = process.env.VOCAB_PATH || path.resolve(process.cwd(), 'vocab.json');
 const REPORTS_PATH = process.env.REPORTS_PATH || path.resolve(process.cwd(), 'reports', 'nots_reports.jsonl');
 const FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
+const HH_PRESUPP_FIELDS = new Set(['preflop', 'flop', 'turn', 'river', 'hand_presupposition']);
 const VISUAL_PROFILE_CACHE_TTL_MS = Number(process.env.VISUAL_PROFILE_CACHE_TTL_MS || '180000');
 
 const visualProfileCache = new Map();
+
+try {
+  initHhDb(HH_DB_PATH);
+} catch (error) {
+  console.error(`HH DB init error (${HH_DB_PATH}):`, error.message);
+  throw error;
+}
 
 function loadVocabulary() {
   try {
@@ -117,12 +152,21 @@ function normalizeSheetName(value, fallback = '') {
   return String(fallback || '').trim();
 }
 
-function voiceSheetName() {
-  return normalizeSheetName('', SHEET_NAME_VOICE);
+function appendRuntimeLog(logPath, event, payload = {}) {
+  if (!HH_RUNTIME_LOG_ENABLED) return;
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const entry = {
+      ts: new Date().toISOString(),
+      event: String(event || 'event'),
+      ...payload
+    };
+    fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, 'utf8');
+  } catch {}
 }
 
-function handHistorySheetName() {
-  return normalizeSheetName('', SHEET_NAME_HAND_HISTORY || SHEET_NAME_VOICE);
+function voiceSheetName() {
+  return normalizeSheetName('', SHEET_NAME_VOICE);
 }
 
 function uniqueSheetNames(names = []) {
@@ -143,14 +187,152 @@ function resolveSheetNamesBySource(source = 'all') {
   if (mode === 'voice') {
     return uniqueSheetNames([voiceSheetName()]);
   }
-  if (mode === 'hh' || mode === 'handhistory' || mode === 'hand_history') {
-    return uniqueSheetNames([handHistorySheetName()]);
-  }
-  return uniqueSheetNames([voiceSheetName(), handHistorySheetName()]);
+  return uniqueSheetNames([voiceSheetName()]);
 }
 
 function makeVisualProfileCacheKey(opponent, scope = 'all') {
   return `${String(scope || 'all').toLowerCase()}::${String(opponent || '').trim().toLowerCase()}`;
+}
+
+function parseFilterCsv(value) {
+  if (!value) return [];
+  return String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeProfileFiltersFromQuery(query = {}) {
+  const allowedPlayers = new Set(['2', '3-4', '5-6', '7-9']);
+  const playerGroups = parseFilterCsv(query.players)
+    .map((item) => item.toLowerCase())
+    .filter((item) => allowedPlayers.has(item));
+
+  const allowedDates = new Set(['all', '6m', '3m', '1m', '1w', '3d', 'today']);
+  const datePresetRaw = String(query.date || 'all').trim().toLowerCase();
+  const datePreset = allowedDates.has(datePresetRaw) ? datePresetRaw : 'all';
+
+  const gameCards = parseFilterCsv(query.games)
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && [4, 5, 6].includes(item));
+
+  const rooms = parseFilterCsv(query.rooms)
+    .map((item) => item.toLowerCase())
+    .filter(Boolean);
+
+  const allowedPots = new Set(['small', 'medium', 'large', 'huge']);
+  const potBuckets = parseFilterCsv(query.pots)
+    .map((item) => item.toLowerCase())
+    .filter((item) => allowedPots.has(item));
+
+  const allowedLimits = new Set(['2-4', '2.5-5', '3-6', '5-10', '10-20', '25-50', '50-100', '100-200']);
+  const limits = parseFilterCsv(query.limits)
+    .map((item) => item.replace(/\s+/g, ''))
+    .filter((item) => allowedLimits.has(item));
+
+  const vsOpponent = String(query.vs || '').trim();
+  const allowedRecent = new Set(['all', '50', '20']);
+  const recentRaw = String(query.recent || 'all').trim().toLowerCase();
+  const recentLimit = allowedRecent.has(recentRaw) ? recentRaw : 'all';
+
+  return {
+    playerGroups,
+    datePreset,
+    gameCards,
+    rooms,
+    potBuckets,
+    limits,
+    vsOpponent,
+    recentLimit
+  };
+}
+
+function serializeProfileFilters(filters = {}) {
+  const pack = (list) => {
+    const normalized = Array.isArray(list) ? list.map((item) => String(item)).filter(Boolean) : [];
+    normalized.sort();
+    return normalized.join(',');
+  };
+  return [
+    `players=${pack(filters.playerGroups)}`,
+    `date=${String(filters.datePreset || 'all')}`,
+    `games=${pack(filters.gameCards)}`,
+    `rooms=${pack(filters.rooms)}`,
+    `pots=${pack(filters.potBuckets)}`,
+    `limits=${pack(filters.limits)}`,
+    `vs=${String(filters.vsOpponent || '').trim().toLowerCase()}`,
+    `recent=${String(filters.recentLimit || 'all')}`
+  ].join('|');
+}
+
+async function collectOpponentRowsForProfile({
+  opponent,
+  targetIdentity,
+  targetId,
+  source,
+  includeVoice,
+  includeHh,
+  limit,
+  filters
+} = {}) {
+  const allRows = [];
+  const bySheet = [];
+  let hhFilterOptions = { rooms: [] };
+
+  if (includeVoice) {
+    const voiceSheet = voiceSheetName();
+    const action = Boolean(targetIdentity) && Boolean(targetId) ? 'get_all_rows' : 'get_opponent_rows';
+    const rowsResult = await postToSheets({
+      action,
+      opponent,
+      limit,
+      sheetName: voiceSheet || undefined
+    });
+
+    if (rowsResult?.ok === false) {
+      throw new Error(rowsResult.error || `Ошибка чтения строк оппонента из листа ${voiceSheet || 'active'}.`);
+    }
+
+    const rowsRaw = Array.isArray(rowsResult?.rows) ? rowsResult.rows : [];
+    const rows = action === 'get_all_rows'
+      ? rowsRaw.filter((row) => rowMatchesTargetProfile(row, opponent, targetIdentity))
+      : rowsRaw;
+    const resolvedSheetName = String(rowsResult?.sheetName || voiceSheet || '').trim();
+
+    rows.forEach((row) => {
+      allRows.push({
+        ...row,
+        rowLabel: `#${resolvedSheetName || 'Sheet'}:${row?.row ?? '?'}`
+      });
+    });
+
+    bySheet.push({
+      sheetName: resolvedSheetName || null,
+      rows: rows.length
+    });
+  }
+
+  if (includeHh) {
+    const hhResult = getHhProfileRows(HH_DB_PATH, { opponent, limit, filters });
+    const hhRows = Array.isArray(hhResult?.rows) ? hhResult.rows : [];
+    hhRows.forEach((row) => {
+      allRows.push({
+        ...row,
+        rowLabel: `#DB:${row?.row ?? '?'}`
+      });
+    });
+    hhFilterOptions = hhResult?.filterOptions || { rooms: [] };
+    bySheet.push({
+      sheetName: 'HH_DB',
+      rows: hhRows.length
+    });
+  }
+
+  if (includeHh && !includeVoice) {
+    allRows.sort((a, b) => Number(b.row || 0) - Number(a.row || 0));
+  }
+
+  return { allRows, bySheet, hhFilterOptions };
 }
 
 function clearProfileCacheForOpponent(opponent) {
@@ -161,6 +343,29 @@ function clearProfileCacheForOpponent(opponent) {
       visualProfileCache.delete(key);
     }
   }
+}
+
+function resolveHhManualKey({ opponent = '', row = 0, handNumber = '', room = '' } = {}) {
+  const normalizedOpponent = String(opponent || '').trim();
+  const normalizedHandNumber = String(handNumber || '').trim();
+  const normalizedRoom = String(room || '').trim().toLowerCase();
+  const numericRow = Number(row);
+
+  if (normalizedHandNumber) {
+    return {
+      targetIdentity: extractTargetIdentity(normalizedOpponent),
+      handNumber: normalizedHandNumber,
+      room: normalizedRoom
+    };
+  }
+
+  if (!Number.isFinite(numericRow) || numericRow <= 0) {
+    throw new Error('Нужен handNumber или корректный row (#DB).');
+  }
+  return getHhNoteMetaById(HH_DB_PATH, {
+    noteId: numericRow,
+    opponent: normalizedOpponent
+  });
 }
 
 function buildSemanticPromptPayload(transcript, vocabulary, semanticDictionaryText) {
@@ -573,46 +778,371 @@ function decodeTextBuffer(buffer) {
   return Buffer.from(buffer).toString('utf8');
 }
 
-async function processHandHistoryToSheets(handHistory, opponent, vocabulary, targetSheetName) {
+function isHandHistoryFile(filePath) {
+  return /\.(txt|log|hh)$/i.test(String(filePath || ''));
+}
+
+function listHandHistoryFilesRecursive(rootDir) {
+  const root = path.resolve(String(rootDir || '').trim());
+  if (!root || !fs.existsSync(root)) return [];
+
+  const out = [];
+  const stack = [root];
+  while (stack.length) {
+    const current = stack.pop();
+    const entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(absolute);
+        continue;
+      }
+      if (entry.isFile() && isHandHistoryFile(absolute)) {
+        out.push(absolute);
+      }
+    }
+  }
+  return out.sort((a, b) => a.localeCompare(b, 'en'));
+}
+
+function ensureDirectory(dirPath) {
+  if (!dirPath) return;
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function buildImportedFilePath(sourceFile, inputRoot, importedRoot) {
+  const inputResolved = path.resolve(inputRoot);
+  const importedResolved = path.resolve(importedRoot);
+  const relative = path.relative(inputResolved, sourceFile);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    return '';
+  }
+
+  const parsed = path.parse(relative);
+  const targetDir = path.join(importedResolved, parsed.dir);
+  ensureDirectory(targetDir);
+  let target = path.join(targetDir, parsed.base);
+  let suffix = 1;
+  while (fs.existsSync(target)) {
+    target = path.join(targetDir, `${parsed.name}__dup${suffix}${parsed.ext}`);
+    suffix += 1;
+  }
+  return target;
+}
+
+function moveFileSafe(sourceFile, targetFile) {
+  try {
+    fs.renameSync(sourceFile, targetFile);
+    return;
+  } catch (error) {
+    if (error?.code !== 'EXDEV') throw error;
+  }
+  fs.copyFileSync(sourceFile, targetFile);
+  fs.unlinkSync(sourceFile);
+}
+
+function pruneEmptyImportTree(rootDir, { preserveRoot = true } = {}) {
+  const root = path.resolve(String(rootDir || '').trim());
+  if (!root || !fs.existsSync(root)) return;
+
+  const sweep = (current) => {
+    let entries = fs.readdirSync(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        sweep(absolute);
+        continue;
+      }
+      // Finder artefacts keep directories non-empty; remove them during cleanup.
+      if (entry.isFile() && entry.name === '.DS_Store') {
+        try {
+          fs.unlinkSync(absolute);
+        } catch {}
+      }
+    }
+
+    entries = fs.readdirSync(current, { withFileTypes: true });
+    if (!entries.length && (!preserveRoot || current !== root)) {
+      fs.rmdirSync(current);
+    }
+  };
+
+  sweep(root);
+}
+
+let hhFolderImportLock = false;
+
+async function importHandHistoryFoldersOnce({
+  inputDir,
+  importedDir,
+  opponent = '',
+  maxHands = 0
+} = {}) {
+  const inbox = path.resolve(String(inputDir || '').trim());
+  const done = path.resolve(String(importedDir || '').trim());
+  if (!inbox) throw new Error('HH_IMPORT_INBOX_DIR не задан.');
+  if (!done) throw new Error('HH_IMPORT_IMPORTED_DIR не задан.');
+  if (!fs.existsSync(inbox) || !fs.statSync(inbox).isDirectory()) {
+    throw new Error(`Папка импорта не найдена: ${inbox}`);
+  }
+  ensureDirectory(done);
+
+  if (hhFolderImportLock) {
+    appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.skip.already_running', {
+      inputDir: inbox,
+      importedDir: done
+    });
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'already_running'
+    };
+  }
+
+  hhFolderImportLock = true;
+  const files = listHandHistoryFilesRecursive(inbox);
+  const vocabulary = loadVocabulary();
+  const errors = [];
+  const moved = [];
+  let totalHands = 0;
+  let savedHands = 0;
+  let duplicateHands = 0;
+  let failedHands = 0;
+  let skippedEmptyHands = 0;
+  let parsedFiles = 0;
+  let runId = 0;
+
+  try {
+    appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.start', {
+      inputDir: inbox,
+      importedDir: done,
+      filesFound: files.length,
+      maxHands
+    });
+    runId = beginHhImportRun(HH_DB_PATH, { sourceType: 'batch', fileCount: files.length });
+    let nextProgressAt = 250;
+    outer:
+    for (const filePath of files) {
+      const rawText = fs.readFileSync(filePath, 'utf8');
+      const hands = splitHandHistoryText(rawText);
+      appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.file.start', {
+        runId,
+        file: filePath,
+        handsFound: hands.length
+      });
+      for (let i = 0; i < hands.length; i += 1) {
+        if (maxHands > 0 && totalHands >= maxHands) break outer;
+        const handText = String(hands[i] || '').trim();
+        if (!handText) continue;
+        totalHands += 1;
+        try {
+          const result = await processHandHistoryRecord(handText, opponent, vocabulary, {
+            dbRunId: runId,
+            allowEmpty: true
+          });
+          if (result.skippedEmpty) {
+            skippedEmptyHands += 1;
+            continue;
+          }
+          if (result.dbInsertedHand) {
+            savedHands += 1;
+          } else {
+            duplicateHands += 1;
+          }
+        } catch (error) {
+          failedHands += 1;
+          appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.hand.error', {
+            runId,
+            file: filePath,
+            handIndex: i + 1,
+            error: error.message || 'Ошибка разбора HH'
+          });
+          if (errors.length < 120) {
+            errors.push({
+              file: filePath,
+              handIndex: i + 1,
+              error: error.message || 'Ошибка разбора HH'
+            });
+          }
+        }
+        if (totalHands >= nextProgressAt) {
+          appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.progress', {
+            runId,
+            filesParsed: parsedFiles,
+            totalHands,
+            savedHands,
+            duplicateHands,
+            skippedEmptyHands,
+            failedHands
+          });
+          nextProgressAt += 250;
+        }
+      }
+
+      const targetFile = buildImportedFilePath(filePath, inbox, done);
+      if (!targetFile) {
+        if (errors.length < 120) {
+          errors.push({
+            file: filePath,
+            handIndex: 0,
+            error: 'Не удалось построить путь перемещения импортированного файла.'
+          });
+        }
+      } else {
+        moveFileSafe(filePath, targetFile);
+        moved.push({
+          from: filePath,
+          to: targetFile
+        });
+      }
+      parsedFiles += 1;
+      appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.file.done', {
+        runId,
+        file: filePath,
+        parsedFiles,
+        movedTo: targetFile || null
+      });
+    }
+
+    pruneEmptyImportTree(inbox, { preserveRoot: true });
+
+    finishHhImportRun(HH_DB_PATH, runId, {
+      handCount: totalHands,
+      savedCount: savedHands,
+      failedCount: failedHands,
+      errors
+    });
+
+    if (savedHands > 0 || duplicateHands > 0) {
+      visualProfileCache.clear();
+    }
+
+    appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.done', {
+      runId,
+      filesFound: files.length,
+      filesMoved: moved.length,
+      parsedFiles,
+      totalHands,
+      savedHands,
+      duplicateHands,
+      skippedEmptyHands,
+      failedHands,
+      errorCount: errors.length
+    });
+
+    return {
+      ok: true,
+      runId,
+      filesFound: files.length,
+      filesMoved: moved.length,
+      parsedFiles,
+      totalHands,
+      savedHands,
+      duplicateHands,
+      skippedEmptyHands,
+      failedHands,
+      errors,
+      moved
+    };
+  } catch (error) {
+    appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.fatal', {
+      runId,
+      totalHands,
+      savedHands,
+      duplicateHands,
+      skippedEmptyHands,
+      failedHands,
+      error: error.message || 'Ошибка batch-импорта HH.'
+    });
+    if (runId) {
+      try {
+        finishHhImportRun(HH_DB_PATH, runId, {
+          handCount: totalHands,
+          savedCount: savedHands,
+          failedCount: failedHands + 1,
+          errors: [
+            ...errors,
+            { file: '', handIndex: 0, error: error.message || 'Ошибка batch-импорта HH.' }
+          ].slice(0, 120)
+        });
+      } catch {}
+    }
+    throw error;
+  } finally {
+    hhFolderImportLock = false;
+  }
+}
+
+async function processHandHistoryRecord(handHistory, opponent, vocabulary, options = {}) {
+  const dbRunId = Number(options?.dbRunId || 0);
+  const allowEmpty = Boolean(options?.allowEmpty);
   const parsedHH = parseHandHistory(handHistory, opponent);
-  const parsedContext = buildHandHistoryContext(parsedHH);
+  let parserMeta = {
+    source: 'deterministic',
+    model: null,
+    confidence: null,
+    unresolved: [`target_player=${parsedHH.targetPlayer || 'none'}`],
+    semanticError: null
+  };
+  let parsed = emptyParsedFields();
 
-  const semanticResult = await parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary);
-
-  let parsed = normalizeHandHistoryParsed(semanticResult.parsed, vocabulary);
-  parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
-  parsed = enrichHandHistoryParsed(parsed, parsedHH);
-
-  if (!hasAnyParsedField(parsed)) {
-    throw new Error('Не удалось извлечь структуру раздачи из hand history.');
-  }
-
-  const sheetsResult = await postToSheets({
-    source: 'hh',
-    opponent: 'HH',
-    preflop: parsed.preflop,
-    flop: parsed.flop,
-    turn: parsed.turn,
-    river: parsed.river,
-    presupposition: parsed.presupposition,
-    sheetName: targetSheetName || undefined
-  });
-
-  if (sheetsResult?.ok === false) {
-    throw new Error(sheetsResult.error || 'Apps Script вернул ошибку.');
-  }
-
-  return {
-    parsed,
-    row: sheetsResult?.row || null,
-    sheetName: sheetsResult?.sheetName || targetSheetName || null,
-    parser: {
+  if (HH_PARSER_MODE === 'semantic') {
+    const parsedContext = buildHandHistoryContext(parsedHH);
+    const semanticResult = await parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary);
+    parsed = normalizeHandHistoryParsed(semanticResult.parsed, vocabulary);
+    parserMeta = {
       source: 'semantic_llm',
       model: semanticResult.modelUsed,
       confidence: semanticResult.confidence,
       unresolved: [...(semanticResult.unresolved || []), `target_player=${parsedHH.targetPlayer || 'none'}`],
       semanticError: null
-    },
+    };
+  }
+
+  parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
+  parsed = enrichHandHistoryParsed(parsed, parsedHH);
+
+  if (!hasAnyParsedField(parsed)) {
+    if (allowEmpty) {
+      return {
+        parsed,
+        row: null,
+        dbNoteId: null,
+        dbInsertedHand: false,
+        skippedEmpty: true,
+        sheetName: null,
+        storage: HH_STORAGE,
+        parser: parserMeta,
+        targetPlayer: parsedHH.targetPlayer
+      };
+    }
+    throw new Error('Не удалось извлечь структуру раздачи из hand history.');
+  }
+
+  if (!hhStorageUsesDb(HH_STORAGE)) {
+    throw new Error('HH storage должен быть DB.');
+  }
+  if (!dbRunId) {
+    throw new Error('В DB режиме обязателен dbRunId.');
+  }
+  const dbResult = saveHhParsedRecord(HH_DB_PATH, {
+    runId: dbRunId,
+    handHistory,
+    parsedHH,
+    parsed,
+    parserVersion: HH_PARSER_VERSION,
+    targetIdentity: extractTargetIdentity(parsedHH.targetPlayer || opponent || ''),
+    targetPlayer: parsedHH.targetPlayer || ''
+  });
+
+  return {
+    parsed,
+    row: null,
+    dbNoteId: dbResult?.noteId || null,
+    dbInsertedHand: Boolean(dbResult?.insertedHand),
+    sheetName: null,
+    storage: HH_STORAGE,
+    parser: parserMeta,
     targetPlayer: parsedHH.targetPlayer
   };
 }
@@ -705,7 +1235,7 @@ async function postToSheets(payload) {
 }
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, hhStorage: HH_STORAGE });
 });
 
 app.get('/api/opponent-suggestions', async (req, res) => {
@@ -716,30 +1246,12 @@ app.get('/api/opponent-suggestions', async (req, res) => {
       ? Math.max(1, Math.min(5000, Math.trunc(limitRaw)))
       : 50;
 
-    if (!SHEETS_WEBHOOK_URL) {
-      return res.json({ ok: true, opponents: [] });
-    }
-
-    const sheets = resolveSheetNamesBySource('all');
-    const lists = [];
-    for (const sheetName of sheets) {
-      const result = await postToSheets({
-        action: 'list_opponents',
-        query,
-        limit,
-        sheetName: sheetName || undefined
-      });
-
-      if (result?.ok === false) {
-        return res.status(500).json({ error: result.error || `Ошибка поиска оппонентов в листе ${sheetName || 'active'}.` });
-      }
-      lists.push(Array.isArray(result?.opponents) ? result.opponents : []);
-    }
-
     const merged = [];
     const seen = new Set();
-    for (const items of lists) {
-      for (const name of items) {
+
+    if (hhStorageUsesDb(HH_STORAGE)) {
+      const dbItems = getHhOpponentSuggestions(HH_DB_PATH, { query, limit });
+      for (const name of dbItems) {
         const value = String(name || '').trim();
         if (!value) continue;
         const key = value.toLowerCase();
@@ -748,7 +1260,34 @@ app.get('/api/opponent-suggestions', async (req, res) => {
         merged.push(value);
         if (merged.length >= limit) break;
       }
-      if (merged.length >= limit) break;
+    }
+
+    if (SHEETS_WEBHOOK_URL && merged.length < limit) {
+      const sheets = resolveSheetNamesBySource('all');
+      for (const sheetName of sheets) {
+        const result = await postToSheets({
+          action: 'list_opponents',
+          query,
+          limit,
+          sheetName: sheetName || undefined
+        });
+
+        if (result?.ok === false) {
+          return res.status(500).json({ error: result.error || `Ошибка поиска оппонентов в листе ${sheetName || 'active'}.` });
+        }
+
+        const items = Array.isArray(result?.opponents) ? result.opponents : [];
+        for (const name of items) {
+          const value = String(name || '').trim();
+          if (!value) continue;
+          const key = value.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(value);
+          if (merged.length >= limit) break;
+        }
+        if (merged.length >= limit) break;
+      }
     }
 
     const opponents = merged.slice(0, limit);
@@ -822,70 +1361,81 @@ app.get('/api/opponent-visual-profile', async (req, res) => {
     const targetIdentity = extractTargetIdentity(opponent);
     const source = String(req.query.source || 'all').trim().toLowerCase();
     const force = String(req.query.force || '').trim() === '1';
+    const filters = normalizeProfileFiltersFromQuery(req.query);
     const limitRaw = Number(req.query.limit);
     const limit = Number.isFinite(limitRaw)
-      ? Math.max(1, Math.min(5000, Math.trunc(limitRaw)))
-      : 2000;
+      ? Math.max(1, Math.min(HH_PROFILE_ROWS_MAX, Math.trunc(limitRaw)))
+      : HH_PROFILE_ROWS_DEFAULT;
+
+    const includeVoice = ['all', 'voice'].includes(source);
+    const includeHh = ['all', 'hh', 'handhistory', 'hand_history'].includes(source);
+    const needsSheets = includeVoice;
+
+    appendRuntimeLog(VISUAL_PROFILE_LOG_PATH, 'profile.request.start', {
+      opponent,
+      source,
+      filters,
+      includeVoice,
+      includeHh,
+      force,
+      limit
+    });
 
     if (!opponent) {
       return res.status(400).json({ error: 'Не выбран оппонент.' });
     }
-    if (!SHEETS_WEBHOOK_URL) {
-      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
+    if (needsSheets && !SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан для источников, читаемых из Sheets.' });
     }
-
-    const sheets = resolveSheetNamesBySource(source || 'all');
-    const scopeLabel = `${source || 'all'}:${sheets.join('|').toLowerCase()}`;
+    const scopeParts = [];
+    if (includeVoice) scopeParts.push(`voice:${voiceSheetName() || 'active'}`);
+    if (includeHh) scopeParts.push('hh:db');
+    const scopeLabel = `${scopeParts.join('|') || source || 'all'}|${serializeProfileFilters(filters)}`;
     const cacheKey = makeVisualProfileCacheKey(opponent, scopeLabel);
     const now = Date.now();
     const cached = visualProfileCache.get(cacheKey);
     if (!force && cached && (now - cached.savedAt) < VISUAL_PROFILE_CACHE_TTL_MS) {
+      appendRuntimeLog(VISUAL_PROFILE_LOG_PATH, 'profile.request.cached', {
+        opponent,
+        source,
+        cacheKey,
+        cachedMs: now - cached.savedAt
+      });
       return res.json({ ok: true, cached: true, profile: cached.profile });
     }
 
-    const allRows = [];
-    const bySheet = [];
-    const hhSheetNameLc = String(handHistorySheetName() || '').trim().toLowerCase();
+    const { allRows, bySheet, hhFilterOptions } = await collectOpponentRowsForProfile({
+      opponent,
+      targetIdentity,
+      targetId,
+      source,
+      includeVoice,
+      includeHh,
+      limit,
+      filters
+    });
 
-    for (const sheetName of sheets) {
-      const requestedSheetName = String(sheetName || '').trim();
-      const isHandHistorySheet = requestedSheetName.toLowerCase() === hhSheetNameLc;
-      const requiresGlobalScan = Boolean(targetIdentity) && (Boolean(targetId) || isHandHistorySheet);
-      const action = requiresGlobalScan ? 'get_all_rows' : 'get_opponent_rows';
-      const rowsResult = await postToSheets({
-        action,
-        opponent,
-        limit,
-        sheetName: sheetName || undefined
-      });
-
-      if (rowsResult?.ok === false) {
-        return res.status(500).json({ error: rowsResult.error || `Ошибка чтения строк оппонента из листа ${sheetName || 'active'}.` });
-      }
-
-      const rowsRaw = Array.isArray(rowsResult?.rows) ? rowsResult.rows : [];
-      const rows = requiresGlobalScan
-        ? rowsRaw.filter((row) => rowMatchesTargetProfile(row, opponent, targetIdentity))
-        : rowsRaw;
-      const resolvedSheetName = String(rowsResult?.sheetName || sheetName || '').trim();
-      rows.forEach((row) => {
-        allRows.push({
-          ...row,
-          rowLabel: `#${resolvedSheetName || 'Sheet'}:${row?.row ?? '?'}`
-        });
-      });
-      bySheet.push({
-        sheetName: resolvedSheetName || null,
-        rows: rows.length
-      });
-    }
-
-    const profile = buildOpponentVisualProfile(allRows, { opponent });
+    const profile = buildOpponentVisualProfile(allRows, { opponent, filters });
     profile.sources = bySheet;
+    profile.filters = {
+      ...filters,
+      options: {
+        rooms: Array.isArray(hhFilterOptions?.rooms) ? hhFilterOptions.rooms : []
+      }
+    };
 
     visualProfileCache.set(cacheKey, {
       savedAt: now,
       profile
+    });
+
+    appendRuntimeLog(VISUAL_PROFILE_LOG_PATH, 'profile.request.done', {
+      opponent,
+      source,
+      cacheKey,
+      totalRows: allRows.length,
+      sections: profile?.sections ? Object.keys(profile.sections).length : 0,
+      sources: bySheet
     });
 
     return res.json({
@@ -894,7 +1444,63 @@ app.get('/api/opponent-visual-profile', async (req, res) => {
       profile
     });
   } catch (error) {
+    appendRuntimeLog(VISUAL_PROFILE_LOG_PATH, 'profile.request.error', {
+      opponent: String(req.query?.opponent || ''),
+      source: String(req.query?.source || 'all'),
+      error: error.message || 'Ошибка построения визуального профиля.'
+    });
     return res.status(500).json({ error: error.message || 'Ошибка построения визуального профиля.' });
+  }
+});
+
+app.get('/api/opponent-visual-list', async (req, res) => {
+  try {
+    const opponent = String(req.query.opponent || '').trim();
+    const targetId = extractTargetIdHint(opponent);
+    const targetIdentity = extractTargetIdentity(opponent);
+    const source = String(req.query.source || 'all').trim().toLowerCase();
+    const filters = normalizeProfileFiltersFromQuery(req.query);
+    const limitRaw = Number(req.query.limit);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.max(1, Math.min(HH_PROFILE_ROWS_MAX, Math.trunc(limitRaw)))
+      : HH_PROFILE_ROWS_DEFAULT;
+
+    const includeVoice = ['all', 'voice'].includes(source);
+    const includeHh = ['all', 'hh', 'handhistory', 'hand_history'].includes(source);
+    const needsSheets = includeVoice;
+
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран оппонент.' });
+    }
+    if (needsSheets && !SHEETS_WEBHOOK_URL) {
+      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан для источников, читаемых из Sheets.' });
+    }
+
+    const { allRows, bySheet, hhFilterOptions } = await collectOpponentRowsForProfile({
+      opponent,
+      targetIdentity,
+      targetId,
+      source,
+      includeVoice,
+      includeHh,
+      limit,
+      filters
+    });
+
+    return res.json({
+      ok: true,
+      list: allRows,
+      totalRows: allRows.length,
+      sources: bySheet,
+      filters: {
+        ...filters,
+        options: {
+          rooms: Array.isArray(hhFilterOptions?.rooms) ? hhFilterOptions.rooms : []
+        }
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка построения списка раздач.' });
   }
 });
 
@@ -998,16 +1604,26 @@ app.post('/api/record-hand-history', async (req, res) => {
     if (!handHistory) {
       return res.status(400).json({ error: 'Hand history пустая.' });
     }
-    if (!SHEETS_WEBHOOK_URL) {
-      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
-    }
-    if (!NOTS_SEMANTIC_ENABLED) {
-      return res.status(400).json({ error: 'Для hand history нужен semantic parser (NOTS_SEMANTIC_ENABLED=1).' });
-    }
-
-    const targetSheetName = handHistorySheetName();
     const vocabulary = loadVocabulary();
-    const result = await processHandHistoryToSheets(handHistory, opponent, vocabulary, targetSheetName);
+    const runId = beginHhImportRun(HH_DB_PATH, { sourceType: 'single', fileCount: 1 });
+    let result = null;
+    try {
+      result = await processHandHistoryRecord(handHistory, opponent, vocabulary, { dbRunId: runId });
+      finishHhImportRun(HH_DB_PATH, runId, {
+        handCount: 1,
+        savedCount: result.dbInsertedHand ? 1 : 0,
+        failedCount: 0,
+        errors: []
+      });
+    } catch (error) {
+      finishHhImportRun(HH_DB_PATH, runId, {
+        handCount: 1,
+        savedCount: 0,
+        failedCount: 1,
+        errors: [{ handIndex: 1, error: error.message || 'Ошибка разбора hand history.' }]
+      });
+      throw error;
+    }
     clearProfileCacheForOpponent(opponent || result.targetPlayer || '');
 
     return res.json({
@@ -1015,7 +1631,10 @@ app.post('/api/record-hand-history', async (req, res) => {
       transcript: handHistory,
       parsed: result.parsed,
       row: result.row,
-      sheetName: result.sheetName,
+      dbNoteId: result.dbNoteId || null,
+      sheetName: null,
+      inserted: result.dbInsertedHand,
+      storage: result.storage || HH_STORAGE,
       targetPlayer: result.targetPlayer || null,
       parser: result.parser
     });
@@ -1027,6 +1646,7 @@ app.post('/api/record-hand-history', async (req, res) => {
 });
 
 app.post('/api/record-hand-history-files', upload.array('files', 200), async (req, res) => {
+  let runId = 0;
   try {
     const opponent = String(req.body?.opponent || '').trim();
     const files = Array.isArray(req.files) ? req.files : [];
@@ -1038,22 +1658,16 @@ app.post('/api/record-hand-history-files', upload.array('files', 200), async (re
     if (!files.length) {
       return res.status(400).json({ error: 'Файлы hand history не загружены.' });
     }
-    if (!SHEETS_WEBHOOK_URL) {
-      return res.status(400).json({ error: 'SHEETS_WEBHOOK_URL не задан.' });
-    }
-    if (!NOTS_SEMANTIC_ENABLED) {
-      return res.status(400).json({ error: 'Для hand history нужен semantic parser (NOTS_SEMANTIC_ENABLED=1).' });
-    }
-
-    const targetSheetName = handHistorySheetName();
     const vocabulary = loadVocabulary();
     const affectedOpponents = new Set();
     let totalHands = 0;
     let savedHands = 0;
     let failedHands = 0;
+    let skippedEmptyHands = 0;
     const errors = [];
     const savedRows = [];
     let lastResult = null;
+    runId = beginHhImportRun(HH_DB_PATH, { sourceType: 'batch', fileCount: files.length });
 
     outer:
     for (const file of files) {
@@ -1068,10 +1682,19 @@ app.post('/api/record-hand-history-files', upload.array('files', 200), async (re
         totalHands += 1;
 
         try {
-          const result = await processHandHistoryToSheets(handHistory, opponent, vocabulary, targetSheetName);
+          const result = await processHandHistoryRecord(handHistory, opponent, vocabulary, {
+            dbRunId: runId,
+            allowEmpty: true
+          });
+          if (result.skippedEmpty) {
+            skippedEmptyHands += 1;
+            continue;
+          }
           if (opponent) affectedOpponents.add(opponent);
           if (result?.targetPlayer) affectedOpponents.add(result.targetPlayer);
-          savedHands += 1;
+          if (result.dbInsertedHand) {
+            savedHands += 1;
+          }
           lastResult = {
             transcript: handHistory,
             ...result
@@ -1080,8 +1703,9 @@ app.post('/api/record-hand-history-files', upload.array('files', 200), async (re
             savedRows.push({
               file: file.originalname || `file_${savedRows.length + 1}`,
               handIndex: i + 1,
-              row: result.row,
-              sheetName: result.sheetName
+              row: result.row || null,
+              dbNoteId: result.dbNoteId || null,
+              inserted: result.dbInsertedHand
             });
           }
         } catch (error) {
@@ -1098,21 +1722,34 @@ app.post('/api/record-hand-history-files', upload.array('files', 200), async (re
     }
 
     if (!totalHands) {
+      if (runId) {
+        finishHhImportRun(HH_DB_PATH, runId, { handCount: 0, savedCount: 0, failedCount: 0, errors: [] });
+      }
       return res.status(422).json({ error: 'В загруженных файлах не найдено ни одной hand history.' });
     }
 
     if (savedHands > 0) {
       affectedOpponents.forEach((name) => clearProfileCacheForOpponent(name));
     }
+    finishHhImportRun(HH_DB_PATH, runId, {
+      handCount: totalHands,
+      savedCount: savedHands,
+      failedCount: failedHands,
+      errors
+    });
 
     return res.json({
       ok: true,
       opponent: opponent || null,
+      storage: HH_STORAGE,
+      dbRunId: runId || null,
       files: files.length,
       totalHands,
       savedHands,
+      duplicateHands: Math.max(0, totalHands - savedHands - failedHands - skippedEmptyHands),
+      skippedEmptyHands,
       failedHands,
-      sheetName: targetSheetName || null,
+      sheetName: null,
       rows: savedRows,
       errors,
       last: lastResult
@@ -1120,13 +1757,62 @@ app.post('/api/record-hand-history-files', upload.array('files', 200), async (re
           transcript: lastResult.transcript,
           parsed: lastResult.parsed,
           row: lastResult.row,
-          sheetName: lastResult.sheetName,
+          dbNoteId: lastResult.dbNoteId || null,
+          inserted: lastResult.dbInsertedHand,
+          sheetName: null,
           parser: lastResult.parser
         }
         : null
     });
   } catch (error) {
+    if (runId) {
+      try {
+        finishHhImportRun(HH_DB_PATH, runId, {
+          handCount: 0,
+          savedCount: 0,
+          failedCount: 1,
+          errors: [{ error: error.message || 'Ошибка пакетного разбора hand history.' }]
+        });
+      } catch {}
+    }
     return res.status(500).json({ error: error.message || 'Ошибка пакетного разбора hand history.' });
+  }
+});
+
+app.get('/api/hh-folder-import-status', (req, res) => {
+  const inbox = HH_IMPORT_INBOX_DIR ? path.resolve(HH_IMPORT_INBOX_DIR) : '';
+  const imported = HH_IMPORT_IMPORTED_DIR ? path.resolve(HH_IMPORT_IMPORTED_DIR) : '';
+  const filesFound = inbox && fs.existsSync(inbox) ? listHandHistoryFilesRecursive(inbox).length : 0;
+  return res.json({
+    ok: true,
+    enabled: HH_IMPORT_ENABLED,
+    running: hhFolderImportLock,
+    inboxDir: inbox || null,
+    importedDir: imported || null,
+    filesFound
+  });
+});
+
+app.post('/api/hh-folder-import', async (req, res) => {
+  try {
+    const inputDir = String(req.body?.inputDir || HH_IMPORT_INBOX_DIR || '').trim();
+    const importedDir = String(req.body?.importedDir || HH_IMPORT_IMPORTED_DIR || '').trim();
+    const opponent = String(req.body?.opponent || '').trim();
+    const maxHandsRaw = Number(req.body?.maxHands);
+    const maxHands = Number.isFinite(maxHandsRaw) && maxHandsRaw > 0 ? Math.trunc(maxHandsRaw) : 0;
+
+    const result = await importHandHistoryFoldersOnce({
+      inputDir,
+      importedDir,
+      opponent,
+      maxHands
+    });
+    if (result?.skipped) {
+      return res.status(409).json({ error: 'Импорт уже выполняется.', status: result });
+    }
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка пакетного импорта папки HH.' });
   }
 });
 
@@ -1255,6 +1941,142 @@ app.post('/api/update-field-text', async (req, res) => {
   }
 });
 
+app.post('/api/hh-manual-presupp-text', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    const field = String(req.body?.field || '').trim().toLowerCase();
+    const value = normalizeOutputPunctuation(String(req.body?.value || ''));
+    if (!HH_PRESUPP_FIELDS.has(field)) {
+      return res.status(400).json({ error: 'Некорректное поле HH presupposition.' });
+    }
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран целевой игрок.' });
+    }
+
+    const resolved = resolveHhManualKey({
+      opponent,
+      row: req.body?.row,
+      handNumber: req.body?.handNumber,
+      room: req.body?.room
+    });
+
+    const saved = upsertHhManualPresupposition(HH_DB_PATH, {
+      targetIdentity: resolved.targetIdentity || extractTargetIdentity(opponent),
+      handNumber: resolved.handNumber,
+      room: resolved.room,
+      field,
+      value
+    });
+    clearProfileCacheForOpponent(opponent);
+
+    return res.json({
+      ok: true,
+      field,
+      value,
+      handNumber: saved.handNumber,
+      room: saved.room,
+      fields: saved.fields
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка сохранения HH presupposition.' });
+  }
+});
+
+app.post('/api/hh-manual-presupp-audio', upload.single('audio'), async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    const field = String(req.body?.field || '').trim().toLowerCase();
+    if (!HH_PRESUPP_FIELDS.has(field)) {
+      return res.status(400).json({ error: 'Некорректное поле HH presupposition.' });
+    }
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран целевой игрок.' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'Аудио не получено.' });
+    }
+
+    const resolved = resolveHhManualKey({
+      opponent,
+      row: req.body?.row,
+      handNumber: req.body?.handNumber,
+      room: req.body?.room
+    });
+
+    const transcript = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
+    const vocabulary = loadVocabulary();
+    const semanticField = field === 'hand_presupposition' ? 'presupposition' : field;
+
+    let semanticError = '';
+    let semanticResult = { value: '', confidence: null, unresolved: [], modelUsed: null };
+    if (NOTS_SEMANTIC_ENABLED) {
+      try {
+        semanticResult = await parseFieldSemantic(transcript, semanticField, vocabulary);
+      } catch (error) {
+        semanticError = error.message || 'Ошибка semantic parser.';
+      }
+    }
+
+    const value = semanticResult.value || normalizeFieldContent(transcript, vocabulary, { spellingMode: SPELLING_MODE });
+    if (!value) {
+      const detail = semanticError ? ` Semantic parser: ${semanticError}` : '';
+      return res.status(422).json({ error: `Не удалось распознать текст для поля.${detail}`, transcript });
+    }
+
+    const saved = upsertHhManualPresupposition(HH_DB_PATH, {
+      targetIdentity: resolved.targetIdentity || extractTargetIdentity(opponent),
+      handNumber: resolved.handNumber,
+      room: resolved.room,
+      field,
+      value
+    });
+    clearProfileCacheForOpponent(opponent);
+
+    return res.json({
+      ok: true,
+      transcript,
+      field,
+      value,
+      handNumber: saved.handNumber,
+      room: saved.room,
+      fields: saved.fields,
+      parser: {
+        source: semanticResult.value ? 'semantic_llm' : 'rules',
+        model: semanticResult.modelUsed,
+        confidence: semanticResult.confidence,
+        unresolved: semanticResult.unresolved,
+        semanticError: semanticError || null
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка голосового HH presupposition.' });
+  }
+});
+
+app.post('/api/hh-clear-opponent', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран игрок для очистки HH DB.' });
+    }
+    const result = clearHhHandsByOpponent(HH_DB_PATH, { opponent });
+    clearProfileCacheForOpponent(opponent);
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка очистки HH DB по игроку.' });
+  }
+});
+
+app.post('/api/hh-clear-all', async (_req, res) => {
+  try {
+    const result = clearAllHhHands(HH_DB_PATH);
+    visualProfileCache.clear();
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка полной очистки HH DB.' });
+  }
+});
+
 app.post('/api/save-report', async (req, res) => {
   try {
     const report = createReportRecord(req.body || {});
@@ -1270,13 +2092,51 @@ app.post('/api/save-report', async (req, res) => {
   }
 });
 
+let hhAutoImportTimer = null;
+
+function startHhAutoImportLoop() {
+  if (!HH_IMPORT_ENABLED) return;
+  if (!HH_IMPORT_INBOX_DIR || !HH_IMPORT_IMPORTED_DIR) {
+    console.warn('HH auto-import disabled: set HH_IMPORT_INBOX_DIR and HH_IMPORT_IMPORTED_DIR.');
+    return;
+  }
+
+  const runTick = async () => {
+    try {
+      const result = await importHandHistoryFoldersOnce({
+        inputDir: HH_IMPORT_INBOX_DIR,
+        importedDir: HH_IMPORT_IMPORTED_DIR
+      });
+      if (result?.ok && (result.savedHands > 0 || result.duplicateHands > 0 || result.skippedEmptyHands > 0 || result.failedHands > 0)) {
+        console.log(
+          `HH auto-import: files=${result.filesFound}, moved=${result.filesMoved}, hands=${result.totalHands}, saved=${result.savedHands}, dup=${result.duplicateHands}, skipped=${result.skippedEmptyHands || 0}, failed=${result.failedHands}`
+        );
+      }
+    } catch (error) {
+      console.error('HH auto-import tick error:', error.message || error);
+    }
+  };
+
+  runTick();
+  hhAutoImportTimer = setInterval(runTick, HH_IMPORT_INTERVAL_SEC * 1000);
+}
+
 const server = app.listen(port, host, () => {
   console.log(`Poker Voice Logger: http://${host}:${port}`);
   console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE || 'auto'} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
   console.log(`Semantic parser: ${NOTS_SEMANTIC_ENABLED ? 'on' : 'off'} primary=${NOTS_SEMANTIC_MODEL} fallbacks=[${NOTS_SEMANTIC_MODEL_FALLBACKS.join(', ')}] dict=${NOTS_SEMANTIC_DICTIONARY_PATH}`);
-  console.log(`Sheets config: voice=${voiceSheetName() || 'active-sheet'} hand_history=${handHistorySheetName() || voiceSheetName() || 'active-sheet'}`);
+  console.log(`HH storage: ${HH_STORAGE}, parser=${HH_PARSER_MODE}, db=${HH_DB_PATH}`);
+  console.log(`HH profile rows: default=${HH_PROFILE_ROWS_DEFAULT} max=${HH_PROFILE_ROWS_MAX}`);
+  console.log(`Sheets config: voice=${voiceSheetName() || 'active-sheet'}`);
+  if (HH_IMPORT_ENABLED) {
+    console.log(`HH auto-import: inbox=${HH_IMPORT_INBOX_DIR || '-'} imported=${HH_IMPORT_IMPORTED_DIR || '-'} interval=${HH_IMPORT_INTERVAL_SEC}s`);
+  }
   console.log(`Reports path: ${REPORTS_PATH}`);
+  startHhAutoImportLoop();
 });
+
+// Imports can run for many minutes; keep HTTP responses open for long-running HH jobs.
+server.requestTimeout = 0;
 
 server.on('error', (error) => {
   if (error && (error.code === 'EADDRINUSE' || error.code === 'EPERM')) {
@@ -1284,4 +2144,11 @@ server.on('error', (error) => {
     return;
   }
   console.error('Ошибка запуска сервера:', error);
+});
+
+server.on('close', () => {
+  if (hhAutoImportTimer) {
+    clearInterval(hhAutoImportTimer);
+    hhAutoImportTimer = null;
+  }
 });

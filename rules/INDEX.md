@@ -62,6 +62,14 @@ Load this file before any substantial task. Then load only relevant rule files.
 55. [BetBet Miss Requires Explicit Turn Action](./visual-profile-betbet-miss-requires-turn-action.md)
 56. [Turn BetBet Miss Requires Flop Bet Then Turn Check](./visual-profile-turn-betbet-miss-requires-flop-bet-then-turn-check.md)
 57. [River Lines Must Split XBB and BXB With Dedicated Donk Rows](./visual-profile-river-lines-must-split-xbb-bxb-with-donk-rows.md)
+58. [VS Filter Must Require Shared Active Involvement](./visual-profile-vs-filter-must-require-shared-active-involvement.md)
+59. [List Mode Must Reuse Chart Filter Scope and Newest-First Ordering](./visual-profile-list-mode-must-reuse-chart-filter-scope.md)
+60. [VS Filter Must Be Validated At Stat Anchor Street](./visual-profile-vs-filter-must-anchor-to-stat-street.md)
+61. [HH Game-Card Filter Must Fallback to `game_type`](./process-hh-game-card-filter-fallback-from-game-type.md)
+62. [Visual Profile All-In Must Use Dedicated Lane](./visual-profile-all-in-must-use-dedicated-lane.md)
+63. [Probe Miss Must Track Flop Check-Through Turn Spot](./visual-profile-probe-miss-must-track-check-through-turn.md)
+64. [Tooltip Samples Must Preserve HH Meta](./visual-tooltip-samples-must-preserve-hh-meta.md)
+65. [Visual All-In Lane Must Use Anchor Action, Not Any Street All-In](./visual-profile-all-in-lane-must-use-anchor-action.md)
 
 ## How to Add a Rule
 

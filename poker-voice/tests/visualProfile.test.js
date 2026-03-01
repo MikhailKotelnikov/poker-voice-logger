@@ -25,6 +25,15 @@ test('visual profile action summary detects street action kinds', () => {
   assert.equal(summary.hasCall, true);
   assert.equal(summary.hasFold, false);
   assert.equal(summary.bucket, 'P');
+  assert.equal(summary.firstBetAllIn, false);
+});
+
+test('visual profile action summary marks direct all-in on first bet action', () => {
+  const summary = __testables.extractStreetActionSummary('(24.6) SB_player cb96.75 allin AhKdQcJcTc_set / BTN_other f');
+  assert.equal(summary.hasAction, true);
+  assert.equal(summary.hasBet, true);
+  assert.equal(summary.bucket, 'P');
+  assert.equal(summary.firstBetAllIn, true);
 });
 
 test('visual profile builder aggregates sections and strengths', () => {
@@ -189,6 +198,90 @@ test('visual profile fills probes on turn when target checked flop then bet turn
   const bucket6 = probes.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '6');
 
   assert.equal(bucket6.total, 1);
+});
+
+test('visual profile fills probes miss when target checked flop and skipped turn probe', () => {
+  const rows = [
+    {
+      flop: '(11.7) UTG_spirituallybroken x onQhTs5s / BTN_other x',
+      turn: '(24.6) UTG_spirituallybroken x onQhTs5s4c / BTN_other b58',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const probes = profile.sections.find((section) => section.id === 'probes');
+  const miss = probes.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === 'Miss');
+
+  assert.equal(miss.total, 1);
+});
+
+test('visual profile stores all-in counts in dedicated lane and keeps sample meta', () => {
+  const rows = [
+    {
+      rowLabel: '#DB:501',
+      handNumber: '1413806286',
+      room: 'cpr',
+      gameType: 'PLO5',
+      gameCardCount: 5,
+      sb: 5,
+      bb: 10,
+      activePlayersCount: 3,
+      finalPotBb: 243,
+      playedAtUtc: '2026-02-11T21:42:00Z',
+      flop: '(11.7) UTG_spirituallybroken b58 allin onQhTs5s / BTN_other c',
+      turn: '',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'spirituallybroken' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucket6 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '6');
+  assert.equal(bucket6.total, 1);
+  assert.equal(bucket6.allInTotal, 1);
+  assert.equal(bucket6.normalTotal, 0);
+  assert.equal(bucket6.countsAllIn.unknown, 1);
+
+  const sampleRaw = bucket6.samplesAllIn.all[0];
+  const sample = JSON.parse(sampleRaw);
+  assert.equal(sample.type, 'profile_sample_v2');
+  assert.equal(sample.meta.handNumber, '1413806286');
+  assert.equal(sample.meta.game, 'PLO5');
+  assert.equal(sample.meta.activePlayers, 3);
+});
+
+test('visual profile keeps flop bucket in normal lane when all-in is only a later call', () => {
+  const rows = [
+    {
+      rowLabel: '#DB:4196',
+      flop: '(26) SB_target cb98.27 AhKdQcJcTc_set / BTN_other r4x / SB_target c allin'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucketP = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === 'P');
+  assert.equal(bucketP.total, 1);
+  assert.equal(bucketP.normalTotal, 1);
+  assert.equal(bucketP.allInTotal, 0);
+});
+
+test('visual profile stores turn BetBet direct all-in bets in dedicated all-in lane', () => {
+  const rows = [
+    {
+      flop: '(18.2) SB_target b96.7 AhKdQcJcTc_set onKc6h5s / BB_other c',
+      turn: '(92.39) SB_target b97.89 allin AhKdQcJcTc_set onKc6h5sQd / BB_other c',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const bucketP = betbet.groups[0].rows.find((row) => row.bucket === 'P');
+  assert.equal(bucketP.total, 1);
+  assert.equal(bucketP.normalTotal, 0);
+  assert.equal(bucketP.allInTotal, 1);
 });
 
 test('visual profile marks no-showdown target action as unknown strength (white)', () => {
@@ -475,6 +568,52 @@ test('visual profile tracks BetBetBet donk and miss-donk rows', () => {
   assert.equal(bbb.groups[0].rows.find((row) => row.bucket === 'Miss Donk').total, 1);
 });
 
+test('visual profile applies vs filter at stat anchor street (turn stats)', () => {
+  const rows = [
+    // VS player participates only until flop, should not count in turn BetBet.
+    {
+      flop: '(16.2) UTG_other x onKcAcTd / UTG1_vs x / CO_target b96.3 / BTN_other f / UTG_other c / UTG1_vs f',
+      turn: '(47.4) UTG_other x onKcAcTd8h / CO_target b98.73 / UTG_other c',
+      river: ''
+    },
+    // VS player is active on turn, should count.
+    {
+      flop: '(12) BB_vs x onAh7d4c / CO_target cb60 / BB_vs c',
+      turn: '(32) BB_vs x onAh7d4c2s / CO_target b55 / BB_vs c',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, {
+    opponent: 'target',
+    filters: { vsOpponent: 'vs' }
+  });
+
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const bucket6 = betbet.groups[0].rows.find((row) => row.bucket === '6');
+  assert.equal(bucket6.total, 1);
+});
+
+test('visual profile applies vs filter at stat anchor street (flop stats)', () => {
+  const rows = [
+    {
+      flop: '(10) BB_target cb50 onAhKd2c / CO_vs c'
+    },
+    {
+      flop: '(10) BB_target cb50 onAhKd2c / CO_other c'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, {
+    opponent: 'target',
+    filters: { vsOpponent: 'vs' }
+  });
+
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucket5 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '5');
+  assert.equal(bucket5.total, 1);
+});
+
 test('visual profile uses miss-street strength for BetBet miss (b-x-x)', () => {
   const rows = [
     {
@@ -683,4 +822,19 @@ test('visual profile uses dedicated lighter color for fragileStrong legend', () 
   const profile = buildOpponentVisualProfile([], { opponent: 'spirituallybroken' });
   const item = (profile.legend || []).find((entry) => entry.key === 'fragileStrong');
   assert.equal(item?.color, '#f8d8df');
+});
+
+test('visual profile section order keeps River Once above Check-Bet-Bet', () => {
+  const profile = buildOpponentVisualProfile([], { opponent: 'target' });
+  const ids = (profile.sections || []).map((section) => section.id);
+  assert.deepEqual(ids, [
+    'flop',
+    'betbet',
+    'probes',
+    'riverBxb',
+    'riverOnce',
+    'riverXbb',
+    'betbetbet',
+    'tot'
+  ]);
 });

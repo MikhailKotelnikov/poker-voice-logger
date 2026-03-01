@@ -2,11 +2,17 @@
   "name": "poker-voice",
   "version": "0.1.0",
   "private": true,
+  "main": "desktop/main.cjs",
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check server.js && node --check public/app.js && node --check src/core.js && node --check src/semantic.js && node --check src/reports.js && node --check src/handHistory.js && node --check src/visualProfile.js && node --check src/handVisual.js",
+    "hh:import": "node scripts/hh-folder-import-cli.mjs",
+    "hh:onedrive": "node scripts/hh-onedrive-import-cli.mjs",
+    "desktop:dev": "electron .",
+    "desktop:dist:win": "electron-builder --win nsis",
+    "desktop:dist:dir": "electron-builder --dir",
+    "check": "node --check server.js && node --check public/app.js && node --check src/core.js && node --check src/semantic.js && node --check src/reports.js && node --check src/handHistory.js && node --check src/visualProfile.js && node --check src/handVisual.js && node --check src/hhDb.js && node --check src/hhFolderSync.js && node --check desktop/main.cjs && node --check desktop/preload.cjs && node --check desktop/ui/renderer.js && node --check scripts/hh-folder-import-cli.mjs && node --check scripts/hh-onedrive-import-cli.mjs",
     "test": "node --test",
     "verify": "npm run check && npm run test"
   },
@@ -14,5 +20,44 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1"
+  },
+  "devDependencies": {
+    "electron": "^32.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.parisianreflect.pokervoice",
+    "productName": "Poker Voice Launcher",
+    "asar": false,
+    "files": [
+      "desktop/**/*",
+      "public/**/*",
+      "src/**/*",
+      "server.js",
+      "NOTS_SEMANTIC_DICTIONARY.md",
+      "vocab.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "data/hh.db",
+        "to": "data/hh.db"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
   }
 }

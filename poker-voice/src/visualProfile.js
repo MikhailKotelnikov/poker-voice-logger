@@ -88,11 +88,22 @@ function cleanText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function buildSamplePayload(rowLabel, streets, focusStreet = '') {
+function buildSamplePayload(rowLabel, streets, focusStreet = '', meta = null, manual = null) {
+  const manualFields = manual && typeof manual === 'object'
+    ? {
+      preflop: cleanText(manual.preflop),
+      flop: cleanText(manual.flop),
+      turn: cleanText(manual.turn),
+      river: cleanText(manual.river),
+      handPresupposition: cleanText(manual.handPresupposition || manual.hand_presupposition)
+    }
+    : null;
   return JSON.stringify({
     type: 'profile_sample_v2',
     rowLabel: cleanText(rowLabel),
     focusStreet: String(focusStreet || '').toLowerCase(),
+    meta: meta && typeof meta === 'object' ? meta : undefined,
+    manual: manualFields || undefined,
     streets: {
       preflop: cleanText(streets?.preflop),
       flop: cleanText(streets?.flop),
@@ -133,37 +144,49 @@ function filterStreetByTargetActor(streetText, targetIdentity) {
 }
 
 function createBucketCounters(bucketOrder = DEFAULT_BUCKET_ORDER) {
+  const makeStrengthCounters = () => ({
+    nuts: 0,
+    strong: 0,
+    conditionalStrong: 0,
+    fragileStrong: 0,
+    overpair: 0,
+    twoPair: 0,
+    topPair: 0,
+    strongDraw: 0,
+    weakDraw: 0,
+    lightFold: 0,
+    weak: 0,
+    unknown: 0
+  });
+
+  const makeSampleMap = () => ({
+    all: [],
+    nuts: [],
+    strong: [],
+    conditionalStrong: [],
+    fragileStrong: [],
+    overpair: [],
+    twoPair: [],
+    topPair: [],
+    strongDraw: [],
+    weakDraw: [],
+    lightFold: [],
+    weak: [],
+    unknown: []
+  });
+
   const out = {};
   bucketOrder.forEach((bucket) => {
     out[bucket] = {
       total: 0,
-      nuts: 0,
-      strong: 0,
-      conditionalStrong: 0,
-      fragileStrong: 0,
-      overpair: 0,
-      twoPair: 0,
-      topPair: 0,
-      strongDraw: 0,
-      weakDraw: 0,
-      lightFold: 0,
-      weak: 0,
-      unknown: 0,
-      samples: {
-        all: [],
-        nuts: [],
-        strong: [],
-        conditionalStrong: [],
-        fragileStrong: [],
-        overpair: [],
-        twoPair: [],
-        topPair: [],
-        strongDraw: [],
-        weakDraw: [],
-        lightFold: [],
-        weak: [],
-        unknown: []
-      }
+      normalTotal: 0,
+      allInTotal: 0,
+      ...makeStrengthCounters(),
+      countsNormal: makeStrengthCounters(),
+      countsAllIn: makeStrengthCounters(),
+      samples: makeSampleMap(),
+      samplesNormal: makeSampleMap(),
+      samplesAllIn: makeSampleMap()
     };
   });
   return out;
@@ -256,11 +279,13 @@ function parseStreetSegments(textRaw) {
     const match = segment.match(/^(?:\(\d+(?:\.\d+)?\)\s*)?(?:[A-Za-z0-9]+_[A-Za-z0-9]{2,24})\s+([^\s/]+)/i);
     const actionToken = String(match?.[1] || '').trim();
     const action = parseStreetActionToken(actionToken);
+    const allIn = /\ball(?:[\s-]+)?in\b/i.test(segment);
     return {
       segment,
       actor: actor?.actor || '',
       identity: actor?.identity || '',
       actionToken,
+      allIn,
       ...action
     };
   });
@@ -308,16 +333,30 @@ function firstActionIndex(segments, identity) {
 }
 
 function detectDonkOutcome(segments, targetIdentity, aggressorIdentity) {
-  if (!Array.isArray(segments) || !segments.length || !targetIdentity || !aggressorIdentity) return '';
+  const empty = { outcome: '', allIn: false };
+  if (!Array.isArray(segments) || !segments.length || !targetIdentity || !aggressorIdentity) return empty;
   const targetIndex = firstActionIndex(segments, targetIdentity);
   const aggressorIndex = firstActionIndex(segments, aggressorIdentity);
-  if (targetIndex < 0 || aggressorIndex < 0 || targetIndex >= aggressorIndex) return '';
+  if (targetIndex < 0 || aggressorIndex < 0 || targetIndex >= aggressorIndex) return empty;
 
   const targetAction = segments[targetIndex];
-  if (!targetAction || targetAction.kind === 'other') return '';
-  if (targetAction.kind === 'bet') return 'Donk';
-  if (targetAction.kind === 'check') return 'Miss Donk';
-  return '';
+  if (!targetAction || targetAction.kind === 'other') return empty;
+  if (targetAction.kind === 'bet') {
+    return { outcome: 'Donk', allIn: Boolean(targetAction.allIn) };
+  }
+  if (targetAction.kind === 'check') {
+    return { outcome: 'Miss Donk', allIn: false };
+  }
+  return empty;
+}
+
+function streetHasIdentityAction(segments, identity) {
+  if (!identity) return true;
+  if (!Array.isArray(segments) || !segments.length) return false;
+  return segments.some((segment) => {
+    if (!segment || segment.identity !== identity) return false;
+    return ['check', 'call', 'bet', 'raise', 'fold'].includes(segment.kind);
+  });
 }
 
 function extractStreetActionSummary(textRaw) {
@@ -329,6 +368,7 @@ function extractStreetActionSummary(textRaw) {
       hasCheck: false,
       hasCall: false,
       hasFold: false,
+      firstBetAllIn: false,
       bucket: null
     };
   }
@@ -338,6 +378,9 @@ function extractStreetActionSummary(textRaw) {
   let hasCheck = false;
   let hasCall = false;
   let hasFold = false;
+  let hasAllIn = false;
+  let firstBetAllIn = false;
+  let firstBetSeen = false;
   let bucket = null;
 
   for (const parsed of segments) {
@@ -347,12 +390,17 @@ function extractStreetActionSummary(textRaw) {
     if (parsed.kind === 'check') hasCheck = true;
     if (parsed.kind === 'call') hasCall = true;
     if (parsed.kind === 'fold') hasFold = true;
+    if (parsed.allIn) hasAllIn = true;
+    if (!firstBetSeen && (parsed.kind === 'bet' || parsed.kind === 'raise')) {
+      firstBetSeen = true;
+      firstBetAllIn = Boolean(parsed.allIn);
+    }
     if (!bucket && parsed.kind === 'bet' && Number.isFinite(parsed.size) && parsed.size > 0) {
       bucket = detectBucket(`b${parsed.size}`);
     }
   }
 
-  return { hasAction, hasBet, hasCheck, hasCall, hasFold, bucket };
+  return { hasAction, hasBet, hasCheck, hasCall, hasFold, hasAllIn, firstBetAllIn, bucket };
 }
 
 function extractCardsToken(textRaw, expectedCards = 5) {
@@ -712,17 +760,28 @@ function addSample(samples, key, text) {
   list.push(text);
 }
 
-function addCount(section, group, bucket, strength, sampleText = '') {
+function addCount(section, group, bucket, strength, sampleText = '', options = {}) {
   if (!section || !section.groups[group] || !bucket || !section.groups[group][bucket]) return;
   const entry = section.groups[group][bucket];
+  const lane = options?.allIn ? 'allIn' : 'normal';
+  const laneCounts = lane === 'allIn' ? entry.countsAllIn : entry.countsNormal;
+  const laneSamples = lane === 'allIn' ? entry.samplesAllIn : entry.samplesNormal;
   entry.total += 1;
+  if (lane === 'allIn') {
+    entry.allInTotal += 1;
+  } else {
+    entry.normalTotal += 1;
+  }
   if (STRENGTH_ORDER.includes(strength)) {
     entry[strength] += 1;
+    laneCounts[strength] += 1;
   }
   if (sampleText) {
     addSample(entry.samples, 'all', sampleText);
+    addSample(laneSamples, 'all', sampleText);
     if (STRENGTH_ORDER.includes(strength)) {
       addSample(entry.samples, strength, sampleText);
+      addSample(laneSamples, strength, sampleText);
     }
   }
 }
@@ -747,14 +806,62 @@ function groupToRows(groupCounters, bucketOrder = DEFAULT_BUCKET_ORDER) {
         weak: row.weak,
         unknown: row.unknown
       },
-      samples: row.samples
+      countsNormal: row.countsNormal,
+      countsAllIn: row.countsAllIn,
+      normalTotal: row.normalTotal,
+      allInTotal: row.allInTotal,
+      samples: row.samples,
+      samplesNormal: row.samplesNormal,
+      samplesAllIn: row.samplesAllIn
     };
   });
+}
+
+function buildSampleMeta(row = {}) {
+  const gameCards = Number(row?.gameCardCount);
+  const activePlayers = Number(row?.activePlayersCount);
+  const finalPotBb = Number(row?.finalPotBb);
+  const sb = Number(row?.sb);
+  const bb = Number(row?.bb);
+  const room = cleanText(row?.room || '').toLowerCase();
+  const handNumber = cleanText(row?.handNumber || '');
+  const playedAtUtc = cleanText(row?.playedAtUtc || '');
+
+  const potBucket = Number.isFinite(finalPotBb)
+    ? (finalPotBb < 15 ? 'small' : finalPotBb < 35 ? 'medium' : finalPotBb < 90 ? 'large' : 'huge')
+    : '';
+  const limit = Number.isFinite(sb) && Number.isFinite(bb)
+    ? `${sb}-${bb}`
+    : '';
+
+  const out = {
+    handNumber,
+    playedAtUtc,
+    game: Number.isFinite(gameCards) ? `PLO${gameCards}` : cleanText(row?.gameType || ''),
+    activePlayers: Number.isFinite(activePlayers) ? activePlayers : '',
+    room,
+    limit,
+    finalPotBb: Number.isFinite(finalPotBb) ? finalPotBb : '',
+    potBucket
+  };
+
+  if (!out.handNumber
+    && !out.playedAtUtc
+    && !out.game
+    && !out.activePlayers
+    && !out.room
+    && !out.limit
+    && !out.finalPotBb
+    && !out.potBucket) {
+    return null;
+  }
+  return out;
 }
 
 export function buildOpponentVisualProfile(rows, options = {}) {
   const items = Array.isArray(rows) ? rows : [];
   const targetIdentity = extractTargetIdentity(options?.opponent);
+  const vsIdentity = extractTargetIdentity(options?.filters?.vsOpponent || options?.vsOpponent || '');
   const sections = {
     flop: createSectionState('Flop Bets', ['HU', 'MW'], DEFAULT_BUCKET_ORDER),
     betbet: createSectionState('BetBet', ['All'], WITH_DONK_BUCKET_ORDER),
@@ -783,6 +890,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       turn: turnRaw,
       river: riverRaw
     };
+    const sampleMeta = buildSampleMeta(row);
     const actionByStreet = {
       flop: extractStreetActionSummary(flopText),
       turn: extractStreetActionSummary(turnText),
@@ -792,6 +900,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       flop: parseStreetSegments(flopRaw),
       turn: parseStreetSegments(turnRaw),
       river: parseStreetSegments(riverRaw)
+    };
+    const hasVsByStreet = {
+      flop: streetHasIdentityAction(segmentsByStreet.flop, vsIdentity),
+      turn: streetHasIdentityAction(segmentsByStreet.turn, vsIdentity),
+      river: streetHasIdentityAction(segmentsByStreet.river, vsIdentity)
     };
     const hasActorContext = streetHasActorContext(segmentsByStreet.flop)
       || streetHasActorContext(segmentsByStreet.turn)
@@ -837,7 +950,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       return classifyStrength(streetText);
     };
 
-    if (flopText) {
+    if (flopText && hasVsByStreet.flop) {
       const bucket = actionByStreet.flop.bucket || detectBucket(flopText);
       if (bucket) {
         const group = detectMultiway(flopRaw || flopText) ? 'MW' : 'HU';
@@ -847,7 +960,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           group,
           bucket,
           strength,
-          buildSamplePayload(rowLabel, sampleBase, 'flop')
+          buildSamplePayload(rowLabel, sampleBase, 'flop', sampleMeta),
+          { allIn: actionByStreet.flop.firstBetAllIn }
         );
         analyzedRows += 1;
       }
@@ -860,25 +974,55 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       const turnBucket = actionByStreet.turn.bucket || detectBucket(turnText);
       const turnStrength = strengthFor('turn', turnText);
 
-      if (targetFlopHasBet) {
+      if (targetFlopHasBet && hasVsByStreet.turn) {
         if (targetTurnHasBet && turnBucket) {
-          addCount(sections.betbet, 'All', turnBucket, turnStrength, buildSamplePayload(rowLabel, sampleBase, 'turn'));
+          addCount(
+            sections.betbet,
+            'All',
+            turnBucket,
+            turnStrength,
+            buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta),
+            { allIn: actionByStreet.turn.firstBetAllIn }
+          );
         } else if (actionByStreet.turn.hasAction && targetTurnHasCheck && !targetTurnHasBet) {
-          addCount(sections.betbet, 'All', 'Miss', turnStrength, buildSamplePayload(rowLabel, sampleBase, 'turn'));
+          addCount(sections.betbet, 'All', 'Miss', turnStrength, buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta));
         }
       }
 
       const turnDonkOutcome = hasActorContext
         ? detectDonkOutcome(segmentsByStreet.turn, targetIdentity, flopCallVsAggressor?.aggressorIdentity)
-        : '';
-      if (turnDonkOutcome) {
-        addCount(sections.betbet, 'All', turnDonkOutcome, turnStrength, buildSamplePayload(rowLabel, sampleBase, 'turn'));
+        : { outcome: '', allIn: false };
+      if (turnDonkOutcome.outcome && hasVsByStreet.turn) {
+        addCount(
+          sections.betbet,
+          'All',
+          turnDonkOutcome.outcome,
+          turnStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta),
+          { allIn: turnDonkOutcome.outcome === 'Donk' && turnDonkOutcome.allIn }
+        );
       }
 
       const isTurnProbe = detectProbeLine(turnText) || (flopAllChecked && targetTurnHasBet);
-      if (isTurnProbe && turnBucket) {
+      if (isTurnProbe && turnBucket && hasVsByStreet.turn) {
         const group = detectMultiway(turnRaw || turnText) ? 'MW' : 'HU';
-        addCount(sections.probes, group, turnBucket, turnStrength, buildSamplePayload(rowLabel, sampleBase, 'turn'));
+        addCount(
+          sections.probes,
+          group,
+          turnBucket,
+          turnStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta),
+          { allIn: actionByStreet.turn.firstBetAllIn }
+        );
+      } else if (flopAllChecked && actionByStreet.turn.hasAction && targetTurnHasCheck && !targetTurnHasBet && hasVsByStreet.turn) {
+        const group = detectMultiway(turnRaw || turnText) ? 'MW' : 'HU';
+        addCount(
+          sections.probes,
+          group,
+          'Miss',
+          turnStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta)
+        );
       }
     }
 
@@ -891,72 +1035,135 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       const riverBucket = actionByStreet.river.bucket || detectBucket(riverText);
       const riverStrength = strengthFor('river', riverText);
 
-      if (riverBucket) {
-        addCount(sections.total, 'All', riverBucket, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+      if (riverBucket && hasVsByStreet.river) {
+        addCount(
+          sections.total,
+          'All',
+          riverBucket,
+          riverStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+          { allIn: actionByStreet.river.firstBetAllIn }
+        );
       }
 
       // Check-Bet-Bet (flop all checks, target bets turn, then acts on river).
       const isXbbLine = flopAllChecked && hasTurnBet;
-      if (isXbbLine) {
+      if (isXbbLine && hasVsByStreet.river) {
         if (hasRiverBet && riverBucket) {
-          addCount(sections.riverXbb, 'All', riverBucket, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(
+            sections.riverXbb,
+            'All',
+            riverBucket,
+            riverStrength,
+            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+            { allIn: actionByStreet.river.firstBetAllIn }
+          );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverXbb, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(sections.riverXbb, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
         }
       }
 
       // River donk after turn aggressor (x-b-c turn, then river lead/check before aggressor).
       const riverDonkOutcome = hasActorContext
         ? detectDonkOutcome(segmentsByStreet.river, targetIdentity, turnCallVsAggressor?.aggressorIdentity)
-        : '';
-      if (riverDonkOutcome && (isXbbLine || (flopAllChecked && turnCallVsAggressor))) {
-        addCount(sections.riverXbb, 'All', riverDonkOutcome, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+        : { outcome: '', allIn: false };
+      if (riverDonkOutcome.outcome && hasVsByStreet.river && (isXbbLine || (flopAllChecked && turnCallVsAggressor))) {
+        addCount(
+          sections.riverXbb,
+          'All',
+          riverDonkOutcome.outcome,
+          riverStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+          { allIn: riverDonkOutcome.outcome === 'Donk' && riverDonkOutcome.allIn }
+        );
       }
 
       // Bet-Check-Bet (target bets flop, turn checks through, then acts on river).
       const isBxbLine = hasFlopBet && turnAllChecked;
-      if (isBxbLine) {
+      if (isBxbLine && hasVsByStreet.river) {
         if (hasRiverBet && riverBucket) {
-          addCount(sections.riverBxb, 'All', riverBucket, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(
+            sections.riverBxb,
+            'All',
+            riverBucket,
+            riverStrength,
+            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+            { allIn: actionByStreet.river.firstBetAllIn }
+          );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverBxb, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(sections.riverBxb, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
         }
       }
 
-      if (riverDonkOutcome && (isBxbLine || (hasFlopBet && actionByStreet.turn.hasCheck && turnCallVsAggressor))) {
-        addCount(sections.riverBxb, 'All', riverDonkOutcome, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+      if (riverDonkOutcome.outcome && hasVsByStreet.river && (isBxbLine || (hasFlopBet && actionByStreet.turn.hasCheck && turnCallVsAggressor))) {
+        addCount(
+          sections.riverBxb,
+          'All',
+          riverDonkOutcome.outcome,
+          riverStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+          { allIn: riverDonkOutcome.outcome === 'Donk' && riverDonkOutcome.allIn }
+        );
       }
 
       // River once after x/x flop and x/x turn.
       const isRiverOnceLine = flopAllChecked && turnAllChecked;
-      if (isRiverOnceLine) {
+      if (isRiverOnceLine && hasVsByStreet.river) {
         if (hasRiverBet && riverBucket) {
-          addCount(sections.riverOnce, 'All', riverBucket, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(
+            sections.riverOnce,
+            'All',
+            riverBucket,
+            riverStrength,
+            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+            { allIn: actionByStreet.river.firstBetAllIn }
+          );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverOnce, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(sections.riverOnce, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
         }
-      } else if (!hasActorContext && detectSingleRiverBetLine(riverText) && riverBucket) {
+      } else if (!hasActorContext && !vsIdentity && detectSingleRiverBetLine(riverText) && riverBucket) {
         // Voice-format fallback without structured actors.
-        addCount(sections.riverOnce, 'All', riverBucket, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+        addCount(
+          sections.riverOnce,
+          'All',
+          riverBucket,
+          riverStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+          { allIn: actionByStreet.river.firstBetAllIn }
+        );
       }
 
       // BetBetBet and misses.
       const isTriple = hasFlopBet && hasTurnBet && hasRiverBet;
       const isTripleMiss = hasFlopBet && hasTurnBet && !hasRiverBet && hasRiverAction && hasRiverCheck;
-      if (detectTripleBarrelLine(riverText) || isTriple) {
+      if ((detectTripleBarrelLine(riverText) || isTriple) && hasVsByStreet.river) {
         if (riverBucket) {
-          addCount(sections.betbetbet, 'All', riverBucket, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+          addCount(
+            sections.betbetbet,
+            'All',
+            riverBucket,
+            riverStrength,
+            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+            { allIn: actionByStreet.river.firstBetAllIn }
+          );
         }
-      } else if (isTripleMiss) {
-        addCount(sections.betbetbet, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+      } else if (isTripleMiss && hasVsByStreet.river) {
+        addCount(sections.betbetbet, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
       }
 
       const hasCallFlopAndTurnVsAggressor = Boolean(flopCallVsAggressor && turnCallVsAggressor);
-      if (riverDonkOutcome && hasCallFlopAndTurnVsAggressor) {
-        addCount(sections.betbetbet, 'All', riverDonkOutcome, riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river'));
+      if (riverDonkOutcome.outcome && hasVsByStreet.river && hasCallFlopAndTurnVsAggressor) {
+        addCount(
+          sections.betbetbet,
+          'All',
+          riverDonkOutcome.outcome,
+          riverStrength,
+          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
+          { allIn: riverDonkOutcome.outcome === 'Donk' && riverDonkOutcome.allIn }
+        );
       }
 
-      if (riverBucket || isTripleMiss || isRiverOnceLine || riverDonkOutcome || isXbbLine || isBxbLine) {
+      if (riverBucket || isTripleMiss || isRiverOnceLine || riverDonkOutcome.outcome || isXbbLine || isBxbLine) {
         analyzedRows += 1;
       }
     }
@@ -992,9 +1199,9 @@ export function buildOpponentVisualProfile(rows, options = {}) {
         ]
       },
       {
-        id: 'riverXbb',
-        title: sections.riverXbb.title,
-        groups: [{ id: 'All', title: 'All', rows: groupToRows(sections.riverXbb.groups.All, sections.riverXbb.bucketOrder) }]
+        id: 'riverOnce',
+        title: sections.riverOnce.title,
+        groups: [{ id: 'All', title: 'All', rows: groupToRows(sections.riverOnce.groups.All, sections.riverOnce.bucketOrder) }]
       },
       {
         id: 'riverBxb',
@@ -1002,9 +1209,9 @@ export function buildOpponentVisualProfile(rows, options = {}) {
         groups: [{ id: 'All', title: 'All', rows: groupToRows(sections.riverBxb.groups.All, sections.riverBxb.bucketOrder) }]
       },
       {
-        id: 'riverOnce',
-        title: sections.riverOnce.title,
-        groups: [{ id: 'All', title: 'All', rows: groupToRows(sections.riverOnce.groups.All, sections.riverOnce.bucketOrder) }]
+        id: 'riverXbb',
+        title: sections.riverXbb.title,
+        groups: [{ id: 'All', title: 'All', rows: groupToRows(sections.riverXbb.groups.All, sections.riverXbb.bucketOrder) }]
       },
       {
         id: 'betbetbet',
