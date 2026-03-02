@@ -85,6 +85,11 @@ Load this file before any substantial task. Then load only relevant rule files.
 78. [Profile VS-Me Filter Must Use Room-Scoped My Nickname](./visual-profile-vs-me-must-use-room-scoped-my-nickname.md)
 79. [HH Preset Selection Must Commit On Pointerdown](./visual-hh-presets-must-commit-on-pointerdown.md)
 80. [HH Card Visibility Must Distinguish Showdown vs Dealt Source](./process-hh-cards-visibility-showdown-vs-dealt.md)
+81. [HH Target Identity Must Strip Position Prefix Tokens](./process-hh-target-identity-must-strip-actor-prefix.md)
+82. [Visual Miss Rows Must Mark Target Call-Off All-Ins In All-In Lane](./visual-profile-miss-allin-must-include-target-call-commitment.md)
+83. [HH Manual Inputs Must Roll Back Optimistic Values On Save Failure](./visual-hh-manual-optimistic-input-must-rollback-on-save-error.md)
+84. [Tooltip Manual Edits Must Patch In-Memory Profile Caches](./visual-tooltip-manual-edits-must-sync-profile-caches.md)
+85. [HH Manual Concurrent Saves Must Patch Only The Edited Field](./visual-hh-manual-concurrent-saves-must-patch-field-locally.md)
 
 ## How to Add a Rule
 

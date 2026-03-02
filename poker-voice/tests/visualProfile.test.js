@@ -312,6 +312,23 @@ test('visual profile stores turn BetBet direct all-in bets in dedicated all-in l
   assert.equal(bucketP.allInTotal, 1);
 });
 
+test('visual profile marks turn BetBet miss in all-in lane when target check-calls shove', () => {
+  const rows = [
+    {
+      flop: '(18.2) SB_target b62 onKc6h5s / BB_other c',
+      turn: '(92.39) SB_target x onKc6h5sQd / BB_other b100 allin / SB_target c',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: 'target' });
+  const betbet = profile.sections.find((section) => section.id === 'betbet');
+  const miss = betbet.groups[0].rows.find((row) => row.bucket === 'Miss');
+  assert.equal(miss.total, 1);
+  assert.equal(miss.normalTotal, 0);
+  assert.equal(miss.allInTotal, 1);
+});
+
 test('visual profile marks no-showdown target action as unknown strength (white)', () => {
   const rows = [
     {

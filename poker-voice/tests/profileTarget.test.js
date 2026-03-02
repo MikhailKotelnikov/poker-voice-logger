@@ -11,6 +11,7 @@ test('extractTargetIdentity prefers numeric id hint, else normalized nickname', 
   assert.equal(extractTargetIdHint('ThatWas 86761294'), '86761294');
   assert.equal(extractTargetIdentity('ThatWas 86761294'), '86761294');
   assert.equal(extractTargetIdentity('Spiritually Broken'), 'spirituallybroken');
+  assert.equal(extractTargetIdentity('HJ_GREXOMETR'), 'grexometr');
 });
 
 test('rowMatchesTargetProfile matches HH rows by actor identity in postflop streets', () => {

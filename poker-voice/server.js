@@ -368,15 +368,16 @@ function clearProfileCacheForOpponent(opponent) {
   }
 }
 
-function resolveHhManualKey({ opponent = '', row = 0, handNumber = '', room = '' } = {}) {
+function resolveHhManualKey({ opponent = '', targetIdentity = '', row = 0, handNumber = '', room = '' } = {}) {
   const normalizedOpponent = String(opponent || '').trim();
+  const normalizedTargetIdentity = extractTargetIdentity(targetIdentity || normalizedOpponent);
   const normalizedHandNumber = String(handNumber || '').trim();
   const normalizedRoom = String(room || '').trim().toLowerCase();
   const numericRow = Number(row);
 
   if (normalizedHandNumber) {
     return {
-      targetIdentity: extractTargetIdentity(normalizedOpponent),
+      targetIdentity: normalizedTargetIdentity,
       handNumber: normalizedHandNumber,
       room: normalizedRoom
     };
@@ -387,7 +388,8 @@ function resolveHhManualKey({ opponent = '', row = 0, handNumber = '', room = ''
   }
   return getHhNoteMetaById(HH_DB_PATH, {
     noteId: numericRow,
-    opponent: normalizedOpponent
+    opponent: normalizedOpponent,
+    targetIdentity: normalizedTargetIdentity
   });
 }
 
@@ -1972,6 +1974,7 @@ app.post('/api/hh-manual-presupp-text', async (req, res) => {
 
     const resolved = resolveHhManualKey({
       opponent,
+      targetIdentity: req.body?.targetIdentity,
       row: req.body?.row,
       handNumber: req.body?.handNumber,
       room: req.body?.room
@@ -2015,6 +2018,7 @@ app.post('/api/hh-manual-presupp-audio', upload.single('audio'), async (req, res
 
     const resolved = resolveHhManualKey({
       opponent,
+      targetIdentity: req.body?.targetIdentity,
       row: req.body?.row,
       handNumber: req.body?.handNumber,
       room: req.body?.room
@@ -2084,6 +2088,7 @@ app.post('/api/hh-manual-timing-text', async (req, res) => {
 
     const resolved = resolveHhManualKey({
       opponent,
+      targetIdentity: req.body?.targetIdentity,
       row: req.body?.row,
       handNumber: req.body?.handNumber,
       room: req.body?.room
@@ -2122,6 +2127,7 @@ app.post('/api/hh-manual-clear-hand', async (req, res) => {
     }
     const resolved = resolveHhManualKey({
       opponent,
+      targetIdentity: req.body?.targetIdentity,
       row: req.body?.row,
       handNumber: req.body?.handNumber,
       room: req.body?.room
@@ -2150,7 +2156,10 @@ app.post('/api/hh-manual-clear-opponent', async (req, res) => {
     if (!opponent) {
       return res.status(400).json({ error: 'Не выбран целевой игрок.' });
     }
-    const result = clearHhManualByOpponent(HH_DB_PATH, { opponent });
+    const result = clearHhManualByOpponent(HH_DB_PATH, {
+      opponent,
+      targetIdentity: req.body?.targetIdentity
+    });
     clearProfileCacheForOpponent(opponent);
     return res.json({
       ok: true,

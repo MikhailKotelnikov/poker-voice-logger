@@ -583,9 +583,22 @@ function extractTargetId(value) {
   return match[match.length - 1];
 }
 
+function extractActorTokenIdentityHint(value) {
+  const source = String(value || '').trim();
+  if (!source) return '';
+  const match = source.match(/^(?:SB|BB|BTN|CO|HJ|UTG|UTG1|LJ|MP|P\d+)_([A-Za-z0-9]{2,24})$/i);
+  if (!match?.[1]) return '';
+  return String(match[1] || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
 function extractTargetIdentity(value) {
   const id = extractTargetId(value);
   if (id) return id;
+  const actorHint = extractActorTokenIdentityHint(value);
+  if (actorHint) return actorHint;
   return String(value || '')
     .trim()
     .toLowerCase()
@@ -687,6 +700,35 @@ function setParsedManualFieldsFromApi(parsed, fields = {}) {
   });
 }
 
+function manualFieldValueFromApi(apiField, fields = {}) {
+  const def = hhManualFieldDef(apiField);
+  if (!def) return null;
+  const source = fields && typeof fields === 'object' ? fields : {};
+  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(source, key);
+
+  if (hasOwn(apiField)) return String(source[apiField] || '');
+  if (apiField === 'hand_presupposition') {
+    if (hasOwn('handPresupposition')) return String(source.handPresupposition || '');
+    if (hasOwn('hand_presupposition')) return String(source.hand_presupposition || '');
+  } else if (hasOwn(def.key)) {
+    return String(source[def.key] || '');
+  }
+  return null;
+}
+
+function applyParsedManualFieldFromApi(parsed, apiField, fields = {}) {
+  if (!parsed || typeof parsed !== 'object') return;
+  const def = hhManualFieldDef(apiField);
+  if (!def) {
+    setParsedManualFieldsFromApi(parsed, fields);
+    return;
+  }
+  const nextValue = manualFieldValueFromApi(apiField, fields);
+  if (nextValue === null) return;
+  parsed.manual = normalizeHhManualValues(parsed?.manual);
+  parsed.manual[def.key] = String(nextValue || '');
+}
+
 function setParsedTimingFieldsFromApi(parsed, timings = []) {
   if (!parsed || typeof parsed !== 'object') return;
   parsed.timings = normalizeHhTimingEntries(timings);
@@ -730,37 +772,97 @@ function parsedSampleMatchContext(parsedContext = {}, sampleContext = {}) {
   return Number.isFinite(parsedRow) && parsedRow > 0 && parsedRow === sampleRow;
 }
 
-function syncProfileTooltipSampleInput(parsed) {
-  if (!parsed || !profileTooltipSampleInput) return;
-  const parsedContext = parsed.context && typeof parsed.context === 'object' ? parsed.context : null;
-  if (!parsedContext) return;
-  const patchOne = (sampleText) => {
-    const text = String(sampleText || '').trim();
-    if (!text) return sampleText;
-    try {
-      const payload = JSON.parse(text);
-      if (!payload || payload.type !== 'profile_sample_v2') return sampleText;
-      const sampleContext = payload.context && typeof payload.context === 'object' ? payload.context : {};
-      if (!parsedSampleMatchContext(parsedContext, sampleContext)) return sampleText;
-      payload.manual = normalizeHhManualValues(parsed.manual);
-      const timings = normalizeHhTimingEntries(parsed.timings);
-      if (timings.length) {
-        payload.timings = timings;
-      } else {
-        delete payload.timings;
-      }
-      return JSON.stringify(payload);
-    } catch {
-      return sampleText;
+function patchSamplePayloadWithParsed(sampleText, parsedContext, manual, timings) {
+  const text = String(sampleText || '').trim();
+  if (!text) return sampleText;
+  try {
+    const payload = JSON.parse(text);
+    if (!payload || payload.type !== 'profile_sample_v2') return sampleText;
+    const sampleContext = payload.context && typeof payload.context === 'object' ? payload.context : {};
+    if (!parsedSampleMatchContext(parsedContext, sampleContext)) return sampleText;
+    payload.manual = normalizeHhManualValues(manual);
+    if (timings.length) {
+      payload.timings = timings;
+    } else {
+      delete payload.timings;
+    }
+    return JSON.stringify(payload);
+  } catch {
+    return sampleText;
+  }
+}
+
+function patchCachedProfileSamples(parsedContext, manual, timings) {
+  const patchArray = (arr) => {
+    if (!Array.isArray(arr)) return;
+    for (let index = 0; index < arr.length; index += 1) {
+      arr[index] = patchSamplePayloadWithParsed(arr[index], parsedContext, manual, timings);
     }
   };
 
+  for (const entry of profileCache.values()) {
+    const profile = entry?.status === 'ready' ? entry.profile : null;
+    if (!profile || !Array.isArray(profile.sections)) continue;
+    for (const section of profile.sections) {
+      const groups = Array.isArray(section?.groups) ? section.groups : [];
+      for (const group of groups) {
+        const rows = Array.isArray(group?.rows) ? group.rows : [];
+        for (const row of rows) {
+          patchArray(row?.samples?.all);
+          Object.values(row?.samples || {}).forEach((items) => patchArray(items));
+          Object.values(row?.samplesNormal || {}).forEach((items) => patchArray(items));
+          Object.values(row?.samplesAllIn || {}).forEach((items) => patchArray(items));
+        }
+      }
+    }
+  }
+}
+
+function patchCachedProfileLists(parsedContext, manual, timings) {
+  const normalizedTimings = timings.map((item) => ({
+    street: String(item.street || '').trim().toLowerCase(),
+    actionIndex: Number(item.actionIndex || 0),
+    actionKey: String(item.actionKey || ''),
+    timing: String(item.timing || '').trim().toLowerCase()
+  }));
+  for (const entry of profileListCache.values()) {
+    const payload = entry?.status === 'ready' ? entry.payload : null;
+    const rows = Array.isArray(payload?.list) ? payload.list : [];
+    for (const row of rows) {
+      const rowContext = {
+        row: Number(row?.row),
+        handNumber: String(row?.handNumber || ''),
+        room: String(row?.room || '').trim().toLowerCase(),
+        targetIdentity: extractTargetIdentity(payload?.opponent || '')
+      };
+      if (!parsedSampleMatchContext(parsedContext, rowContext)) continue;
+      row.manualPreflop = String(manual.preflop || '');
+      row.manualFlop = String(manual.flop || '');
+      row.manualTurn = String(manual.turn || '');
+      row.manualRiver = String(manual.river || '');
+      row.handPresupposition = String(manual.handPresupposition || '');
+      row.manualTimings = normalizedTimings.map((item) => ({ ...item }));
+    }
+  }
+}
+
+function syncProfileTooltipSampleInput(parsed) {
+  if (!parsed) return;
+  const parsedContext = parsed.context && typeof parsed.context === 'object' ? parsed.context : null;
+  if (!parsedContext) return;
+  const manual = normalizeHhManualValues(parsed.manual);
+  const timings = normalizeHhTimingEntries(parsed.timings);
+
+  patchCachedProfileSamples(parsedContext, manual, timings);
+  patchCachedProfileLists(parsedContext, manual, timings);
+
   if (Array.isArray(profileTooltipSampleInput)) {
-    profileTooltipSampleInput = profileTooltipSampleInput.map((item) => patchOne(item));
+    profileTooltipSampleInput = profileTooltipSampleInput
+      .map((item) => patchSamplePayloadWithParsed(item, parsedContext, manual, timings));
     return;
   }
   if (typeof profileTooltipSampleInput === 'string') {
-    profileTooltipSampleInput = patchOne(profileTooltipSampleInput);
+    profileTooltipSampleInput = patchSamplePayloadWithParsed(profileTooltipSampleInput, parsedContext, manual, timings);
   }
 }
 
@@ -1071,6 +1173,7 @@ async function saveHhManualTextField(parsed, apiField, value) {
         row: context.row,
         handNumber: context.handNumber,
         room: context.room,
+        targetIdentity: context.targetIdentity,
         field,
         value
       })
@@ -1079,7 +1182,7 @@ async function saveHhManualTextField(parsed, apiField, value) {
     if (!response.ok) {
       throw new Error(data.error || 'Ошибка сохранения HH presupposition.');
     }
-    setParsedManualFieldsFromApi(parsed, data.fields || {});
+    applyParsedManualFieldFromApi(parsed, field, data.fields || {});
     syncProfileTooltipSampleInput(parsed);
     clearProfileCacheByOpponent(opponent);
     refreshPinnedProfileTooltip();
@@ -1121,6 +1224,7 @@ async function saveHhManualTiming(parsed, { street, actionIndex, actionKey, timi
         row: context.row,
         handNumber: context.handNumber,
         room: context.room,
+        targetIdentity: context.targetIdentity,
         street: normalizedStreet,
         actionIndex,
         actionKey,
@@ -1187,6 +1291,7 @@ async function submitHhManualAudioRecording() {
   formData.append('row', String(payloadContext.row || ''));
   formData.append('handNumber', String(payloadContext.handNumber || ''));
   formData.append('room', String(payloadContext.room || ''));
+  formData.append('targetIdentity', String(payloadContext.targetIdentity || ''));
 
   try {
     setStatus(`Транскрибирую ${fieldLabel}...`);
@@ -1199,7 +1304,7 @@ async function submitHhManualAudioRecording() {
       throw new Error(data.error || 'Ошибка голосового HH presupposition.');
     }
 
-    setParsedManualFieldsFromApi(parsed, data.fields || {});
+    applyParsedManualFieldFromApi(parsed, field, data.fields || {});
     syncProfileTooltipSampleInput(parsed);
     clearProfileCacheByOpponent(resolvedOpponent);
     refreshPinnedProfileTooltip();
@@ -1398,6 +1503,7 @@ function createHhManualFieldEditor(parsed, apiField, options = {}) {
   input.type = 'text';
   input.className = 'pt-manual-input';
   input.value = currentValue;
+  const committedValue = { value: currentValue };
   input.placeholder = canEdit ? '' : '—';
   input.disabled = !canEdit;
   const isHandPresuppField = field === 'hand_presupposition';
@@ -1443,6 +1549,11 @@ function createHhManualFieldEditor(parsed, apiField, options = {}) {
     const ok = await saveHhManualTextField(parsed, field, input.value);
     if (ok) {
       input.value = hhManualFieldValue(parsed, field);
+      committedValue.value = input.value;
+      updateHandPresupLayout();
+    } else {
+      setHhManualFieldValue(parsed, field, committedValue.value);
+      input.value = committedValue.value;
       updateHandPresupLayout();
     }
   });
@@ -1450,6 +1561,7 @@ function createHhManualFieldEditor(parsed, apiField, options = {}) {
   voiceBtn.addEventListener('click', async () => {
     await startHhManualAudioRecording(parsed, field, () => {
       input.value = hhManualFieldValue(parsed, field);
+      committedValue.value = input.value;
       updateHandPresupLayout();
       refreshVoiceLabel();
     });
@@ -1468,6 +1580,7 @@ function createHhManualFieldEditor(parsed, apiField, options = {}) {
     const applyPreset = async () => {
       if (!canEdit) return;
       if (presetCommitInFlight) return;
+      const previousCommitted = String(committedValue.value || '');
       presetCommitInFlight = true;
       try {
         const nextValue = appendPreset(preset);
@@ -1477,6 +1590,11 @@ function createHhManualFieldEditor(parsed, apiField, options = {}) {
         const ok = await saveHhManualTextField(parsed, field, nextValue);
         if (ok) {
           input.value = hhManualFieldValue(parsed, field);
+          committedValue.value = input.value;
+          updateHandPresupLayout();
+        } else {
+          setHhManualFieldValue(parsed, field, previousCommitted);
+          input.value = previousCommitted;
           updateHandPresupLayout();
         }
         input.focus();
@@ -2055,7 +2173,8 @@ async function clearHhManualForParsedHand(parsed) {
         opponent,
         row: context.row,
         handNumber: context.handNumber,
-        room: context.room
+        room: context.room,
+        targetIdentity: context.targetIdentity
       })
     });
     const data = await response.json();
@@ -2091,7 +2210,10 @@ async function clearHhManualForCurrentOpponent() {
     const response = await fetch('/api/hh-manual-clear-opponent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ opponent })
+      body: JSON.stringify({
+        opponent,
+        targetIdentity: extractTargetIdentity(opponent)
+      })
     });
     const data = await response.json();
     if (!response.ok) {
@@ -3405,10 +3527,18 @@ function addOpponent() {
 }
 
 function clearProfileCacheByOpponent(name) {
-  const suffix = `::${String(name || '').trim()}`;
+  const normalizedName = String(name || '').trim().toLowerCase();
+  const normalizedIdentity = extractTargetIdentity(name);
+  if (!normalizedName && !normalizedIdentity) return;
   const clearBySuffix = (cache) => {
     for (const key of cache.keys()) {
-      if (String(key).endsWith(suffix)) {
+      const parts = String(key || '').split('::');
+      const keyOpponent = String(parts[parts.length - 1] || '').trim();
+      const keyNameLower = keyOpponent.toLowerCase();
+      const keyIdentity = extractTargetIdentity(keyOpponent);
+      const matchesName = normalizedName && keyNameLower === normalizedName;
+      const matchesIdentity = normalizedIdentity && keyIdentity === normalizedIdentity;
+      if (matchesName || matchesIdentity) {
         cache.delete(key);
       }
     }

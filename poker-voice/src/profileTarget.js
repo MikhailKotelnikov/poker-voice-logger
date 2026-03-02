@@ -13,6 +13,14 @@ function normalizeActorIdentity(value) {
     .replace(/[^a-z0-9]/g, '');
 }
 
+function extractActorTokenIdentityHint(opponent) {
+  const value = String(opponent || '').trim();
+  if (!value) return '';
+  const match = value.match(/^(?:SB|BB|BTN|CO|HJ|UTG|UTG1|LJ|MP|P\d+)_([A-Za-z0-9]{2,24})$/i);
+  if (!match?.[1]) return '';
+  return normalizeActorIdentity(match[1]);
+}
+
 export function extractTargetIdHint(opponent) {
   const match = String(opponent || '').match(/\d{4,}/g);
   if (!match || !match.length) {
@@ -24,6 +32,8 @@ export function extractTargetIdHint(opponent) {
 export function extractTargetIdentity(opponent) {
   const id = extractTargetIdHint(opponent);
   if (id) return id;
+  const actorHint = extractActorTokenIdentityHint(opponent);
+  if (actorHint) return actorHint;
   return normalizeActorIdentity(opponent);
 }
 

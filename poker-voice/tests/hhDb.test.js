@@ -480,6 +480,73 @@ test('manual presupp/timing are resolved by selected target identity, support ma
   assert.equal(onlyManualAfterClear.length, 0);
 });
 
+test('manual presupp save accepts position-prefixed opponent token and stays visible after reload', () => {
+  const dbPath = makeTempDbPath();
+  initHhDb(dbPath);
+  const parserVersion = 'test-manual-prefixed-opponent-v1';
+  const target = 'grexometr';
+
+  const parsedHH = {
+    blinds: { smallBlind: 5, bigBlind: 10 },
+    players: [target, 'villain'],
+    positionsByPlayer: { [target]: 'HJ', villain: 'BTN' },
+    targetPlayer: target,
+    board: { flop: ['Kc', '9h', '3s'], turn: '6d', river: '' },
+    events: {
+      preflop: [
+        { player: target, type: 'raise', amount: 45, amountBb: 4.5, potBefore: 0, potAfter: 45 },
+        { player: 'villain', type: 'call', amount: 45, amountBb: 4.5, potBefore: 45, potAfter: 90 }
+      ],
+      flop: [
+        { player: target, type: 'check', amount: 0, amountBb: 0, pctPot: 0, potBefore: 90, potAfter: 90 },
+        { player: 'villain', type: 'bet', amount: 40, amountBb: 4, pctPot: 44.4, potBefore: 90, potAfter: 130 },
+        { player: target, type: 'call', amount: 40, amountBb: 4, pctPot: 30.7, potBefore: 130, potAfter: 170 }
+      ],
+      turn: [],
+      river: []
+    },
+    showdown: { showCardsByPlayer: {} }
+  };
+
+  const parsed = {
+    preflop: 'HJ_grexometr r4.5bb / BTN_villain c4.5bb',
+    flop: '(9) HJ_grexometr x onKc9h3s / BTN_villain b44.4 / HJ_grexometr c',
+    turn: '',
+    river: '',
+    presupposition: ''
+  };
+
+  const runId = beginHhImportRun(dbPath, { sourceType: 'single', fileCount: 1 });
+  saveHhParsedRecord(dbPath, {
+    runId,
+    handHistory: `PokerStars Hand #93000001: 5 Card Omaha Pot Limit (¥5/¥10 CNY) - 2026/02/26 18:18:15 UTC
+Table 'CGG_9300001-KrakenDen' 6-max`,
+    parsedHH,
+    parsed,
+    parserVersion,
+    targetIdentity: target,
+    targetPlayer: target
+  });
+  finishHhImportRun(dbPath, runId, { handCount: 1, savedCount: 1, failedCount: 0, errors: [] });
+
+  const rowsBefore = getHhProfileRows(dbPath, { opponent: target, limit: 10, filters: {} }).rows;
+  assert.equal(rowsBefore.length, 1);
+  const row = rowsBefore[0];
+  assert.equal(row.manualTurn, '');
+
+  upsertHhManualPresupposition(dbPath, {
+    opponent: 'HJ_GREXOMETR',
+    room: row.room,
+    handNumber: row.handNumber,
+    field: 'turn',
+    value: 'i gc'
+  });
+
+  const rowsAfter = getHhProfileRows(dbPath, { opponent: target, limit: 10, filters: {} }).rows;
+  assert.equal(rowsAfter.length, 1);
+  assert.equal(rowsAfter[0].manualTurn, 'i gc');
+});
+
 test('clearHhHandsByOpponent removes rows that match opponent by action tokens when note identity is unknown', () => {
   const dbPath = makeTempDbPath();
   initHhDb(dbPath);

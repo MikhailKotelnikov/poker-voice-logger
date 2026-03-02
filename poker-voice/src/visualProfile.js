@@ -378,6 +378,33 @@ function isTargetAnchorAllIn(segments, targetIdentity) {
   return false;
 }
 
+function isTargetCallCommitAllIn(segments, targetIdentity) {
+  if (!Array.isArray(segments) || !segments.length || !targetIdentity) return false;
+  let seenTargetAggression = false;
+  let seenOpponentAllInAggression = false;
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (!segment || !segment.identity || segment.kind === 'other') continue;
+
+    if (segment.identity === targetIdentity) {
+      if (segment.kind === 'bet' || segment.kind === 'raise') {
+        seenTargetAggression = true;
+        continue;
+      }
+      if (!seenTargetAggression && segment.kind === 'call' && (segment.allIn || seenOpponentAllInAggression)) {
+        return true;
+      }
+      continue;
+    }
+
+    if (!seenTargetAggression && (segment.kind === 'bet' || segment.kind === 'raise') && segment.allIn) {
+      seenOpponentAllInAggression = true;
+    }
+  }
+  return false;
+}
+
 function firstActionIndex(segments, identity) {
   if (!Array.isArray(segments) || !segments.length || !identity) return -1;
   for (let index = 0; index < segments.length; index += 1) {
@@ -1002,6 +1029,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       turn: isTargetAnchorAllIn(segmentsByStreet.turn, targetIdentity),
       river: isTargetAnchorAllIn(segmentsByStreet.river, targetIdentity)
     };
+    const callAllInByStreet = {
+      flop: isTargetCallCommitAllIn(segmentsByStreet.flop, targetIdentity),
+      turn: isTargetCallCommitAllIn(segmentsByStreet.turn, targetIdentity),
+      river: isTargetCallCommitAllIn(segmentsByStreet.river, targetIdentity)
+    };
     const hasVsByStreet = {
       flop: streetHasIdentityAction(segmentsByStreet.flop, vsIdentity),
       turn: streetHasIdentityAction(segmentsByStreet.turn, vsIdentity),
@@ -1022,6 +1054,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
     const turnCallVsAggressor = hasActorContext
       ? findTargetCallVsAggressor(segmentsByStreet.turn, targetIdentity)
       : null;
+    const missAllInByStreet = {
+      flop: hasActorContext ? callAllInByStreet.flop : (actionByStreet.flop.hasCall && actionByStreet.flop.hasAllIn),
+      turn: hasActorContext ? callAllInByStreet.turn : (actionByStreet.turn.hasCall && actionByStreet.turn.hasAllIn),
+      river: hasActorContext ? callAllInByStreet.river : (actionByStreet.river.hasCall && actionByStreet.river.hasAllIn)
+    };
     const hasShowdownClassByStreet = {
       flop: hasShowdownClassToken(flopText),
       turn: hasShowdownClassToken(turnText),
@@ -1086,7 +1123,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             { allIn: hasActorContext ? anchorAllInByStreet.turn : actionByStreet.turn.firstBetAllIn }
           );
         } else if (actionByStreet.turn.hasAction && targetTurnHasCheck && !targetTurnHasBet) {
-          addCount(sections.betbet, 'All', 'Miss', turnStrength, sampleForStreet('turn'));
+          addCount(sections.betbet, 'All', 'Miss', turnStrength, sampleForStreet('turn'), { allIn: missAllInByStreet.turn });
         }
       }
 
@@ -1102,7 +1139,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           sampleForStreet('turn'),
           {
             allIn: turnDonkOutcome.outcome === 'Donk'
-              && (turnDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.turn : false))
+              ? (turnDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.turn : false))
+              : (turnDonkOutcome.outcome === 'Miss Donk' && missAllInByStreet.turn)
           }
         );
       }
@@ -1125,7 +1163,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           group,
           'Miss',
           turnStrength,
-          sampleForStreet('turn')
+          sampleForStreet('turn'),
+          { allIn: missAllInByStreet.turn }
         );
       }
     }
@@ -1163,7 +1202,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverXbb, 'All', 'Miss', riverStrength, sampleForStreet('river'));
+          addCount(sections.riverXbb, 'All', 'Miss', riverStrength, sampleForStreet('river'), { allIn: missAllInByStreet.river });
         }
       }
 
@@ -1180,7 +1219,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           sampleForStreet('river'),
           {
             allIn: riverDonkOutcome.outcome === 'Donk'
-              && (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+              ? (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+              : (riverDonkOutcome.outcome === 'Miss Donk' && missAllInByStreet.river)
           }
         );
       }
@@ -1198,7 +1238,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverBxb, 'All', 'Miss', riverStrength, sampleForStreet('river'));
+          addCount(sections.riverBxb, 'All', 'Miss', riverStrength, sampleForStreet('river'), { allIn: missAllInByStreet.river });
         }
       }
 
@@ -1211,7 +1251,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           sampleForStreet('river'),
           {
             allIn: riverDonkOutcome.outcome === 'Donk'
-              && (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+              ? (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+              : (riverDonkOutcome.outcome === 'Miss Donk' && missAllInByStreet.river)
           }
         );
       }
@@ -1229,7 +1270,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverOnce, 'All', 'Miss', riverStrength, sampleForStreet('river'));
+          addCount(sections.riverOnce, 'All', 'Miss', riverStrength, sampleForStreet('river'), { allIn: missAllInByStreet.river });
         }
       } else if (!hasActorContext && !vsIdentity && detectSingleRiverBetLine(riverText) && riverBucket) {
         // Voice-format fallback without structured actors.
@@ -1258,7 +1299,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           );
         }
       } else if (isTripleMiss && hasVsByStreet.river) {
-        addCount(sections.betbetbet, 'All', 'Miss', riverStrength, sampleForStreet('river'));
+        addCount(sections.betbetbet, 'All', 'Miss', riverStrength, sampleForStreet('river'), { allIn: missAllInByStreet.river });
       }
 
       const hasCallFlopAndTurnVsAggressor = Boolean(flopCallVsAggressor && turnCallVsAggressor);
@@ -1271,7 +1312,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           sampleForStreet('river'),
           {
             allIn: riverDonkOutcome.outcome === 'Donk'
-              && (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+              ? (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+              : (riverDonkOutcome.outcome === 'Miss Donk' && missAllInByStreet.river)
           }
         );
       }
