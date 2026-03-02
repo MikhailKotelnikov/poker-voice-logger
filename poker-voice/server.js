@@ -45,6 +45,8 @@ import {
   beginHhImportRun,
   clearAllHhHands,
   clearHhHandsByOpponent,
+  clearHhManualByHand,
+  clearHhManualByOpponent,
   finishHhImportRun,
   getHhNoteMetaById,
   getHhOpponentSuggestions,
@@ -52,6 +54,7 @@ import {
   hhStorageUsesDb,
   initHhDb,
   saveHhParsedRecord,
+  upsertHhManualActionTiming,
   upsertHhManualPresupposition
 } from './src/hhDb.js';
 
@@ -105,7 +108,10 @@ const HH_RUNTIME_LOG_ENABLED = String(process.env.HH_RUNTIME_LOG_ENABLED || '1')
 const HH_IMPORT_LOG_PATH = process.env.HH_IMPORT_LOG_PATH || path.resolve(process.cwd(), 'logs', 'hh-import.log');
 const VISUAL_PROFILE_LOG_PATH = process.env.VISUAL_PROFILE_LOG_PATH || path.resolve(process.cwd(), 'logs', 'visual-profile.log');
 const HH_PROFILE_ROWS_DEFAULT = Math.max(1000, Number(process.env.HH_PROFILE_ROWS_DEFAULT || '50000') || 50000);
-const HH_PROFILE_ROWS_MAX = Math.max(HH_PROFILE_ROWS_DEFAULT, Number(process.env.HH_PROFILE_ROWS_MAX || '500000') || 500000);
+const HH_PROFILE_ROWS_MAX_RAW = Number(process.env.HH_PROFILE_ROWS_MAX || '0');
+const HH_PROFILE_ROWS_MAX = Number.isFinite(HH_PROFILE_ROWS_MAX_RAW) && HH_PROFILE_ROWS_MAX_RAW > 0
+  ? Math.max(HH_PROFILE_ROWS_DEFAULT, Math.trunc(HH_PROFILE_ROWS_MAX_RAW))
+  : Number.POSITIVE_INFINITY;
 const VOCAB_PATH = process.env.VOCAB_PATH || path.resolve(process.cwd(), 'vocab.json');
 const REPORTS_PATH = process.env.REPORTS_PATH || path.resolve(process.cwd(), 'reports', 'nots_reports.jsonl');
 const FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
@@ -231,9 +237,13 @@ function normalizeProfileFiltersFromQuery(query = {}) {
     .filter((item) => allowedLimits.has(item));
 
   const vsOpponent = String(query.vs || '').trim();
+  const cardsRaw = String(query.cards || query.cardsVisibility || query.cardsMode || '').trim().toLowerCase();
+  const cardsVisibility = cardsRaw === 'known' ? 'known' : 'showdown';
   const allowedRecent = new Set(['all', '50', '20']);
   const recentRaw = String(query.recent || 'all').trim().toLowerCase();
   const recentLimit = allowedRecent.has(recentRaw) ? recentRaw : 'all';
+  const manualRaw = String(query.manual || query.manualOnly || '').trim().toLowerCase();
+  const manualOnly = manualRaw === '1' || manualRaw === 'true';
 
   return {
     playerGroups,
@@ -243,7 +253,9 @@ function normalizeProfileFiltersFromQuery(query = {}) {
     potBuckets,
     limits,
     vsOpponent,
-    recentLimit
+    cardsVisibility,
+    recentLimit,
+    manualOnly
   };
 }
 
@@ -261,8 +273,19 @@ function serializeProfileFilters(filters = {}) {
     `pots=${pack(filters.potBuckets)}`,
     `limits=${pack(filters.limits)}`,
     `vs=${String(filters.vsOpponent || '').trim().toLowerCase()}`,
-    `recent=${String(filters.recentLimit || 'all')}`
+    `cards=${String(filters.cardsVisibility || 'showdown')}`,
+    `recent=${String(filters.recentLimit || 'all')}`,
+    `manual=${filters.manualOnly ? '1' : '0'}`
   ].join('|');
+}
+
+function clampProfileLimit(limitRaw) {
+  const numericLimit = Number(limitRaw);
+  if (!Number.isFinite(numericLimit)) return HH_PROFILE_ROWS_DEFAULT;
+  const normalized = Math.max(1, Math.trunc(numericLimit));
+  return Number.isFinite(HH_PROFILE_ROWS_MAX)
+    ? Math.min(HH_PROFILE_ROWS_MAX, normalized)
+    : normalized;
 }
 
 async function collectOpponentRowsForProfile({
@@ -1362,10 +1385,7 @@ app.get('/api/opponent-visual-profile', async (req, res) => {
     const source = String(req.query.source || 'all').trim().toLowerCase();
     const force = String(req.query.force || '').trim() === '1';
     const filters = normalizeProfileFiltersFromQuery(req.query);
-    const limitRaw = Number(req.query.limit);
-    const limit = Number.isFinite(limitRaw)
-      ? Math.max(1, Math.min(HH_PROFILE_ROWS_MAX, Math.trunc(limitRaw)))
-      : HH_PROFILE_ROWS_DEFAULT;
+    const limit = clampProfileLimit(req.query.limit);
 
     const includeVoice = ['all', 'voice'].includes(source);
     const includeHh = ['all', 'hh', 'handhistory', 'hand_history'].includes(source);
@@ -1460,10 +1480,7 @@ app.get('/api/opponent-visual-list', async (req, res) => {
     const targetIdentity = extractTargetIdentity(opponent);
     const source = String(req.query.source || 'all').trim().toLowerCase();
     const filters = normalizeProfileFiltersFromQuery(req.query);
-    const limitRaw = Number(req.query.limit);
-    const limit = Number.isFinite(limitRaw)
-      ? Math.max(1, Math.min(HH_PROFILE_ROWS_MAX, Math.trunc(limitRaw)))
-      : HH_PROFILE_ROWS_DEFAULT;
+    const limit = clampProfileLimit(req.query.limit);
 
     const includeVoice = ['all', 'voice'].includes(source);
     const includeHh = ['all', 'hh', 'handhistory', 'hand_history'].includes(source);
@@ -2053,6 +2070,99 @@ app.post('/api/hh-manual-presupp-audio', upload.single('audio'), async (req, res
   }
 });
 
+app.post('/api/hh-manual-timing-text', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    const street = String(req.body?.street || '').trim().toLowerCase();
+    const actionIndex = Number(req.body?.actionIndex);
+    const actionKey = String(req.body?.actionKey || '');
+    const timing = String(req.body?.timing || '').trim();
+
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран целевой игрок.' });
+    }
+
+    const resolved = resolveHhManualKey({
+      opponent,
+      row: req.body?.row,
+      handNumber: req.body?.handNumber,
+      room: req.body?.room
+    });
+
+    const saved = upsertHhManualActionTiming(HH_DB_PATH, {
+      targetIdentity: resolved.targetIdentity || extractTargetIdentity(opponent),
+      handNumber: resolved.handNumber,
+      room: resolved.room,
+      street,
+      actionIndex,
+      actionKey,
+      timing
+    });
+    clearProfileCacheForOpponent(opponent);
+
+    return res.json({
+      ok: true,
+      handNumber: saved.handNumber,
+      room: saved.room,
+      street: saved.street,
+      actionIndex: saved.actionIndex,
+      timing: saved.timing,
+      timings: saved.timings
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка сохранения HH timing.' });
+  }
+});
+
+app.post('/api/hh-manual-clear-hand', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран целевой игрок.' });
+    }
+    const resolved = resolveHhManualKey({
+      opponent,
+      row: req.body?.row,
+      handNumber: req.body?.handNumber,
+      room: req.body?.room
+    });
+    const result = clearHhManualByHand(HH_DB_PATH, {
+      targetIdentity: resolved.targetIdentity || extractTargetIdentity(opponent),
+      handNumber: resolved.handNumber,
+      room: resolved.room
+    });
+    clearProfileCacheForOpponent(opponent);
+    return res.json({
+      ok: true,
+      handNumber: result.handNumber,
+      room: result.room,
+      presuppDeleted: result.presuppDeleted,
+      timingsDeleted: result.timingsDeleted
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка удаления ручных данных HH по раздаче.' });
+  }
+});
+
+app.post('/api/hh-manual-clear-opponent', async (req, res) => {
+  try {
+    const opponent = String(req.body?.opponent || '').trim();
+    if (!opponent) {
+      return res.status(400).json({ error: 'Не выбран целевой игрок.' });
+    }
+    const result = clearHhManualByOpponent(HH_DB_PATH, { opponent });
+    clearProfileCacheForOpponent(opponent);
+    return res.json({
+      ok: true,
+      targetIdentity: result.targetIdentity,
+      presuppDeleted: result.presuppDeleted,
+      timingsDeleted: result.timingsDeleted
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Ошибка удаления ручных данных HH по игроку.' });
+  }
+});
+
 app.post('/api/hh-clear-opponent', async (req, res) => {
   try {
     const opponent = String(req.body?.opponent || '').trim();
@@ -2126,7 +2236,7 @@ const server = app.listen(port, host, () => {
   console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE || 'auto'} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
   console.log(`Semantic parser: ${NOTS_SEMANTIC_ENABLED ? 'on' : 'off'} primary=${NOTS_SEMANTIC_MODEL} fallbacks=[${NOTS_SEMANTIC_MODEL_FALLBACKS.join(', ')}] dict=${NOTS_SEMANTIC_DICTIONARY_PATH}`);
   console.log(`HH storage: ${HH_STORAGE}, parser=${HH_PARSER_MODE}, db=${HH_DB_PATH}`);
-  console.log(`HH profile rows: default=${HH_PROFILE_ROWS_DEFAULT} max=${HH_PROFILE_ROWS_MAX}`);
+  console.log(`HH profile rows: default=${HH_PROFILE_ROWS_DEFAULT} max=${Number.isFinite(HH_PROFILE_ROWS_MAX) ? HH_PROFILE_ROWS_MAX : 'unlimited'}`);
   console.log(`Sheets config: voice=${voiceSheetName() || 'active-sheet'}`);
   if (HH_IMPORT_ENABLED) {
     console.log(`HH auto-import: inbox=${HH_IMPORT_INBOX_DIR || '-'} imported=${HH_IMPORT_IMPORTED_DIR || '-'} interval=${HH_IMPORT_INTERVAL_SEC}s`);

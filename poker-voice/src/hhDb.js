@@ -8,14 +8,32 @@ const MODE_SHEETS = 'sheets';
 const MODE_DB = 'db';
 const MODE_DUAL = 'dual';
 const HH_MANUAL_FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'hand_presupposition']);
+const HH_TIMING_STREETS = new Set(['preflop', 'flop', 'turn', 'river']);
+const HH_TIMING_VALUES = new Set([
+  '0% t',
+  '10% t',
+  '20% t',
+  '30% t',
+  '40% t',
+  '50% t',
+  '60% t',
+  '70% t',
+  '80% t',
+  '90% t',
+  '100% t',
+  '50% tb',
+  '70% tb',
+  '90% tb',
+  '100% tb'
+]);
 const HH_PROFILE_ROWS_DEFAULT = Math.max(
   1000,
   Number(process.env.HH_PROFILE_ROWS_DEFAULT || '50000') || 50000
 );
-const HH_PROFILE_ROWS_MAX = Math.max(
-  HH_PROFILE_ROWS_DEFAULT,
-  Number(process.env.HH_PROFILE_ROWS_MAX || '500000') || 500000
-);
+const HH_PROFILE_ROWS_MAX_RAW = Number(process.env.HH_PROFILE_ROWS_MAX || '0');
+const HH_PROFILE_ROWS_MAX = Number.isFinite(HH_PROFILE_ROWS_MAX_RAW) && HH_PROFILE_ROWS_MAX_RAW > 0
+  ? Math.max(HH_PROFILE_ROWS_DEFAULT, Math.trunc(HH_PROFILE_ROWS_MAX_RAW))
+  : Number.POSITIVE_INFINITY;
 
 let cachedPath = '';
 let cachedDb = null;
@@ -30,6 +48,28 @@ function sanitizeManualText(value, limit = 2000) {
     .replace(/\u0000/g, '')
     .trim()
     .slice(0, limit);
+}
+
+function normalizeTimingStreet(value) {
+  const street = String(value || '').trim().toLowerCase();
+  return HH_TIMING_STREETS.has(street) ? street : '';
+}
+
+function normalizeTimingLabel(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return '';
+  return HH_TIMING_VALUES.has(text) ? text : '';
+}
+
+function sanitizeActionKey(value, limit = 500) {
+  return String(value || '')
+    .replace(/\u0000/g, '')
+    .trim()
+    .slice(0, limit);
+}
+
+function makeHandMapKey(targetIdentity = '', room = '', handNumber = '') {
+  return `${String(targetIdentity || '').trim().toLowerCase()}|${String(room || '').trim().toLowerCase()}|${String(handNumber || '').trim()}`;
 }
 
 const SCHEMA_SQL = `
@@ -91,6 +131,7 @@ CREATE TABLE IF NOT EXISTS hh_hand_players (
   stack_start REAL,
   is_target_candidate INTEGER NOT NULL DEFAULT 0 CHECK (is_target_candidate IN (0,1)),
   showdown_cards TEXT,
+  dealt_cards TEXT,
   showdown_result TEXT,
   UNIQUE(hand_id, player_id)
 );
@@ -146,6 +187,20 @@ CREATE TABLE IF NOT EXISTS hh_manual_presupp (
   UNIQUE(target_identity, room, hand_number)
 );
 
+CREATE TABLE IF NOT EXISTS hh_manual_action_timing (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  target_identity TEXT NOT NULL,
+  room TEXT NOT NULL DEFAULT '',
+  hand_number TEXT NOT NULL,
+  street TEXT NOT NULL CHECK (street IN ('preflop','flop','turn','river')),
+  action_index INTEGER NOT NULL,
+  action_key TEXT NOT NULL DEFAULT '',
+  timing_label TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(target_identity, room, hand_number, street, action_index)
+);
+
 CREATE TABLE IF NOT EXISTS hh_profile_cache (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   target_identity TEXT NOT NULL,
@@ -160,6 +215,7 @@ CREATE TABLE IF NOT EXISTS hh_profile_cache (
 CREATE INDEX IF NOT EXISTS idx_hh_notes_target_identity ON hh_notes(target_identity, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hh_notes_target_player ON hh_notes(target_player_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hh_manual_presupp_target ON hh_manual_presupp(target_identity, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hh_manual_action_timing_target ON hh_manual_action_timing(target_identity, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hh_events_hand_street_seq ON hh_events(hand_id, street, seq);
 CREATE INDEX IF NOT EXISTS idx_hh_hand_players_hand_pos ON hh_hand_players(hand_id, position);
 CREATE INDEX IF NOT EXISTS idx_hh_hands_played_at ON hh_hands(played_at_utc DESC);
@@ -233,6 +289,9 @@ function applySchemaMigrations(db) {
     if (hasTableColumn(db, 'hh_hands', columnName)) continue;
     db.exec(alterSql);
   }
+  if (!hasTableColumn(db, 'hh_hand_players', 'dealt_cards')) {
+    db.exec('ALTER TABLE hh_hand_players ADD COLUMN dealt_cards TEXT');
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS hh_manual_presupp (
@@ -251,8 +310,25 @@ function applySchemaMigrations(db) {
     )
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS hh_manual_action_timing (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_identity TEXT NOT NULL,
+      room TEXT NOT NULL DEFAULT '',
+      hand_number TEXT NOT NULL,
+      street TEXT NOT NULL CHECK (street IN ('preflop','flop','turn','river')),
+      action_index INTEGER NOT NULL,
+      action_key TEXT NOT NULL DEFAULT '',
+      timing_label TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(target_identity, room, hand_number, street, action_index)
+    )
+  `);
+
   db.exec('CREATE INDEX IF NOT EXISTS idx_hh_hands_played_at ON hh_hands(played_at_utc DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_hh_manual_presupp_target ON hh_manual_presupp(target_identity, updated_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_hh_manual_action_timing_target ON hh_manual_action_timing(target_identity, updated_at DESC)');
 }
 
 function parseMoneyValue(raw) {
@@ -294,7 +370,7 @@ function formatUtcIso(rawUtc) {
 function parseHeaderMeta(text) {
   const headerLine = String(text || '')
     .split(/\r?\n/)
-    .find((line) => /Hand #/i.test(line) && /Card\s+Omaha/i.test(line));
+    .find((line) => /Hand #/i.test(line) && /Omaha/i.test(line));
   if (!headerLine) {
     return {
       gameType: null,
@@ -306,12 +382,14 @@ function parseHeaderMeta(text) {
 
   const gameLabel = String(headerLine.match(/Hand\s+#\d+:\s+(.+?)\s+\([^)]+\)\s*-\s*/i)?.[1] || '').trim();
   const gameCardCountRaw = Number(headerLine.match(/(\d+)\s*Card\s+Omaha/i)?.[1]);
-  const gameCardCount = Number.isFinite(gameCardCountRaw) ? gameCardCountRaw : null;
+  const gameCardCount = Number.isFinite(gameCardCountRaw)
+    ? gameCardCountRaw
+    : (/Omaha\s+Pot\s+Limit/i.test(headerLine) ? 4 : null);
   const limitText = String(headerLine.match(/\(([^)]*)\)/)?.[1] || '').trim() || null;
   const playedAtUtc = formatUtcIso(String(headerLine.match(/-\s+(.+)$/)?.[1] || ''));
 
   let gameType = null;
-  if (gameCardCount && /omaha/i.test(gameLabel)) {
+  if (gameCardCount && /omaha/i.test(gameLabel || headerLine)) {
     gameType = `PLO${gameCardCount}`;
   } else if (gameLabel) {
     gameType = gameLabel;
@@ -324,7 +402,10 @@ function deriveGameCardCountFromGameType(gameTypeRaw) {
   const gameType = String(gameTypeRaw || '').trim();
   if (!gameType) return null;
   const match = gameType.match(/(?:^|[^A-Z0-9])PLO\s*([0-9]+)/i);
-  if (!match?.[1]) return null;
+  if (!match?.[1]) {
+    if (/^PLO$/i.test(gameType)) return 4;
+    return null;
+  }
   const value = Number(match[1]);
   return Number.isFinite(value) ? value : null;
 }
@@ -597,20 +678,23 @@ export function saveHhParsedRecord(dbPath, {
       const playerId = playerIdByName.get(String(playerRaw));
       if (!playerId) continue;
       const showdownCards = parsedHH?.showdown?.showCardsByPlayer?.[playerRaw] || [];
+      const dealtCards = parsedHH?.showdown?.dealtCardsByPlayer?.[playerRaw] || [];
       const position = String(parsedHH?.positionsByPlayer?.[playerRaw] || '').toUpperCase() || null;
       db.prepare(`
-        INSERT INTO hh_hand_players (hand_id, player_id, seat_no, position, stack_start, is_target_candidate, showdown_cards, showdown_result)
-        VALUES (?, ?, NULL, ?, NULL, ?, ?, NULL)
+        INSERT INTO hh_hand_players (hand_id, player_id, seat_no, position, stack_start, is_target_candidate, showdown_cards, dealt_cards, showdown_result)
+        VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, NULL)
         ON CONFLICT(hand_id, player_id) DO UPDATE SET
           position=excluded.position,
           is_target_candidate=excluded.is_target_candidate,
-          showdown_cards=excluded.showdown_cards
+          showdown_cards=excluded.showdown_cards,
+          dealt_cards=excluded.dealt_cards
       `).run(
         handId,
         playerId,
         position,
         String(playerRaw) === String(parsedHH?.targetPlayer || '') ? 1 : 0,
-        Array.isArray(showdownCards) && showdownCards.length ? showdownCards.join(' ') : null
+        Array.isArray(showdownCards) && showdownCards.length ? showdownCards.join(' ') : null,
+        Array.isArray(dealtCards) && dealtCards.length ? dealtCards.join(' ') : null
       );
     }
 
@@ -717,13 +801,16 @@ export function getHhNoteMetaById(dbPath, { noteId, opponent = '', targetIdentit
   if (!row) {
     throw new Error('Раздача не найдена.');
   }
-  if (resolvedTargetIdentity && String(row.target_identity || '') !== resolvedTargetIdentity) {
+  const rowTargetIdentity = String(row.target_identity || '').trim().toLowerCase();
+  if (resolvedTargetIdentity && rowTargetIdentity && rowTargetIdentity !== resolvedTargetIdentity && rowTargetIdentity !== 'unknown') {
     throw new Error('Раздача не принадлежит выбранному игроку.');
   }
 
   return {
     noteId: Number(row.note_id),
-    targetIdentity: String(row.target_identity || ''),
+    targetIdentity: rowTargetIdentity && rowTargetIdentity !== 'unknown'
+      ? rowTargetIdentity
+      : resolvedTargetIdentity,
     handNumber: String(row.hand_number || ''),
     room: String(row.room || '')
   };
@@ -793,6 +880,178 @@ export function upsertHhManualPresupposition(dbPath, {
   });
 }
 
+export function upsertHhManualActionTiming(dbPath, {
+  opponent = '',
+  targetIdentity = '',
+  handNumber = '',
+  room = '',
+  street = '',
+  actionIndex = -1,
+  actionKey = '',
+  timing = ''
+} = {}) {
+  const db = openDb(dbPath);
+  const resolvedTargetIdentity = extractTargetIdentity(targetIdentity || opponent);
+  if (!resolvedTargetIdentity) {
+    throw new Error('target identity обязателен для сохранения HH timing.');
+  }
+
+  const resolvedStreet = normalizeTimingStreet(street);
+  if (!resolvedStreet) {
+    throw new Error('Некорректная улица HH timing.');
+  }
+
+  const resolvedActionIndex = Number(actionIndex);
+  if (!Number.isFinite(resolvedActionIndex) || resolvedActionIndex < 0) {
+    throw new Error('Некорректный индекс действия HH timing.');
+  }
+
+  const resolvedHandNumber = String(handNumber || '').trim();
+  if (!resolvedHandNumber) {
+    throw new Error('handNumber обязателен для сохранения HH timing.');
+  }
+
+  const resolvedRoom = String(room || '').trim().toLowerCase();
+  const resolvedTiming = normalizeTimingLabel(timing);
+  const resolvedActionKey = sanitizeActionKey(actionKey, 600);
+  const nowIso = new Date().toISOString();
+
+  return withTransaction(db, () => {
+    if (resolvedTiming) {
+      db.prepare(`
+        INSERT INTO hh_manual_action_timing (
+          target_identity, room, hand_number, street, action_index, action_key, timing_label, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_identity, room, hand_number, street, action_index) DO UPDATE SET
+          action_key=excluded.action_key,
+          timing_label=excluded.timing_label,
+          updated_at=excluded.updated_at
+      `).run(
+        resolvedTargetIdentity,
+        resolvedRoom,
+        resolvedHandNumber,
+        resolvedStreet,
+        Math.trunc(resolvedActionIndex),
+        resolvedActionKey,
+        resolvedTiming,
+        nowIso
+      );
+    } else {
+      db.prepare(`
+        DELETE FROM hh_manual_action_timing
+        WHERE target_identity = ?
+          AND room = ?
+          AND hand_number = ?
+          AND street = ?
+          AND action_index = ?
+      `).run(
+        resolvedTargetIdentity,
+        resolvedRoom,
+        resolvedHandNumber,
+        resolvedStreet,
+        Math.trunc(resolvedActionIndex)
+      );
+    }
+
+    const rows = db.prepare(`
+      SELECT street, action_index, action_key, timing_label
+      FROM hh_manual_action_timing
+      WHERE target_identity = ?
+        AND room = ?
+        AND hand_number = ?
+      ORDER BY
+        CASE street
+          WHEN 'preflop' THEN 1
+          WHEN 'flop' THEN 2
+          WHEN 'turn' THEN 3
+          WHEN 'river' THEN 4
+          ELSE 99
+        END,
+        action_index ASC
+    `).all(resolvedTargetIdentity, resolvedRoom, resolvedHandNumber);
+
+    return {
+      targetIdentity: resolvedTargetIdentity,
+      room: resolvedRoom,
+      handNumber: resolvedHandNumber,
+      street: resolvedStreet,
+      actionIndex: Math.trunc(resolvedActionIndex),
+      timing: resolvedTiming,
+      timings: rows.map((row) => ({
+        street: String(row?.street || ''),
+        actionIndex: Number(row?.action_index || 0),
+        actionKey: String(row?.action_key || ''),
+        timing: String(row?.timing_label || '')
+      }))
+    };
+  });
+}
+
+export function clearHhManualByHand(dbPath, {
+  opponent = '',
+  targetIdentity = '',
+  handNumber = '',
+  room = ''
+} = {}) {
+  const db = openDb(dbPath);
+  const resolvedTargetIdentity = extractTargetIdentity(targetIdentity || opponent);
+  if (!resolvedTargetIdentity) {
+    throw new Error('Не удалось определить target identity для удаления ручных данных HH.');
+  }
+  const resolvedHandNumber = String(handNumber || '').trim();
+  if (!resolvedHandNumber) {
+    throw new Error('handNumber обязателен для удаления ручных данных HH.');
+  }
+  const resolvedRoom = String(room || '').trim().toLowerCase();
+
+  return withTransaction(db, () => {
+    const presuppDeleted = Number(db.prepare(`
+      DELETE FROM hh_manual_presupp
+      WHERE target_identity = ?
+        AND room = ?
+        AND hand_number = ?
+    `).run(resolvedTargetIdentity, resolvedRoom, resolvedHandNumber).changes || 0);
+    const timingsDeleted = Number(db.prepare(`
+      DELETE FROM hh_manual_action_timing
+      WHERE target_identity = ?
+        AND room = ?
+        AND hand_number = ?
+    `).run(resolvedTargetIdentity, resolvedRoom, resolvedHandNumber).changes || 0);
+    return {
+      targetIdentity: resolvedTargetIdentity,
+      handNumber: resolvedHandNumber,
+      room: resolvedRoom,
+      presuppDeleted,
+      timingsDeleted
+    };
+  });
+}
+
+export function clearHhManualByOpponent(dbPath, { opponent = '', targetIdentity = '' } = {}) {
+  const db = openDb(dbPath);
+  const resolvedTargetIdentity = extractTargetIdentity(targetIdentity || opponent);
+  if (!resolvedTargetIdentity) {
+    throw new Error('Не удалось определить target identity для удаления ручных данных HH.');
+  }
+
+  return withTransaction(db, () => {
+    const presuppDeleted = Number(db.prepare(`
+      DELETE FROM hh_manual_presupp
+      WHERE target_identity = ?
+    `).run(resolvedTargetIdentity).changes || 0);
+    const timingsDeleted = Number(db.prepare(`
+      DELETE FROM hh_manual_action_timing
+      WHERE target_identity = ?
+    `).run(resolvedTargetIdentity).changes || 0);
+    return {
+      targetIdentity: resolvedTargetIdentity,
+      presuppDeleted,
+      timingsDeleted
+    };
+  });
+}
+
 function pruneOrphanHhRows(db) {
   const handsDeleted = Number(db.prepare(`
     DELETE FROM hh_hands
@@ -833,12 +1092,17 @@ export function clearHhHandsByOpponent(dbPath, { opponent = '', targetIdentity =
   if (!resolvedTargetIdentity) {
     throw new Error('Не указан оппонент для удаления HH данных.');
   }
+  const likeToken = `%_${resolvedTargetIdentity} %`;
 
   return withTransaction(db, () => {
     const notesDeleted = Number(db.prepare(`
       DELETE FROM hh_notes
       WHERE target_identity = ?
-    `).run(resolvedTargetIdentity).changes || 0);
+         OR lower(preflop) LIKE ?
+         OR lower(flop) LIKE ?
+         OR lower(turn) LIKE ?
+         OR lower(river) LIKE ?
+    `).run(resolvedTargetIdentity, likeToken, likeToken, likeToken, likeToken).changes || 0);
 
     const { handsDeleted } = pruneOrphanHhRows(db);
     db.prepare('DELETE FROM hh_profile_cache WHERE target_identity = ?').run(resolvedTargetIdentity);
@@ -878,7 +1142,9 @@ function normalizeProfileFilters(filters = {}) {
     potBuckets: [],
     limits: [],
     vsOpponent: '',
-    recentLimit: 'all'
+    cardsVisibility: 'all',
+    recentLimit: 'all',
+    manualOnly: false
   };
 
   const parseList = (value) => {
@@ -918,10 +1184,16 @@ function normalizeProfileFilters(filters = {}) {
     .filter((item) => allowedLimits.has(item));
 
   out.vsOpponent = String(filters.vsOpponent || '').trim();
+  const cardsVisibilityRaw = String(filters.cardsVisibility || filters.cardsMode || filters.cards || '')
+    .trim()
+    .toLowerCase();
+  out.cardsVisibility = ['showdown', 'known'].includes(cardsVisibilityRaw) ? cardsVisibilityRaw : 'all';
 
   const allowedRecentLimits = new Set(['all', '50', '20']);
   const recentRaw = String(filters.recentLimit || 'all').trim().toLowerCase();
   out.recentLimit = allowedRecentLimits.has(recentRaw) ? recentRaw : 'all';
+  const manualRaw = String(filters.manualOnly || '').trim().toLowerCase();
+  out.manualOnly = manualRaw === '1' || manualRaw === 'true' || filters.manualOnly === true;
 
   return out;
 }
@@ -1120,6 +1392,25 @@ function appendVsOpponentCondition(sqlParts, params, db, targetIdentity, vsOppon
   params.push(...versusIds);
 }
 
+function appendKnownCardsCondition(sqlParts, params, targetIdentity, cardsVisibility) {
+  const visibility = String(cardsVisibility || '').trim().toLowerCase();
+  if (!['showdown', 'known'].includes(visibility)) return;
+  const cardsPredicate = visibility === 'known'
+    ? "(trim(COALESCE(hp.showdown_cards, '')) <> '' OR trim(COALESCE(hp.dealt_cards, '')) <> '')"
+    : "(trim(COALESCE(hp.showdown_cards, '')) <> '')";
+  sqlParts.push(`
+    AND EXISTS (
+      SELECT 1
+      FROM hh_hand_players hp
+      JOIN hh_players p ON p.id = hp.player_id
+      WHERE hp.hand_id = h.id
+        AND (p.player_key = ? OR lower(COALESCE(p.display_name, '')) = ?)
+        AND ${cardsPredicate}
+    )
+  `);
+  params.push(targetIdentity, targetIdentity);
+}
+
 export function getHhProfileRows(dbPath, { opponent, limit = HH_PROFILE_ROWS_DEFAULT, filters = {} } = {}) {
   const db = openDb(dbPath);
   const targetIdentity = extractTargetIdentity(opponent);
@@ -1130,8 +1421,14 @@ export function getHhProfileRows(dbPath, { opponent, limit = HH_PROFILE_ROWS_DEF
       appliedFilters: normalizeProfileFilters(filters)
     };
   }
-  const safeLimit = Number.isFinite(limit)
-    ? Math.max(1, Math.min(HH_PROFILE_ROWS_MAX, Math.trunc(limit)))
+  const numericLimit = Number(limit);
+  const safeLimit = Number.isFinite(numericLimit)
+    ? Math.max(
+      1,
+      Number.isFinite(HH_PROFILE_ROWS_MAX)
+        ? Math.min(HH_PROFILE_ROWS_MAX, Math.trunc(numericLimit))
+        : Math.trunc(numericLimit)
+    )
     : HH_PROFILE_ROWS_DEFAULT;
   const safeFilters = normalizeProfileFilters(filters);
   const likeToken = `%_${targetIdentity} %`;
@@ -1179,13 +1476,13 @@ export function getHhProfileRows(dbPath, { opponent, limit = HH_PROFILE_ROWS_DEF
     FROM hh_notes n
     JOIN hh_hands h ON h.id = n.hand_id
     LEFT JOIN hh_manual_presupp m
-      ON m.target_identity = n.target_identity
+      ON m.target_identity = ?
      AND lower(COALESCE(m.room, '')) = lower(COALESCE(h.room, ''))
      AND m.hand_number = h.hand_number
     WHERE ${baseWhere}
   `
   ];
-  const params = [targetIdentity, likeToken, likeToken, likeToken, likeToken];
+  const params = [targetIdentity, targetIdentity, likeToken, likeToken, likeToken, likeToken];
 
   appendPlayerGroupCondition(sqlParts, params, safeFilters.playerGroups);
   appendDateCondition(sqlParts, params, safeFilters.datePreset);
@@ -1196,6 +1493,27 @@ export function getHhProfileRows(dbPath, { opponent, limit = HH_PROFILE_ROWS_DEF
   }
   appendPotBucketCondition(sqlParts, params, safeFilters.potBuckets);
   appendVsOpponentCondition(sqlParts, params, db, targetIdentity, safeFilters.vsOpponent);
+  appendKnownCardsCondition(sqlParts, params, targetIdentity, safeFilters.cardsVisibility);
+  if (safeFilters.manualOnly) {
+    sqlParts.push(`
+      AND (
+        trim(COALESCE(m.preflop, '')) <> ''
+        OR trim(COALESCE(m.flop, '')) <> ''
+        OR trim(COALESCE(m.turn, '')) <> ''
+        OR trim(COALESCE(m.river, '')) <> ''
+        OR trim(COALESCE(m.hand_presupposition, '')) <> ''
+        OR EXISTS (
+          SELECT 1
+          FROM hh_manual_action_timing mt
+          WHERE mt.target_identity = ?
+            AND lower(COALESCE(mt.room, '')) = lower(COALESCE(h.room, ''))
+            AND mt.hand_number = h.hand_number
+            AND trim(COALESCE(mt.timing_label, '')) <> ''
+        )
+      )
+    `);
+    params.push(targetIdentity);
+  }
 
   sqlParts.push(`
     ORDER BY
@@ -1206,6 +1524,27 @@ export function getHhProfileRows(dbPath, { opponent, limit = HH_PROFILE_ROWS_DEF
   params.push(safeLimit);
 
   const rowsRaw = db.prepare(sqlParts.join('\n')).all(...params);
+
+  const timingRows = db.prepare(`
+    SELECT room, hand_number, street, action_index, action_key, timing_label
+    FROM hh_manual_action_timing
+    WHERE target_identity = ?
+  `).all(targetIdentity);
+  const timingMap = new Map();
+  for (const timingRow of timingRows) {
+    const key = makeHandMapKey(
+      targetIdentity,
+      String(timingRow?.room || '').trim().toLowerCase(),
+      String(timingRow?.hand_number || '').trim()
+    );
+    if (!timingMap.has(key)) timingMap.set(key, []);
+    timingMap.get(key).push({
+      street: String(timingRow?.street || ''),
+      actionIndex: Number(timingRow?.action_index || 0),
+      actionKey: String(timingRow?.action_key || ''),
+      timing: String(timingRow?.timing_label || '')
+    });
+  }
 
   const rows = rowsRaw.map((row) => ({
     row: Number(row.id),
@@ -1222,6 +1561,13 @@ export function getHhProfileRows(dbPath, { opponent, limit = HH_PROFILE_ROWS_DEF
     handPresupposition: String(row.manual_hand_presupposition || ''),
     handNumber: String(row.hand_number || ''),
     room: String(row.room || '').toLowerCase(),
+    manualTimings: timingMap.get(
+      makeHandMapKey(
+        targetIdentity,
+        String(row.room || '').toLowerCase(),
+        String(row.hand_number || '')
+      )
+    ) || [],
     gameType: String(row.game_type || ''),
     gameCardCount: Number.isFinite(Number(row.resolved_game_card_count))
       ? Number(row.resolved_game_card_count)

@@ -251,6 +251,34 @@ test('visual profile stores all-in counts in dedicated lane and keeps sample met
   assert.equal(sample.meta.activePlayers, 3);
 });
 
+test('visual profile sample meta does not coerce null numeric fields into PLO0 or 0-0 limit', () => {
+  const rows = [
+    {
+      rowLabel: '#DB:700',
+      handNumber: '376591149',
+      room: 'cpr',
+      gameType: 'PLO',
+      gameCardCount: null,
+      sb: null,
+      bb: null,
+      activePlayersCount: null,
+      finalPotBb: null,
+      playedAtUtc: '2026-02-02T18:18:15Z',
+      flop: '(10) BTN_88luckycat88 b50 onAdThTd / BB_happysally c',
+      turn: '',
+      river: ''
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, { opponent: '88luckycat88' });
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const bucket5 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '5');
+  const sample = JSON.parse(bucket5.samples.all[0]);
+
+  assert.equal(sample.meta.game, 'PLO');
+  assert.equal(sample.meta.limit, '');
+});
+
 test('visual profile keeps flop bucket in normal lane when all-in is only a later call', () => {
   const rows = [
     {
@@ -831,8 +859,8 @@ test('visual profile section order keeps River Once above Check-Bet-Bet', () => 
     'flop',
     'betbet',
     'probes',
-    'riverBxb',
     'riverOnce',
+    'riverBxb',
     'riverXbb',
     'betbetbet',
     'tot'

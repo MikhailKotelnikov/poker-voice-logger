@@ -2,6 +2,7 @@ const opponentInput = document.getElementById('opponent-name');
 const opponentSuggestions = document.getElementById('opponent-suggestions');
 const addOpponentBtn = document.getElementById('add-opponent');
 const clearOpponentsBtn = document.getElementById('clear-opponents');
+const clearHhDbBtn = document.getElementById('clear-hh-db');
 const opponentList = document.getElementById('opponent-list');
 const activeOpponentEl = document.getElementById('active-opponent');
 const recordStatusEl = document.getElementById('record-status');
@@ -28,6 +29,44 @@ const profileTooltipEl = document.getElementById('profile-tooltip');
 
 const STORAGE_KEY = 'pokerVoiceOpponents';
 const PARSED_FIELDS = ['preflop', 'flop', 'turn', 'river', 'presupposition'];
+const HH_MANUAL_FIELD_DEFS = [
+  { apiField: 'preflop', key: 'preflop', label: 'preflop' },
+  { apiField: 'flop', key: 'flop', label: 'flop' },
+  { apiField: 'turn', key: 'turn', label: 'turn' },
+  { apiField: 'river', key: 'river', label: 'river' },
+  { apiField: 'hand_presupposition', key: 'handPresupposition', label: 'hand presupposition' }
+];
+const HH_MANUAL_PRESUPP_PRESETS = [
+  'i agro',
+  'i gc',
+  'i gc+++'
+];
+const HH_TIMING_OPTIONS = [
+  '0% t',
+  '10% t',
+  '20% t',
+  '30% t',
+  '40% t',
+  '50% t',
+  '60% t',
+  '70% t',
+  '80% t',
+  '90% t',
+  '100% t',
+  '50% tb',
+  '70% tb',
+  '90% tb',
+  '100% tb'
+];
+const HH_STREET_KEYS = new Set(['preflop', 'flop', 'turn', 'river']);
+const HH_MANUAL_REPORT_SOURCE = 'poker-voice-web-hh-manual';
+const HH_REPORT_FIELD_MAP = {
+  preflop: 'preflop',
+  flop: 'flop',
+  turn: 'turn',
+  river: 'river',
+  hand_presupposition: 'presupposition'
+};
 
 let opponents = loadOpponents();
 let allOpponentIndex = [];
@@ -55,29 +94,47 @@ let isBatchProcessing = false;
 const profileCache = new Map();
 const profileListCache = new Map();
 const PROFILE_DEFAULT_SOURCE = 'voice';
-const PROFILE_VS_DEFAULTS_KEY = 'pokerVoiceProfileVsDefaultsV1';
-const PROFILE_VS_DEFAULT_KEY = '__all__';
+const PROFILE_MY_NICK_BY_ROOM_KEY = 'pokerVoiceMyNickByRoomV1';
 let profileViewMode = 'chart';
+let hhManualRecorder = null;
+let hhManualChunks = [];
+let hhManualRecordingKey = '';
+let hhManualRecordingContext = null;
+const hhManualReportDrafts = new Map();
 
-function loadProfileVsDefaults() {
+function loadProfileMyNickByRoom() {
   try {
-    const raw = localStorage.getItem(PROFILE_VS_DEFAULTS_KEY);
+    const raw = localStorage.getItem(PROFILE_MY_NICK_BY_ROOM_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    return parsed;
+    const out = {};
+    Object.entries(parsed).forEach(([key, value]) => {
+      const roomKey = String(key || '').trim().toLowerCase();
+      const nickname = String(value || '').trim();
+      if (!roomKey || !nickname) return;
+      out[roomKey] = nickname;
+    });
+    return out;
   } catch {
     return {};
   }
 }
 
-function saveProfileVsDefaults(defaults = {}) {
+function saveProfileMyNickByRoom(map = {}) {
   try {
-    localStorage.setItem(PROFILE_VS_DEFAULTS_KEY, JSON.stringify(defaults));
+    localStorage.setItem(PROFILE_MY_NICK_BY_ROOM_KEY, JSON.stringify(map));
   } catch {}
 }
 
-let profileVsDefaults = loadProfileVsDefaults();
+let profileMyNickByRoom = loadProfileMyNickByRoom();
+let profileTooltipPinned = false;
+let profileTooltipSampleInput = null;
+let profileVsMeEnabled = false;
+let profileMirrorFilters = null;
+let profileMirrorFilterOptions = { rooms: [] };
+let profileMirrorVsHimEnabled = true;
+let profileMirrorRequestId = 0;
 
 function createDefaultProfileFilters() {
   return {
@@ -87,13 +144,16 @@ function createDefaultProfileFilters() {
     rooms: [],
     potBuckets: [],
     limits: [],
-    vsOpponent: String(profileVsDefaults?.[PROFILE_VS_DEFAULT_KEY] || '').trim(),
-    recentLimit: 'all'
+    vsOpponent: '',
+    cardsVisibility: 'showdown',
+    recentLimit: 'all',
+    manualOnly: false
   };
 }
 
 let profileFilters = createDefaultProfileFilters();
 let profileFilterOptions = { rooms: [] };
+profileMirrorFilters = createDefaultProfileFilters();
 
 function normalizeProfileSource(source) {
   const value = String(source || PROFILE_DEFAULT_SOURCE).trim().toLowerCase();
@@ -116,7 +176,9 @@ function serializeProfileFilters(filters = profileFilters) {
     `pots=${normalizeList(filters.potBuckets)}`,
     `limits=${normalizeList(filters.limits)}`,
     `vs=${String(filters.vsOpponent || '').trim().toLowerCase()}`,
-    `recent=${String(filters.recentLimit || 'all')}`
+    `cards=${String(filters.cardsVisibility || 'showdown')}`,
+    `recent=${String(filters.recentLimit || 'all')}`,
+    `manual=${filters.manualOnly ? '1' : '0'}`
   ].join('|');
 }
 
@@ -175,7 +237,7 @@ function canSaveReport() {
     reportDraft
     && reportDraft.opponent
     && (reportDraft.row || lastSavedRow)
-    && !(mediaRecorder && mediaRecorder.state === 'recording')
+    && !isAnyRecordingActive()
     && !isBatchProcessing
   );
 }
@@ -457,6 +519,20 @@ function parseTooltipSample(sampleText) {
         rowId: String(parsed.rowLabel || '').trim(),
         focusStreet: String(parsed.focusStreet || '').toUpperCase(),
         meta: parsed?.meta && typeof parsed.meta === 'object' ? parsed.meta : null,
+        manual: normalizeHhManualValues(parsed?.manual),
+        context: parsed?.context && typeof parsed.context === 'object'
+          ? {
+            row: Number.isFinite(Number(parsed.context.row)) && Number(parsed.context.row) > 0
+              ? Math.trunc(Number(parsed.context.row))
+              : null,
+            handNumber: String(parsed.context.handNumber || ''),
+            room: String(parsed.context.room || ''),
+            opponent: String(parsed.context.opponent || ''),
+            source: String(parsed.context.source || ''),
+            targetIdentity: String(parsed.context.targetIdentity || '')
+          }
+          : null,
+        timings: normalizeHhTimingEntries(parsed?.timings),
         streets
       };
     }
@@ -516,6 +592,194 @@ function extractTargetIdentity(value) {
     .replace(/[^a-z0-9]/g, '');
 }
 
+function emptyHhManualValues() {
+  return {
+    preflop: '',
+    flop: '',
+    turn: '',
+    river: '',
+    handPresupposition: ''
+  };
+}
+
+function normalizeHhManualValues(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  return {
+    preflop: String(source.preflop || ''),
+    flop: String(source.flop || ''),
+    turn: String(source.turn || ''),
+    river: String(source.river || ''),
+    handPresupposition: String(source.handPresupposition || source.hand_presupposition || '')
+  };
+}
+
+function normalizeHhTimingEntries(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((item) => ({
+      street: String(item?.street || '').trim().toLowerCase(),
+      actionIndex: Number(item?.actionIndex),
+      actionKey: String(item?.actionKey || ''),
+      timing: String(item?.timing || '').trim().toLowerCase()
+    }))
+    .filter((item) => ['preflop', 'flop', 'turn', 'river'].includes(item.street)
+      && Number.isFinite(item.actionIndex)
+      && item.actionIndex >= 0);
+}
+
+function normalizeTimingValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function applyTimingSelectWidth(selectEl) {
+  if (!selectEl) return;
+  const normalizedValue = normalizeTimingValue(selectEl.value);
+  const selectedOption = selectEl.options[selectEl.selectedIndex];
+  const selectedLabel = String(selectedOption?.textContent || selectEl.value || '').trim();
+  const contentLength = selectedLabel.length || 1;
+  const widthCh = normalizedValue
+    ? Math.max(4.8, Math.min(13.5, contentLength + 2.4))
+    : 2.2;
+  selectEl.style.width = `${widthCh}ch`;
+  selectEl.classList.toggle('pt-timing-select-empty', !normalizedValue);
+}
+
+function canEditHhSample(parsed) {
+  const context = parsed?.context && typeof parsed.context === 'object' ? parsed.context : null;
+  if (!context) return false;
+  if (String(context.source || '').trim().toLowerCase() !== 'hh') return false;
+  return Boolean(String(context.handNumber || '').trim());
+}
+
+function timingLookupKey(street, actionIndex) {
+  return `${String(street || '').trim().toLowerCase()}::${Number(actionIndex)}`;
+}
+
+function getParsedTimingValue(parsed, street, actionIndex, actionKey = '') {
+  const timings = normalizeHhTimingEntries(parsed?.timings);
+  const normalizedActionKey = String(actionKey || '').trim();
+  if (normalizedActionKey) {
+    for (const item of timings) {
+      if (String(item.street || '').trim().toLowerCase() !== String(street || '').trim().toLowerCase()) continue;
+      if (Number(item.actionIndex) !== Number(actionIndex)) continue;
+      if (String(item.actionKey || '').trim() === normalizedActionKey) {
+        return String(item.timing || '');
+      }
+    }
+  }
+  const key = timingLookupKey(street, actionIndex);
+  for (const item of timings) {
+    if (timingLookupKey(item.street, item.actionIndex) === key) {
+      return String(item.timing || '');
+    }
+  }
+  return '';
+}
+
+function setParsedManualFieldsFromApi(parsed, fields = {}) {
+  if (!parsed || typeof parsed !== 'object') return;
+  parsed.manual = normalizeHhManualValues({
+    preflop: fields.preflop,
+    flop: fields.flop,
+    turn: fields.turn,
+    river: fields.river,
+    handPresupposition: fields.hand_presupposition
+  });
+}
+
+function setParsedTimingFieldsFromApi(parsed, timings = []) {
+  if (!parsed || typeof parsed !== 'object') return;
+  parsed.timings = normalizeHhTimingEntries(timings);
+}
+
+function resolveProfileModalOpponent(parsed) {
+  const contextOpponent = String(parsed?.context?.opponent || '').trim();
+  if (contextOpponent) return contextOpponent;
+  return String(profileModalOpponent || '').trim();
+}
+
+function normalizeManualReportField(field) {
+  const key = String(field || '').trim().toLowerCase();
+  return String(HH_REPORT_FIELD_MAP[key] || '');
+}
+
+function buildHhManualReportKey(parsed) {
+  const context = parsed?.context && typeof parsed.context === 'object' ? parsed.context : {};
+  const hand = String(context.handNumber || '').trim();
+  const room = String(context.room || '').trim().toLowerCase();
+  const row = Number(context.row);
+  if (hand) return `${hand}|${room}`;
+  if (Number.isFinite(row) && row > 0) return `row:${Math.trunc(row)}`;
+  return '';
+}
+
+function parsedSampleMatchContext(parsedContext = {}, sampleContext = {}) {
+  const parsedHandNumber = String(parsedContext.handNumber || '').trim();
+  const sampleHandNumber = String(sampleContext.handNumber || '').trim();
+  const parsedRoom = String(parsedContext.room || '').trim().toLowerCase();
+  const sampleRoom = String(sampleContext.room || '').trim().toLowerCase();
+  if (parsedHandNumber && sampleHandNumber && parsedRoom && sampleRoom) {
+    if (parsedHandNumber === sampleHandNumber && parsedRoom === sampleRoom) {
+      const parsedTarget = String(parsedContext.targetIdentity || '').trim().toLowerCase();
+      const sampleTarget = String(sampleContext.targetIdentity || '').trim().toLowerCase();
+      return !parsedTarget || !sampleTarget || parsedTarget === sampleTarget;
+    }
+  }
+  const parsedRow = Number(parsedContext.row);
+  const sampleRow = Number(sampleContext.row);
+  return Number.isFinite(parsedRow) && parsedRow > 0 && parsedRow === sampleRow;
+}
+
+function syncProfileTooltipSampleInput(parsed) {
+  if (!parsed || !profileTooltipSampleInput) return;
+  const parsedContext = parsed.context && typeof parsed.context === 'object' ? parsed.context : null;
+  if (!parsedContext) return;
+  const patchOne = (sampleText) => {
+    const text = String(sampleText || '').trim();
+    if (!text) return sampleText;
+    try {
+      const payload = JSON.parse(text);
+      if (!payload || payload.type !== 'profile_sample_v2') return sampleText;
+      const sampleContext = payload.context && typeof payload.context === 'object' ? payload.context : {};
+      if (!parsedSampleMatchContext(parsedContext, sampleContext)) return sampleText;
+      payload.manual = normalizeHhManualValues(parsed.manual);
+      const timings = normalizeHhTimingEntries(parsed.timings);
+      if (timings.length) {
+        payload.timings = timings;
+      } else {
+        delete payload.timings;
+      }
+      return JSON.stringify(payload);
+    } catch {
+      return sampleText;
+    }
+  };
+
+  if (Array.isArray(profileTooltipSampleInput)) {
+    profileTooltipSampleInput = profileTooltipSampleInput.map((item) => patchOne(item));
+    return;
+  }
+  if (typeof profileTooltipSampleInput === 'string') {
+    profileTooltipSampleInput = patchOne(profileTooltipSampleInput);
+  }
+}
+
+function isMainRecordingActive() {
+  return Boolean(mediaRecorder && mediaRecorder.state === 'recording');
+}
+
+function isHhManualRecordingActive() {
+  return Boolean(hhManualRecorder && hhManualRecorder.state === 'recording');
+}
+
+function isAnyRecordingActive() {
+  return isMainRecordingActive() || isHhManualRecordingActive();
+}
+
+function canMutateHhManual() {
+  return !isAnyRecordingActive() && !isBatchProcessing;
+}
+
 function markHeroSegments(streets = [], targetIdentity = '') {
   if (!targetIdentity) return streets;
   const suffix = `_${targetIdentity}`;
@@ -539,6 +803,11 @@ function renderTooltipSegmentLine(segments = [], options = {}) {
   const showBoard = options.showBoard !== false;
   const showExtras = options.showExtras !== false;
   const showAllIn = options.showAllIn !== false;
+  const enableTiming = options.enableTiming === true;
+  const timingStreet = String(options.timingStreet || '').trim().toLowerCase();
+  const onTimingChange = typeof options.onTimingChange === 'function' ? options.onTimingChange : null;
+  const getTimingValue = typeof options.getTimingValue === 'function' ? options.getTimingValue : null;
+  const hideEmptyTimingControls = options.hideEmptyTimingControls === true;
 
   const line = document.createElement('div');
   line.className = 'pt-line';
@@ -609,6 +878,59 @@ function renderTooltipSegmentLine(segments = [], options = {}) {
       item.appendChild(extra);
     }
 
+    const hasTimingContext = Boolean(timingStreet && showAction && segment.action);
+    const currentTiming = hasTimingContext && getTimingValue
+      ? normalizeTimingValue(getTimingValue(timingStreet, index, segment))
+      : '';
+    if (hasTimingContext) {
+      if (enableTiming) {
+        if (!(hideEmptyTimingControls && !currentTiming)) {
+          const timingSelect = document.createElement('select');
+          timingSelect.className = 'pt-timing-select';
+          const emptyOption = document.createElement('option');
+          emptyOption.value = '';
+          emptyOption.textContent = 't';
+          timingSelect.appendChild(emptyOption);
+          HH_TIMING_OPTIONS.forEach((value) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value;
+            timingSelect.appendChild(option);
+          });
+          timingSelect.value = currentTiming;
+          applyTimingSelectWidth(timingSelect);
+          const previousTiming = { value: currentTiming };
+          timingSelect.addEventListener('focus', () => {
+            previousTiming.value = timingSelect.value;
+          });
+          timingSelect.addEventListener('change', async () => {
+            if (!onTimingChange) return;
+            const selected = normalizeTimingValue(timingSelect.value);
+            timingSelect.disabled = true;
+            const ok = await onTimingChange({
+              street: timingStreet,
+              actionIndex: index,
+              actionKey: String(segment.raw || '').trim(),
+              timing: selected
+            });
+            timingSelect.disabled = false;
+            if (!ok) {
+              timingSelect.value = previousTiming.value;
+            } else {
+              previousTiming.value = selected;
+            }
+            applyTimingSelectWidth(timingSelect);
+          });
+          item.appendChild(timingSelect);
+        }
+      } else if (currentTiming) {
+        const timingBadge = document.createElement('span');
+        timingBadge.className = 'pt-timing-badge';
+        timingBadge.textContent = currentTiming;
+        item.appendChild(timingBadge);
+      }
+    }
+
     if (!segment.pos && !segment.action && !segment.cards.length && !segment.board.length && !segment.extras.length) {
       const raw = document.createElement('span');
       raw.className = 'pt-extra';
@@ -677,49 +999,608 @@ function handleProfileTooltipWheel(event) {
   event.preventDefault();
 }
 
-function buildProfileTooltipContent(sampleInput) {
+function refreshPinnedProfileTooltip() {
+  if (!profileTooltipPinned || !profileTooltipEl || profileTooltipEl.classList.contains('hidden')) return;
+  if (!profileTooltipSampleInput) return;
+  profileTooltipEl.innerHTML = '';
+  profileTooltipEl.appendChild(buildProfileTooltipContent(profileTooltipSampleInput, { interactive: true }));
+}
+
+function pinProfileTooltip() {
+  if (!profileTooltipEl || profileTooltipEl.classList.contains('hidden')) return;
+  if (profileTooltipPinned) return;
+  profileTooltipPinned = true;
+  profileTooltipEl.classList.add('pinned');
+  refreshPinnedProfileTooltip();
+}
+
+function unpinProfileTooltip() {
+  profileTooltipPinned = false;
+  if (!profileTooltipEl) return;
+  profileTooltipEl.classList.remove('pinned');
+}
+
+function hhManualFieldDef(apiField) {
+  return HH_MANUAL_FIELD_DEFS.find((item) => item.apiField === String(apiField || '').trim().toLowerCase()) || null;
+}
+
+function hhManualFieldValue(parsed, apiField) {
+  const def = hhManualFieldDef(apiField);
+  if (!def) return '';
+  return String(parsed?.manual?.[def.key] || '');
+}
+
+function setHhManualFieldValue(parsed, apiField, value) {
+  const def = hhManualFieldDef(apiField);
+  if (!def) return;
+  parsed.manual = normalizeHhManualValues(parsed?.manual);
+  parsed.manual[def.key] = String(value || '');
+}
+
+function getHhManualInputLabel(apiField) {
+  const def = hhManualFieldDef(apiField);
+  return def?.label || String(apiField || '');
+}
+
+async function saveHhManualTextField(parsed, apiField, value) {
+  if (!canEditHhSample(parsed)) {
+    setStatus('Эта раздача не из HH DB — редактирование недоступно.', 'error');
+    return false;
+  }
+  if (!canMutateHhManual()) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return false;
+  }
+
+  const opponent = resolveProfileModalOpponent(parsed);
+  if (!opponent) {
+    setStatus('Не удалось определить выбранного игрока.', 'error');
+    return false;
+  }
+  const context = parsed.context || {};
+  const field = String(apiField || '').trim().toLowerCase();
+  const label = getHhManualInputLabel(field);
+
+  try {
+    setStatus(`Сохраняю ${label}...`);
+    const response = await fetch('/api/hh-manual-presupp-text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        opponent,
+        row: context.row,
+        handNumber: context.handNumber,
+        room: context.room,
+        field,
+        value
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка сохранения HH presupposition.');
+    }
+    setParsedManualFieldsFromApi(parsed, data.fields || {});
+    syncProfileTooltipSampleInput(parsed);
+    clearProfileCacheByOpponent(opponent);
+    refreshPinnedProfileTooltip();
+    setStatus(`${label} сохранено.`, 'ok');
+    return true;
+  } catch (error) {
+    setStatus(error.message || 'Ошибка сохранения HH presupposition.', 'error');
+    return false;
+  }
+}
+
+async function saveHhManualTiming(parsed, { street, actionIndex, actionKey, timing }) {
+  if (!canEditHhSample(parsed)) {
+    setStatus('Эта раздача не из HH DB — тайминги недоступны.', 'error');
+    return false;
+  }
+  if (!canMutateHhManual()) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return false;
+  }
+  const opponent = resolveProfileModalOpponent(parsed);
+  if (!opponent) {
+    setStatus('Не удалось определить выбранного игрока.', 'error');
+    return false;
+  }
+  const context = parsed.context || {};
+  const normalizedStreet = String(street || '').trim().toLowerCase();
+  if (!HH_STREET_KEYS.has(normalizedStreet)) {
+    setStatus('Некорректная улица для тайминга.', 'error');
+    return false;
+  }
+
+  try {
+    const response = await fetch('/api/hh-manual-timing-text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        opponent,
+        row: context.row,
+        handNumber: context.handNumber,
+        room: context.room,
+        street: normalizedStreet,
+        actionIndex,
+        actionKey,
+        timing: normalizeTimingValue(timing)
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка сохранения HH timing.');
+    }
+    setParsedTimingFieldsFromApi(parsed, data.timings || []);
+    syncProfileTooltipSampleInput(parsed);
+    clearProfileCacheByOpponent(opponent);
+    refreshPinnedProfileTooltip();
+    if (normalizeTimingValue(timing)) {
+      setStatus('Тайминг сохранен.', 'ok');
+    } else {
+      setStatus('Тайминг очищен.', 'ok');
+    }
+    return true;
+  } catch (error) {
+    setStatus(error.message || 'Ошибка сохранения HH timing.', 'error');
+    return false;
+  }
+}
+
+function resetHhManualRecordingState() {
+  hhManualRecorder = null;
+  hhManualChunks = [];
+  hhManualRecordingKey = '';
+  hhManualRecordingContext = null;
+}
+
+async function submitHhManualAudioRecording() {
+  const context = hhManualRecordingContext;
+  if (!context) {
+    resetHhManualRecordingState();
+    return;
+  }
+  if (!hhManualChunks.length) {
+    setStatus('Нет аудио для сохранения поля.', 'error');
+    resetHhManualRecordingState();
+    return;
+  }
+
+  const {
+    parsed,
+    apiField,
+    opponent,
+    reportScopeKey,
+    previousValue,
+    onStateChange
+  } = context;
+  const resolvedOpponent = String(opponent || resolveProfileModalOpponent(parsed) || '').trim();
+  const payloadContext = parsed?.context && typeof parsed.context === 'object' ? parsed.context : {};
+  const field = String(apiField || '').trim().toLowerCase();
+  const reportField = normalizeManualReportField(field);
+  const fieldLabel = getHhManualInputLabel(field);
+  const blob = new Blob(hhManualChunks, { type: 'audio/webm' });
+  const formData = new FormData();
+  formData.append('audio', blob, 'hh-manual.webm');
+  formData.append('opponent', resolvedOpponent);
+  formData.append('field', field);
+  formData.append('row', String(payloadContext.row || ''));
+  formData.append('handNumber', String(payloadContext.handNumber || ''));
+  formData.append('room', String(payloadContext.room || ''));
+
+  try {
+    setStatus(`Транскрибирую ${fieldLabel}...`);
+    const response = await fetch('/api/hh-manual-presupp-audio', {
+      method: 'POST',
+      body: formData
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка голосового HH presupposition.');
+    }
+
+    setParsedManualFieldsFromApi(parsed, data.fields || {});
+    syncProfileTooltipSampleInput(parsed);
+    clearProfileCacheByOpponent(resolvedOpponent);
+    refreshPinnedProfileTooltip();
+
+    if (reportScopeKey && reportField) {
+      hhManualReportDrafts.set(reportScopeKey, {
+        source: HH_MANUAL_REPORT_SOURCE,
+        sessionId: createSessionId(),
+        createdAt: new Date().toISOString(),
+        opponent: resolvedOpponent,
+        row: Number.isFinite(Number(payloadContext.row)) ? Number(payloadContext.row) : null,
+        handNumber: String(payloadContext.handNumber || ''),
+        room: String(payloadContext.room || ''),
+        field: reportField,
+        transcript: String(data.transcript || ''),
+        previousValue: String(previousValue || ''),
+        newValue: String(data.value || ''),
+        parser: data.parser || null
+      });
+    }
+
+    setStatus(`${fieldLabel} обновлено голосом.`, 'ok');
+  } catch (error) {
+    setStatus(error.message || 'Ошибка голосового HH presupposition.', 'error');
+  } finally {
+    resetHhManualRecordingState();
+    if (typeof onStateChange === 'function') onStateChange();
+  }
+}
+
+async function startHhManualAudioRecording(parsed, apiField, onStateChange) {
+  if (!canEditHhSample(parsed)) {
+    setStatus('Эта раздача не из HH DB — редактирование недоступно.', 'error');
+    return;
+  }
+  if (isMainRecordingActive() || isBatchProcessing) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return;
+  }
+
+  const reportScopeKey = buildHhManualReportKey(parsed);
+  if (!reportScopeKey) {
+    setStatus('Не удалось определить ключ раздачи для записи.', 'error');
+    return;
+  }
+  const recordKey = `manual:${reportScopeKey}|${String(apiField || '').trim().toLowerCase()}`;
+  if (isHhManualRecordingActive()) {
+    if (hhManualRecordingKey === recordKey) {
+      hhManualRecorder.stop();
+      return;
+    }
+    setStatus('Уже идет запись другого поля. Остановите ее сначала.', 'error');
+    return;
+  }
+
+  const opponent = resolveProfileModalOpponent(parsed);
+  if (!opponent) {
+    setStatus('Не удалось определить выбранного игрока.', 'error');
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
+    hhManualChunks = [];
+    hhManualRecorder = new MediaRecorder(stream, { mimeType });
+    hhManualRecordingKey = recordKey;
+    hhManualRecordingContext = {
+      parsed,
+      apiField,
+      opponent,
+      reportScopeKey,
+      previousValue: hhManualFieldValue(parsed, apiField),
+      onStateChange
+    };
+
+    hhManualRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        hhManualChunks.push(event.data);
+      }
+    };
+    hhManualRecorder.onstop = async () => {
+      stream.getTracks().forEach((track) => track.stop());
+      await submitHhManualAudioRecording();
+    };
+    hhManualRecorder.onerror = () => {
+      stream.getTracks().forEach((track) => track.stop());
+      setStatus('Ошибка записи аудио для HH поля.', 'error');
+      resetHhManualRecordingState();
+      if (typeof onStateChange === 'function') onStateChange();
+    };
+
+    hhManualRecorder.start();
+    setStatus(`Запись поля ${getHhManualInputLabel(apiField)} запущена. Нажмите "стоп".`, 'ok');
+    if (typeof onStateChange === 'function') onStateChange();
+  } catch (error) {
+    setStatus('Не удалось получить доступ к микрофону.', 'error');
+    resetHhManualRecordingState();
+    if (typeof onStateChange === 'function') onStateChange();
+  }
+}
+
+async function saveHhManualReport(parsed) {
+  const reportKey = buildHhManualReportKey(parsed);
+  if (!reportKey || !hhManualReportDrafts.has(reportKey)) {
+    setStatus('Нет голосового черновика для репорта по этой раздаче.', 'error');
+    return false;
+  }
+
+  const draft = hhManualReportDrafts.get(reportKey);
+  const reportField = normalizeManualReportField(draft?.field || '');
+  if (!reportField) {
+    setStatus('Поле не поддерживает репорт.', 'error');
+    return false;
+  }
+
+  const initialParsed = emptyParsedFields();
+  const finalParsed = emptyParsedFields();
+  initialParsed[reportField] = String(draft.previousValue || '');
+  finalParsed[reportField] = String(draft.newValue || '');
+
+  const payload = {
+    source: draft.source || HH_MANUAL_REPORT_SOURCE,
+    sessionId: draft.sessionId || createSessionId(),
+    createdAt: draft.createdAt || new Date().toISOString(),
+    savedAt: new Date().toISOString(),
+    opponent: String(draft.opponent || resolveProfileModalOpponent(parsed) || profileModalOpponent || '').trim(),
+    row: draft.row,
+    initialTranscript: String(draft.transcript || ''),
+    finalTranscript: String(draft.transcript || ''),
+    initialParsed,
+    finalParsed,
+    parser: draft.parser || null,
+    edits: [
+      {
+        type: 'redictate',
+        field: reportField,
+        at: new Date().toISOString(),
+        transcript: String(draft.transcript || ''),
+        previousValue: String(draft.previousValue || ''),
+        newValue: String(draft.newValue || ''),
+        parser: draft.parser || null
+      }
+    ]
+  };
+
+  try {
+    setStatus('Сохраняю репорт...');
+    const response = await fetch('/api/save-report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Не удалось сохранить репорт.');
+    }
+    setStatus(`Репорт сохранен (${data.id}).`, 'ok');
+    return true;
+  } catch (error) {
+    setStatus(error.message || 'Ошибка сохранения репорта.', 'error');
+    return false;
+  }
+}
+
+function createHhManualFieldEditor(parsed, apiField, options = {}) {
+  const canEdit = canEditHhSample(parsed) && options.readOnly !== true;
+  const field = String(apiField || '').trim().toLowerCase();
+  const scopeKey = buildHhManualReportKey(parsed);
+  const recordKey = scopeKey ? `manual:${scopeKey}|${field}` : '';
+  const currentValue = hhManualFieldValue(parsed, field);
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'pt-manual-box';
+  if (options.extraClass) {
+    wrapper.classList.add(options.extraClass);
+  }
+
+  const inputWrap = document.createElement('div');
+  inputWrap.className = 'pt-manual-input-wrap';
+  const voiceBtn = document.createElement('button');
+  voiceBtn.type = 'button';
+  voiceBtn.className = 'pt-manual-mic-btn';
+  voiceBtn.title = 'голосовой ввод';
+  voiceBtn.disabled = !canEdit;
+  const refreshVoiceLabel = () => {
+    voiceBtn.textContent = isHhManualRecordingActive() && hhManualRecordingKey === recordKey ? '■' : '🎤';
+    const disabledByOtherRecord = isHhManualRecordingActive() && hhManualRecordingKey !== recordKey;
+    voiceBtn.disabled = !canEdit || disabledByOtherRecord;
+  };
+  refreshVoiceLabel();
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'pt-manual-input';
+  input.value = currentValue;
+  input.placeholder = canEdit ? '' : '—';
+  input.disabled = !canEdit;
+  const isHandPresuppField = field === 'hand_presupposition';
+  if (isHandPresuppField) {
+    wrapper.classList.add('pt-manual-box-hand-presup');
+  }
+  const updateHandPresupLayout = () => {
+    if (!isHandPresuppField) return;
+    const normalized = String(input.value || '').trim();
+    const isExpanded = normalized.length >= 72;
+    wrapper.classList.toggle('pt-hand-presup-expanded', isExpanded);
+  };
+  updateHandPresupLayout();
+  const openPresets = () => {
+    if (!canEdit) return;
+    inputWrap.classList.add('pt-manual-presets-open');
+  };
+  const closePresets = () => {
+    inputWrap.classList.remove('pt-manual-presets-open');
+  };
+  const appendPreset = (presetValue) => {
+    const preset = String(presetValue || '').trim();
+    if (!preset) return String(input.value || '');
+    const current = String(input.value || '').trim();
+    if (!current) return preset;
+    if (current.toLowerCase().includes(preset.toLowerCase())) return current;
+    return `${current} / ${preset}`;
+  };
+  input.addEventListener('focus', openPresets);
+  input.addEventListener('click', openPresets);
+  input.addEventListener('input', () => {
+    setHhManualFieldValue(parsed, field, input.value);
+    updateHandPresupLayout();
+  });
+  input.addEventListener('keydown', async (event) => {
+    if (event.key === 'Escape') {
+      closePresets();
+      return;
+    }
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    if (!canEdit) return;
+    const ok = await saveHhManualTextField(parsed, field, input.value);
+    if (ok) {
+      input.value = hhManualFieldValue(parsed, field);
+      updateHandPresupLayout();
+    }
+  });
+
+  voiceBtn.addEventListener('click', async () => {
+    await startHhManualAudioRecording(parsed, field, () => {
+      input.value = hhManualFieldValue(parsed, field);
+      updateHandPresupLayout();
+      refreshVoiceLabel();
+    });
+    refreshVoiceLabel();
+  });
+
+  const presets = document.createElement('div');
+  presets.className = 'pt-manual-presets';
+  HH_MANUAL_PRESUPP_PRESETS.forEach((preset) => {
+    const presetBtn = document.createElement('button');
+    presetBtn.type = 'button';
+    presetBtn.className = 'pt-manual-preset-btn';
+    presetBtn.textContent = preset;
+    presetBtn.disabled = !canEdit;
+    let presetCommitInFlight = false;
+    const applyPreset = async () => {
+      if (!canEdit) return;
+      if (presetCommitInFlight) return;
+      presetCommitInFlight = true;
+      try {
+        const nextValue = appendPreset(preset);
+        input.value = nextValue;
+        setHhManualFieldValue(parsed, field, nextValue);
+        updateHandPresupLayout();
+        const ok = await saveHhManualTextField(parsed, field, nextValue);
+        if (ok) {
+          input.value = hhManualFieldValue(parsed, field);
+          updateHandPresupLayout();
+        }
+        input.focus();
+        openPresets();
+      } finally {
+        presetCommitInFlight = false;
+      }
+    };
+    presetBtn.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      void applyPreset();
+    });
+    presetBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+    });
+    presets.appendChild(presetBtn);
+  });
+  input.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (document.activeElement === input) return;
+      closePresets();
+    }, 120);
+  });
+
+  inputWrap.appendChild(input);
+  inputWrap.appendChild(voiceBtn);
+  inputWrap.appendChild(presets);
+  wrapper.appendChild(inputWrap);
+  return wrapper;
+}
+
+function buildHhTrashIcon() {
+  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  icon.setAttribute('viewBox', '0 0 24 24');
+  icon.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v8h-2V9zm4 0h2v8h-2V9zM7 9h2v8H7V9z');
+  path.setAttribute('fill', 'currentColor');
+  icon.appendChild(path);
+  return icon;
+}
+
+function buildProfileTooltipContent(sampleInput, options = {}) {
+  const interactive = options.interactive === true;
+  const hideEmptyTimingControls = options.hideEmptyTimingControls === true;
   const samples = normalizeTooltipSamples(sampleInput);
   const root = document.createElement('div');
   root.className = 'pt-wrap';
+  if (hideEmptyTimingControls) {
+    root.classList.add('pt-wrap-list');
+  }
 
   samples.forEach((sampleText, sampleIndex) => {
     const parsed = parseTooltipSample(sampleText);
+    const metaTokens = tooltipMetaTokens(parsed.meta);
+    const editableByContext = canEditHhSample(parsed);
+    const editableSample = interactive && editableByContext;
     const entry = document.createElement('div');
     entry.className = 'pt-entry';
 
     const head = document.createElement('div');
     head.className = 'pt-head';
+    const headMain = document.createElement('div');
+    headMain.className = 'pt-head-main';
     if (parsed.rowId) {
       const row = document.createElement('span');
       row.className = 'pt-rowid';
       row.textContent = parsed.rowId;
-      head.appendChild(row);
+      headMain.appendChild(row);
     }
     if (parsed.focusStreet) {
       const street = document.createElement('span');
       street.className = 'pt-street';
       street.textContent = parsed.focusStreet;
-      head.appendChild(street);
+      headMain.appendChild(street);
+    }
+    if (headMain.childNodes.length) {
+      head.appendChild(headMain);
+    }
+    if (metaTokens.length) {
+      const metaWrap = document.createElement('div');
+      metaWrap.className = 'pt-head-meta';
+      metaTokens.forEach((token) => {
+        const item = document.createElement('span');
+        item.className = 'pt-meta-token';
+        item.textContent = token;
+        metaWrap.appendChild(item);
+      });
+      head.appendChild(metaWrap);
+    }
+    if (editableByContext) {
+      const actionsWrap = document.createElement('div');
+      actionsWrap.className = 'pt-meta-actions';
+      const reportKey = buildHhManualReportKey(parsed);
+
+      const clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'pt-meta-clear-btn';
+      clearBtn.title = 'удалить пресуппозиции и тайминги в этой раздаче';
+      clearBtn.disabled = !editableSample || !reportKey;
+      clearBtn.appendChild(buildHhTrashIcon());
+      clearBtn.addEventListener('click', async () => {
+        await clearHhManualForParsedHand(parsed);
+      });
+      actionsWrap.appendChild(clearBtn);
+
+      const reportBtn = document.createElement('button');
+      reportBtn.type = 'button';
+      reportBtn.className = 'pt-meta-report-btn';
+      reportBtn.textContent = 'сохранить репорт';
+      reportBtn.disabled = !editableSample || !reportKey;
+      reportBtn.addEventListener('click', async () => {
+        await saveHhManualReport(parsed);
+      });
+      actionsWrap.appendChild(reportBtn);
+      head.appendChild(actionsWrap);
     }
     if (head.childNodes.length) {
       entry.appendChild(head);
     }
 
-    const metaTokens = tooltipMetaTokens(parsed.meta);
-    if (metaTokens.length) {
-      const metaRow = document.createElement('div');
-      metaRow.className = 'pt-meta-row';
-      metaTokens.forEach((token) => {
-        const item = document.createElement('span');
-        item.className = 'pt-meta-token';
-        item.textContent = token;
-        metaRow.appendChild(item);
-      });
-      entry.appendChild(metaRow);
-    }
-
     const streets = Array.isArray(parsed.streets) ? parsed.streets : [];
     markHeroSegments(streets, extractTargetIdentity(profileModalOpponent));
+    const hasManualContext = editableByContext;
 
     const handsSegments = collectTooltipHandsSegments(streets);
     if (handsSegments.length) {
@@ -746,27 +1627,69 @@ function buildProfileTooltipContent(sampleInput) {
 
     streets.forEach((street) => {
       const row = document.createElement('div');
-      row.className = 'pt-street-row';
+      row.className = `pt-street-row ${hasManualContext ? 'pt-street-row-editable' : ''}`.trim();
 
       const label = document.createElement('span');
       label.className = 'pt-street-label';
       label.textContent = street.name || '';
       row.appendChild(label);
 
+      const content = document.createElement('div');
+      content.className = 'pt-street-main';
       const raw = String(street.raw || '').trim();
       if (!raw) {
         const empty = document.createElement('span');
         empty.className = 'pt-empty';
         empty.textContent = '—';
-        row.appendChild(empty);
+        content.appendChild(empty);
       } else {
         const segments = street.segments?.length
           ? street.segments
           : [parseTooltipSegment(raw)];
-        row.appendChild(renderTooltipSegmentLine(segments, { showCards: false }));
+        const timingStreet = String(street.name || '').trim().toLowerCase();
+        content.appendChild(renderTooltipSegmentLine(segments, {
+          showCards: false,
+          enableTiming: editableSample && HH_STREET_KEYS.has(timingStreet),
+          timingStreet,
+          hideEmptyTimingControls,
+          onTimingChange: async ({ street: nextStreet, actionIndex, actionKey, timing }) => saveHhManualTiming(parsed, {
+            street: nextStreet,
+            actionIndex,
+            actionKey,
+            timing
+          }),
+          getTimingValue: (nextStreet, actionIndex, segment) => getParsedTimingValue(
+            parsed,
+            nextStreet,
+            actionIndex,
+            String(segment?.raw || '').trim()
+          )
+        }));
+      }
+      row.appendChild(content);
+
+      if (hasManualContext) {
+        const streetKey = String(street.name || '').trim().toLowerCase();
+        row.appendChild(createHhManualFieldEditor(parsed, streetKey, { readOnly: !editableSample }));
       }
       entry.appendChild(row);
     });
+
+    if (hasManualContext) {
+      const globalRow = document.createElement('div');
+      globalRow.className = 'pt-street-row pt-hand-presup-row';
+
+      const globalLabel = document.createElement('span');
+      globalLabel.className = 'pt-street-label';
+      globalLabel.textContent = 'PRESUP';
+      globalRow.appendChild(globalLabel);
+
+      const globalMain = document.createElement('div');
+      globalMain.className = 'pt-street-main';
+      globalMain.appendChild(createHhManualFieldEditor(parsed, 'hand_presupposition', { readOnly: !editableSample }));
+      globalRow.appendChild(globalMain);
+      entry.appendChild(globalRow);
+    }
 
     root.appendChild(entry);
 
@@ -782,6 +1705,7 @@ function buildProfileTooltipContent(sampleInput) {
 
 function moveProfileTooltip(event) {
   if (!profileTooltipEl || profileTooltipEl.classList.contains('hidden')) return;
+  if (profileTooltipPinned) return;
   const offset = 14;
   const maxX = window.innerWidth - profileTooltipEl.offsetWidth - 8;
   const maxY = window.innerHeight - profileTooltipEl.offsetHeight - 8;
@@ -793,16 +1717,21 @@ function moveProfileTooltip(event) {
 
 function showProfileTooltip(sampleInput, event) {
   if (!profileTooltipEl) return;
+  if (profileTooltipPinned) return;
+  profileTooltipSampleInput = sampleInput;
   profileTooltipEl.innerHTML = '';
-  profileTooltipEl.appendChild(buildProfileTooltipContent(sampleInput));
+  profileTooltipEl.appendChild(buildProfileTooltipContent(sampleInput, { interactive: false }));
   profileTooltipEl.scrollTop = 0;
   profileTooltipEl.classList.remove('hidden');
   profileTooltipEl.setAttribute('aria-hidden', 'false');
   moveProfileTooltip(event);
 }
 
-function hideProfileTooltip() {
+function hideProfileTooltip(options = {}) {
   if (!profileTooltipEl) return;
+  if (profileTooltipPinned && options.force !== true) return;
+  unpinProfileTooltip();
+  profileTooltipSampleInput = null;
   profileTooltipEl.classList.add('hidden');
   profileTooltipEl.setAttribute('aria-hidden', 'true');
 }
@@ -833,6 +1762,12 @@ function renderProfileRows(rows = [], legend = []) {
         segment.addEventListener('mouseenter', (event) => showProfileTooltip(tooltipSamples, event));
         segment.addEventListener('mousemove', moveProfileTooltip);
         segment.addEventListener('mouseleave', hideProfileTooltip);
+        segment.addEventListener('click', (event) => {
+          showProfileTooltip(tooltipSamples, event);
+          pinProfileTooltip();
+          event.preventDefault();
+          event.stopPropagation();
+        });
       }
       if (width >= 22) {
         segment.textContent = String(count);
@@ -896,100 +1831,283 @@ function createFilterButton(label, active, onClick) {
   return button;
 }
 
-function activeProfileRoomKey() {
-  const rooms = Array.isArray(profileFilters.rooms) ? profileFilters.rooms : [];
-  if (rooms.length === 1) {
-    return String(rooms[0] || '').trim().toLowerCase() || PROFILE_VS_DEFAULT_KEY;
-  }
-  return PROFILE_VS_DEFAULT_KEY;
+function normalizeRoomKey(value) {
+  return String(value || '').trim().toLowerCase();
 }
 
-function persistVsDefaultForCurrentRoom(value) {
-  const normalized = String(value || '').trim();
-  if (!normalized) return;
-  const roomKey = activeProfileRoomKey();
-  profileVsDefaults = {
-    ...profileVsDefaults,
-    [roomKey]: normalized,
-    [PROFILE_VS_DEFAULT_KEY]: String(profileVsDefaults[PROFILE_VS_DEFAULT_KEY] || normalized).trim() || normalized
+function resolveProfileRoomKey(filters = profileFilters, roomOptions = profileFilterOptions.rooms) {
+  const rooms = Array.isArray(filters?.rooms) ? filters.rooms : [];
+  if (rooms.length === 1) return normalizeRoomKey(rooms[0]);
+  const available = Array.isArray(roomOptions) ? roomOptions : [];
+  if (available.length === 1) return normalizeRoomKey(available[0]);
+  return '';
+}
+
+function profileMyNicknameForRoom(roomKey) {
+  const key = normalizeRoomKey(roomKey);
+  if (!key) return '';
+  return String(profileMyNickByRoom[key] || '').trim();
+}
+
+function persistProfileMyNickname(roomKey, nickname) {
+  const key = normalizeRoomKey(roomKey);
+  if (!key) return;
+  const next = { ...profileMyNickByRoom };
+  const normalizedNick = String(nickname || '').trim();
+  if (!normalizedNick) {
+    delete next[key];
+  } else {
+    next[key] = normalizedNick;
+  }
+  profileMyNickByRoom = next;
+  saveProfileMyNickByRoom(profileMyNickByRoom);
+}
+
+function currentMainRoomKey() {
+  return resolveProfileRoomKey(profileFilters, profileFilterOptions.rooms);
+}
+
+function currentMainMyNickname() {
+  return profileMyNicknameForRoom(currentMainRoomKey());
+}
+
+function syncMainVsMeFilter() {
+  if (!profileVsMeEnabled) return;
+  const myNickname = currentMainMyNickname();
+  if (!myNickname) {
+    profileVsMeEnabled = false;
+  }
+  profileFilters = {
+    ...profileFilters,
+    vsOpponent: profileVsMeEnabled ? myNickname : ''
   };
-  if (roomKey === PROFILE_VS_DEFAULT_KEY) {
-    profileVsDefaults[PROFILE_VS_DEFAULT_KEY] = normalized;
-  }
-  saveProfileVsDefaults(profileVsDefaults);
 }
 
-function applyVsDefaultForCurrentRoom() {
-  const roomKey = activeProfileRoomKey();
-  const exact = String(profileVsDefaults?.[roomKey] || '').trim();
-  const fallback = String(profileVsDefaults?.[PROFILE_VS_DEFAULT_KEY] || '').trim();
-  const nextVs = exact || fallback || '';
-  profileFilters = { ...profileFilters, vsOpponent: nextVs };
-}
-
-function toggleMultiFilter(key, value) {
-  const current = Array.isArray(profileFilters[key]) ? [...profileFilters[key]] : [];
+function toggleMultiFilterState(filters, key, value) {
+  const current = Array.isArray(filters[key]) ? [...filters[key]] : [];
   const normalizedValue = String(value);
   const index = current.indexOf(normalizedValue);
   if (index >= 0) current.splice(index, 1);
   else current.push(normalizedValue);
-  profileFilters = { ...profileFilters, [key]: current };
+  return { ...filters, [key]: current };
+}
+
+function setSingleFilterState(filters, key, value) {
+  const nextValue = String(value);
+  const currentValue = String(filters[key] || 'all');
+  return { ...filters, [key]: currentValue === nextValue ? 'all' : nextValue };
+}
+
+function toggleMultiFilter(key, value) {
+  profileFilters = toggleMultiFilterState(profileFilters, key, value);
   if (key === 'rooms') {
-    applyVsDefaultForCurrentRoom();
+    syncMainVsMeFilter();
   }
 }
 
 function setSingleFilter(key, value) {
-  const nextValue = String(value);
-  const currentValue = String(profileFilters[key] || 'all');
-  profileFilters = { ...profileFilters, [key]: currentValue === nextValue ? 'all' : nextValue };
+  profileFilters = setSingleFilterState(profileFilters, key, value);
 }
 
-function setVsFilter(value, options = {}) {
+function setVsFilter(value) {
   const normalized = String(value || '').trim();
   profileFilters = { ...profileFilters, vsOpponent: normalized };
-  if (options.persist !== false) {
-    persistVsDefaultForCurrentRoom(normalized);
+  if (profileVsMeEnabled) {
+    const myNickname = currentMainMyNickname();
+    if (!myNickname || myNickname !== normalized) {
+      profileVsMeEnabled = false;
+    }
   }
 }
 
 function setFiltersAndReload() {
   if (!profileModalOpponent) return;
+  syncMainVsMeFilter();
   renderProfileModalState(profileModalOpponent, profileModalSource);
   if (profileViewMode === 'list') {
-    prefetchOpponentProfileList(profileModalOpponent, { force: true, source: profileModalSource });
+    prefetchOpponentProfileList(profileModalOpponent, {
+      force: true,
+      source: profileModalSource,
+      filters: profileFilters
+    });
     return;
   }
-  prefetchOpponentProfile(profileModalOpponent, { force: true, source: profileModalSource });
+  prefetchOpponentProfile(profileModalOpponent, {
+    force: true,
+    source: profileModalSource,
+    filters: profileFilters
+  });
 }
 
-function renderProfileFilters() {
-  const wrap = document.createElement('div');
-  wrap.className = 'profile-filters';
+function cloneProfileFilters(filters) {
+  const source = filters || createDefaultProfileFilters();
+  return {
+    ...createDefaultProfileFilters(),
+    playerGroups: Array.isArray(source.playerGroups) ? [...source.playerGroups] : [],
+    datePreset: String(source.datePreset || 'all'),
+    gameCards: Array.isArray(source.gameCards) ? [...source.gameCards] : [],
+    rooms: Array.isArray(source.rooms) ? [...source.rooms] : [],
+    potBuckets: Array.isArray(source.potBuckets) ? [...source.potBuckets] : [],
+    limits: Array.isArray(source.limits) ? [...source.limits] : [],
+    vsOpponent: String(source.vsOpponent || ''),
+    cardsVisibility: String(source.cardsVisibility || 'showdown') === 'known' ? 'known' : 'showdown',
+    recentLimit: String(source.recentLimit || 'all'),
+    manualOnly: source.manualOnly === true
+  };
+}
 
-  const modeRow = document.createElement('div');
-  modeRow.className = 'profile-filter-row';
-  const modeTitle = document.createElement('div');
-  modeTitle.className = 'profile-filter-title';
-  modeTitle.textContent = 'Режим';
-  modeRow.appendChild(modeTitle);
-  const modeActions = document.createElement('div');
-  modeActions.className = 'profile-filter-actions';
-  modeActions.appendChild(createFilterButton('График', profileViewMode === 'chart', () => {
-    if (profileViewMode === 'chart') return;
-    profileViewMode = 'chart';
-    renderProfileModalState(profileModalOpponent, profileModalSource);
-    prefetchOpponentProfile(profileModalOpponent, { force: false, source: profileModalSource });
-  }));
-  modeActions.appendChild(createFilterButton('Визуализировать списком', profileViewMode === 'list', () => {
-    if (profileViewMode === 'list') return;
-    profileViewMode = 'list';
-    renderProfileModalState(profileModalOpponent, profileModalSource);
-    prefetchOpponentProfileList(profileModalOpponent, { force: false, source: profileModalSource });
-  }));
-  modeRow.appendChild(modeActions);
-  wrap.appendChild(modeRow);
+function resetMirrorFilters() {
+  const next = cloneProfileFilters(profileFilters);
+  next.vsOpponent = profileMirrorVsHimEnabled ? String(profileModalOpponent || '').trim() : '';
+  profileMirrorFilters = next;
+}
 
+async function clearHhHandsForCurrentOpponent() {
+  if (String(profileModalSource || '').toLowerCase() !== 'hh') return;
+  const opponent = String(profileModalOpponent || '').trim();
+  if (!opponent) return;
+  if (isAnyRecordingActive() || isBatchProcessing) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return;
+  }
+  const confirmed = window.confirm(`Удалить HH раздачи только для игрока "${opponent}"?`);
+  if (!confirmed) return;
+
+  try {
+    setStatus(`Удаляю HH руки игрока ${opponent}...`);
+    const response = await fetch('/api/hh-clear-opponent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ opponent })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка очистки HH DB по игроку.');
+    }
+    clearProfileCacheByOpponent(opponent);
+    const notes = Number(data.notesDeleted || 0);
+    const hands = Number(data.handsDeleted || 0);
+    setStatus(`HH очищено для ${opponent}: notes=${notes}, hands=${hands}.`, 'ok');
+    setFiltersAndReload();
+  } catch (error) {
+    setStatus(error.message || 'Ошибка очистки HH DB по игроку.', 'error');
+  }
+}
+
+async function clearAllHhHandsInDb() {
+  if (isAnyRecordingActive() || isBatchProcessing) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return;
+  }
+  const confirmed = window.confirm('Удалить ВСЮ HH базу (руки) для всех игроков? Ручные пресуппозиции и тайминги останутся.');
+  if (!confirmed) return;
+
+  try {
+    setStatus('Удаляю всю HH базу...');
+    const response = await fetch('/api/hh-clear-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка полной очистки HH DB.');
+    }
+    profileCache.clear();
+    profileListCache.clear();
+    const notes = Number(data.notesDeleted || 0);
+    const hands = Number(data.handsDeleted || 0);
+    setStatus(`Вся HH база очищена: notes=${notes}, hands=${hands}.`, 'ok');
+    if (profileModalOpponent && String(profileModalSource || '').toLowerCase() === 'hh') {
+      setFiltersAndReload();
+    }
+  } catch (error) {
+    setStatus(error.message || 'Ошибка полной очистки HH DB.', 'error');
+  }
+}
+
+async function clearHhManualForParsedHand(parsed) {
+  if (!canEditHhSample(parsed)) {
+    setStatus('Эта раздача не из HH DB — удаление ручных данных недоступно.', 'error');
+    return false;
+  }
+  if (!canMutateHhManual()) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return false;
+  }
+  const opponent = resolveProfileModalOpponent(parsed);
+  if (!opponent) {
+    setStatus('Не удалось определить выбранного игрока.', 'error');
+    return false;
+  }
+  const context = parsed?.context && typeof parsed.context === 'object' ? parsed.context : {};
+  const handNumber = String(context.handNumber || '').trim();
+  const confirmText = handNumber
+    ? `Удалить все ручные пресуппозиции и тайминги для раздачи #${handNumber}?`
+    : 'Удалить все ручные пресуппозиции и тайминги для этой раздачи?';
+  if (!window.confirm(confirmText)) return false;
+
+  try {
+    const response = await fetch('/api/hh-manual-clear-hand', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        opponent,
+        row: context.row,
+        handNumber: context.handNumber,
+        room: context.room
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка удаления ручных данных HH по раздаче.');
+    }
+    setParsedManualFieldsFromApi(parsed, {});
+    setParsedTimingFieldsFromApi(parsed, []);
+    syncProfileTooltipSampleInput(parsed);
+    clearProfileCacheByOpponent(opponent);
+    refreshPinnedProfileTooltip();
+    setStatus('Ручные пресуппозиции и тайминги по раздаче удалены.', 'ok');
+    return true;
+  } catch (error) {
+    setStatus(error.message || 'Ошибка удаления ручных данных HH по раздаче.', 'error');
+    return false;
+  }
+}
+
+async function clearHhManualForCurrentOpponent() {
+  if (String(profileModalSource || '').toLowerCase() !== 'hh') return;
+  const opponent = String(profileModalOpponent || '').trim();
+  if (!opponent) return;
+  if (!canMutateHhManual()) {
+    setStatus('Сначала завершите текущую запись.', 'error');
+    return;
+  }
+  const confirmed = window.confirm(`Удалить ВСЕ ручные пресуппозиции и тайминги для игрока "${opponent}"?`);
+  if (!confirmed) return;
+
+  try {
+    setStatus(`Удаляю ручные записи игрока ${opponent}...`);
+    const response = await fetch('/api/hh-manual-clear-opponent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ opponent })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Ошибка удаления ручных данных HH по игроку.');
+    }
+    clearProfileCacheByOpponent(opponent);
+    const presuppDeleted = Number(data.presuppDeleted || 0);
+    const timingsDeleted = Number(data.timingsDeleted || 0);
+    setStatus(`Удалено ручных записей: presupp=${presuppDeleted}, timings=${timingsDeleted}.`, 'ok');
+    setFiltersAndReload();
+  } catch (error) {
+    setStatus(error.message || 'Ошибка удаления ручных данных HH по игроку.', 'error');
+  }
+}
+
+function buildProfileFilterGroups(roomValues = []) {
   const groups = [
     {
       title: 'Игроков в раздаче',
@@ -1062,20 +2180,19 @@ function renderProfileFilters() {
     }
   ];
 
-  const roomValues = Array.isArray(profileFilterOptions.rooms)
-    ? profileFilterOptions.rooms
-    : [];
-  if (roomValues.length > 0) {
+  if (Array.isArray(roomValues) && roomValues.length > 0) {
     groups.push({
       title: 'Room',
-      buttons: [
-        ...roomValues.map((room) => ({ label: room, value: room }))
-      ],
+      buttons: roomValues.map((room) => ({ label: room, value: room })),
       key: 'rooms',
       single: false
     });
   }
+  return groups;
+}
 
+function appendProfileFilterGroups(wrap, filters, roomValues, onFilterChange) {
+  const groups = buildProfileFilterGroups(roomValues);
   groups.forEach((group) => {
     const row = document.createElement('div');
     row.className = 'profile-filter-row';
@@ -1089,30 +2206,228 @@ function renderProfileFilters() {
     actions.className = 'profile-filter-actions';
 
     group.buttons.forEach((item) => {
-      let active = false;
-      if (group.single) {
-        active = String(profileFilters[group.key] || '') === String(item.value);
-      } else {
-        active = Array.isArray(profileFilters[group.key]) && profileFilters[group.key].includes(String(item.value));
-      }
-
-      const button = createFilterButton(item.label, active, () => {
-        if (group.single) {
-          setSingleFilter(group.key, item.value);
-          setFiltersAndReload();
-          return;
-        }
-        toggleMultiFilter(group.key, item.value);
-        setFiltersAndReload();
-      });
+      const value = String(item.value);
+      const active = group.single
+        ? String(filters[group.key] || '') === value
+        : (Array.isArray(filters[group.key]) && filters[group.key].includes(value));
+      const button = createFilterButton(item.label, active, () => onFilterChange(group, value));
       actions.appendChild(button);
     });
 
     row.appendChild(actions);
     wrap.appendChild(row);
   });
+}
 
-  if (profileModalSource === 'hh') {
+function renderProfileFilters(context = 'main') {
+  const isMirror = context === 'mirror';
+  const filters = isMirror ? profileMirrorFilters : profileFilters;
+  const options = isMirror ? profileMirrorFilterOptions : profileFilterOptions;
+  const wrap = document.createElement('div');
+  wrap.className = isMirror ? 'profile-filters profile-filters-mirror' : 'profile-filters';
+
+  if (!isMirror) {
+    const modeRow = document.createElement('div');
+    modeRow.className = 'profile-filter-row';
+    const modeTitle = document.createElement('div');
+    modeTitle.className = 'profile-filter-title';
+    modeTitle.textContent = 'Режим';
+    modeRow.appendChild(modeTitle);
+    const modeActions = document.createElement('div');
+    modeActions.className = 'profile-filter-actions';
+    modeActions.appendChild(createFilterButton('График', profileViewMode === 'chart', () => {
+      if (profileViewMode === 'chart') return;
+      profileViewMode = 'chart';
+      renderProfileModalState(profileModalOpponent, profileModalSource);
+      prefetchOpponentProfile(profileModalOpponent, {
+        force: false,
+        source: profileModalSource,
+        filters: profileFilters
+      });
+    }));
+    modeActions.appendChild(createFilterButton('Визуализировать списком', profileViewMode === 'list', () => {
+      if (profileViewMode === 'list') return;
+      profileViewMode = 'list';
+      renderProfileModalState(profileModalOpponent, profileModalSource);
+      prefetchOpponentProfileList(profileModalOpponent, {
+        force: false,
+        source: profileModalSource,
+        filters: profileFilters
+      });
+    }));
+    modeRow.appendChild(modeActions);
+    wrap.appendChild(modeRow);
+  }
+
+  if (!isMirror && profileModalSource === 'hh') {
+    const clearRow = document.createElement('div');
+    clearRow.className = 'profile-filter-row profile-clear-row';
+
+    const clearTitle = document.createElement('div');
+    clearTitle.className = 'profile-filter-title';
+    clearTitle.textContent = 'HH DB';
+    clearRow.appendChild(clearTitle);
+
+    const clearActions = document.createElement('div');
+    clearActions.className = 'profile-filter-actions';
+
+    const clearOpponentBtn = createFilterButton('Стереть руки игрока', false, clearHhHandsForCurrentOpponent);
+    clearOpponentBtn.classList.add('profile-filter-danger');
+
+    clearActions.appendChild(clearOpponentBtn);
+    clearRow.appendChild(clearActions);
+    wrap.appendChild(clearRow);
+
+    const manualRow = document.createElement('div');
+    manualRow.className = 'profile-filter-row profile-clear-row';
+
+    const manualTitle = document.createElement('div');
+    manualTitle.className = 'profile-filter-title';
+    manualTitle.textContent = 'Ручные записи';
+    manualRow.appendChild(manualTitle);
+
+    const manualActions = document.createElement('div');
+    manualActions.className = 'profile-filter-actions';
+
+    const manualOnlyBtn = createFilterButton('только с заметками', profileFilters.manualOnly === true, () => {
+      profileFilters = {
+        ...profileFilters,
+        manualOnly: profileFilters.manualOnly !== true
+      };
+      setFiltersAndReload();
+    });
+    const clearManualBtn = createFilterButton('удалить записи игрока', false, clearHhManualForCurrentOpponent);
+    clearManualBtn.classList.add('profile-filter-danger');
+
+    manualActions.appendChild(manualOnlyBtn);
+    manualActions.appendChild(clearManualBtn);
+    manualRow.appendChild(manualActions);
+    wrap.appendChild(manualRow);
+
+    const cardsRow = document.createElement('div');
+    cardsRow.className = 'profile-filter-row profile-clear-row';
+    const cardsTitle = document.createElement('div');
+    cardsTitle.className = 'profile-filter-title';
+    cardsTitle.textContent = 'Карты';
+    cardsRow.appendChild(cardsTitle);
+    const cardsActions = document.createElement('div');
+    cardsActions.className = 'profile-filter-actions';
+    const cardsMode = String(profileFilters.cardsVisibility || 'showdown').toLowerCase() === 'known'
+      ? 'known'
+      : 'showdown';
+    cardsActions.appendChild(createFilterButton('только showdown', cardsMode === 'showdown', () => {
+      if (cardsMode === 'showdown') return;
+      profileFilters = { ...profileFilters, cardsVisibility: 'showdown' };
+      setFiltersAndReload();
+    }));
+    cardsActions.appendChild(createFilterButton('все известные карты', cardsMode === 'known', () => {
+      if (cardsMode === 'known') return;
+      profileFilters = { ...profileFilters, cardsVisibility: 'known' };
+      setFiltersAndReload();
+    }));
+    cardsRow.appendChild(cardsActions);
+    wrap.appendChild(cardsRow);
+  }
+
+  if (isMirror && profileModalSource === 'hh') {
+    const manualRow = document.createElement('div');
+    manualRow.className = 'profile-filter-row profile-clear-row';
+
+    const manualTitle = document.createElement('div');
+    manualTitle.className = 'profile-filter-title';
+    manualTitle.textContent = 'Ручные записи';
+    manualRow.appendChild(manualTitle);
+
+    const manualActions = document.createElement('div');
+    manualActions.className = 'profile-filter-actions';
+    const manualOnlyBtn = createFilterButton('только с заметками', profileMirrorFilters.manualOnly === true, () => {
+      profileMirrorFilters = {
+        ...profileMirrorFilters,
+        manualOnly: profileMirrorFilters.manualOnly !== true
+      };
+      setFiltersAndReload();
+    });
+    manualActions.appendChild(manualOnlyBtn);
+    manualRow.appendChild(manualActions);
+    wrap.appendChild(manualRow);
+
+    const cardsRow = document.createElement('div');
+    cardsRow.className = 'profile-filter-row profile-clear-row';
+    const cardsTitle = document.createElement('div');
+    cardsTitle.className = 'profile-filter-title';
+    cardsTitle.textContent = 'Карты';
+    cardsRow.appendChild(cardsTitle);
+    const cardsActions = document.createElement('div');
+    cardsActions.className = 'profile-filter-actions';
+    const cardsMode = String(profileMirrorFilters.cardsVisibility || 'showdown').toLowerCase() === 'known'
+      ? 'known'
+      : 'showdown';
+    cardsActions.appendChild(createFilterButton('только showdown', cardsMode === 'showdown', () => {
+      if (cardsMode === 'showdown') return;
+      profileMirrorFilters = { ...profileMirrorFilters, cardsVisibility: 'showdown' };
+      setFiltersAndReload();
+    }));
+    cardsActions.appendChild(createFilterButton('все известные карты', cardsMode === 'known', () => {
+      if (cardsMode === 'known') return;
+      profileMirrorFilters = { ...profileMirrorFilters, cardsVisibility: 'known' };
+      setFiltersAndReload();
+    }));
+    cardsRow.appendChild(cardsActions);
+    wrap.appendChild(cardsRow);
+  }
+
+  const roomValues = Array.isArray(options.rooms) ? options.rooms : [];
+  appendProfileFilterGroups(wrap, filters, roomValues, (group, value) => {
+    if (isMirror) {
+      if (group.single) {
+        profileMirrorFilters = setSingleFilterState(profileMirrorFilters, group.key, value);
+      } else {
+        profileMirrorFilters = toggleMultiFilterState(profileMirrorFilters, group.key, value);
+      }
+      setFiltersAndReload();
+      return;
+    }
+    if (group.single) {
+      setSingleFilter(group.key, value);
+    } else {
+      toggleMultiFilter(group.key, value);
+    }
+    setFiltersAndReload();
+  });
+
+  if (isMirror && profileModalSource === 'hh') {
+    const vsRow = document.createElement('div');
+    vsRow.className = 'profile-filter-row';
+    const vsTitle = document.createElement('div');
+    vsTitle.className = 'profile-filter-title';
+    vsTitle.textContent = 'VS him';
+    vsRow.appendChild(vsTitle);
+    const vsActions = document.createElement('div');
+    vsActions.className = 'profile-filter-actions profile-filter-actions-vs';
+
+    const toggleLabel = document.createElement('label');
+    toggleLabel.className = 'profile-vs-toggle';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.checked = profileMirrorVsHimEnabled === true;
+    toggle.addEventListener('change', () => {
+      profileMirrorVsHimEnabled = toggle.checked === true;
+      profileMirrorFilters = {
+        ...profileMirrorFilters,
+        vsOpponent: profileMirrorVsHimEnabled ? String(profileModalOpponent || '').trim() : ''
+      };
+      setFiltersAndReload();
+    });
+    const toggleText = document.createElement('span');
+    toggleText.textContent = 'против выбранного игрока';
+    toggleLabel.appendChild(toggle);
+    toggleLabel.appendChild(toggleText);
+    vsActions.appendChild(toggleLabel);
+    vsRow.appendChild(vsActions);
+    wrap.appendChild(vsRow);
+  }
+
+  if (!isMirror && profileModalSource === 'hh') {
     const vsRow = document.createElement('div');
     vsRow.className = 'profile-filter-row';
 
@@ -1131,7 +2446,7 @@ function renderProfileFilters() {
     vsInput.value = String(profileFilters.vsOpponent || '');
 
     const suggestionList = document.createElement('datalist');
-    suggestionList.id = 'profile-vs-suggestions';
+    suggestionList.id = 'profile-vs-suggestions-main';
     const refillVsSuggestions = (query = '') => {
       suggestionList.innerHTML = '';
       const items = mergedSuggestions(query);
@@ -1152,6 +2467,8 @@ function renderProfileFilters() {
       const nextValue = String(vsInput.value || '').trim();
       if (currentValue === nextValue) return;
       setVsFilter(nextValue);
+      const myNickname = currentMainMyNickname();
+      profileVsMeEnabled = Boolean(myNickname && myNickname.toLowerCase() === nextValue.toLowerCase());
       setFiltersAndReload();
     };
 
@@ -1164,15 +2481,84 @@ function renderProfileFilters() {
 
     const clearVsButton = createFilterButton('сбросить', false, () => {
       if (!profileFilters.vsOpponent) return;
-      setVsFilter('', { persist: false });
+      profileVsMeEnabled = false;
+      setVsFilter('');
       vsInput.value = '';
       refillVsSuggestions('');
       setFiltersAndReload();
     });
 
+    const vsMeta = document.createElement('div');
+    vsMeta.className = 'profile-vs-meta';
+
+    const vsMeLabel = document.createElement('label');
+    vsMeLabel.className = 'profile-vs-toggle';
+    const vsMeCheckbox = document.createElement('input');
+    vsMeCheckbox.type = 'checkbox';
+    vsMeCheckbox.checked = profileVsMeEnabled === true;
+    const vsMeText = document.createElement('span');
+    vsMeText.textContent = 'VS me';
+    vsMeLabel.appendChild(vsMeCheckbox);
+    vsMeLabel.appendChild(vsMeText);
+
+    const roomKey = currentMainRoomKey();
+    const myNicknameInput = document.createElement('input');
+    myNicknameInput.type = 'text';
+    myNicknameInput.className = 'profile-my-nick-input';
+    myNicknameInput.placeholder = roomKey ? `my nickname (${roomKey})` : 'my nickname (выбери room)';
+    myNicknameInput.value = profileMyNicknameForRoom(roomKey);
+    myNicknameInput.disabled = !roomKey;
+
+    const saveMyNickname = () => {
+      if (!roomKey) return;
+      const nextNickname = String(myNicknameInput.value || '').trim();
+      const prevNickname = profileMyNicknameForRoom(roomKey);
+      if (prevNickname === nextNickname) return;
+      persistProfileMyNickname(roomKey, nextNickname);
+      if (profileVsMeEnabled) {
+        setVsFilter(nextNickname);
+        vsInput.value = nextNickname;
+      }
+      setFiltersAndReload();
+    };
+    myNicknameInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      saveMyNickname();
+    });
+    myNicknameInput.addEventListener('blur', saveMyNickname);
+
+    vsMeCheckbox.addEventListener('change', () => {
+      profileVsMeEnabled = vsMeCheckbox.checked === true;
+      if (!profileVsMeEnabled) {
+        setVsFilter('');
+        vsInput.value = '';
+        setFiltersAndReload();
+        return;
+      }
+      const myNickname = profileMyNicknameForRoom(roomKey);
+      if (!myNickname) {
+        profileVsMeEnabled = false;
+        vsMeCheckbox.checked = false;
+        setStatus('Укажи my nickname для выбранного room.', 'error');
+        return;
+      }
+      setVsFilter(myNickname);
+      vsInput.value = myNickname;
+      setFiltersAndReload();
+    });
+
+    const myNickLabel = document.createElement('span');
+    myNickLabel.className = 'profile-my-nick-label';
+    myNickLabel.textContent = 'my nickname';
+
     vsActions.appendChild(vsInput);
     vsActions.appendChild(suggestionList);
     vsActions.appendChild(clearVsButton);
+    vsMeta.appendChild(vsMeLabel);
+    vsMeta.appendChild(myNickLabel);
+    vsMeta.appendChild(myNicknameInput);
+    vsActions.appendChild(vsMeta);
     vsRow.appendChild(vsActions);
     wrap.appendChild(vsRow);
   }
@@ -1180,25 +2566,10 @@ function renderProfileFilters() {
   return wrap;
 }
 
-function renderProfileModal(profile) {
-  if (!profileContentEl || !profileMetaEl || !profileTitleEl) return;
-  profileContentEl.innerHTML = '';
-  profileTitleEl.textContent = `Профиль: ${profile?.opponent || '—'}`;
-  const sources = Array.isArray(profile?.sources) ? profile.sources : [];
-  const sourceText = sources.length
-    ? ` • источники: ${sources.map((item) => `${item.sheetName || 'active'}=${item.rows || 0}`).join(', ')}`
-    : '';
-  profileMetaEl.textContent = `строк в выборке: ${profile?.totalRows || 0} • учтено в секциях: ${profile?.analyzedRows || 0}${sourceText}`;
-
-  const rooms = Array.isArray(profile?.filters?.options?.rooms)
-    ? profile.filters.options.rooms
-    : [];
-  profileFilterOptions = { rooms };
-  profileContentEl.appendChild(renderProfileFilters());
-
+function buildProfileLegend(legendItems = []) {
   const legend = document.createElement('div');
   legend.className = 'profile-legend';
-  (profile?.legend || []).forEach((item) => {
+  legendItems.forEach((item) => {
     const entry = document.createElement('div');
     entry.className = 'legend-item';
     const swatch = document.createElement('span');
@@ -1210,11 +2581,13 @@ function renderProfileModal(profile) {
     entry.appendChild(label);
     legend.appendChild(entry);
   });
-  profileContentEl.appendChild(legend);
+  return legend;
+}
 
+function buildProfileGrid(sections = [], legend = []) {
   const grid = document.createElement('div');
   grid.className = 'profile-grid';
-  (profile?.sections || []).forEach((section) => {
+  sections.forEach((section) => {
     const sectionEl = document.createElement('div');
     sectionEl.className = 'profile-section';
 
@@ -1232,14 +2605,171 @@ function renderProfileModal(profile) {
       groupTitle.textContent = group.title;
       groupEl.appendChild(groupTitle);
 
-      groupEl.appendChild(renderProfileRows(group.rows || [], profile.legend || []));
+      groupEl.appendChild(renderProfileRows(group.rows || [], legend));
       sectionEl.appendChild(groupEl);
     });
 
     grid.appendChild(sectionEl);
   });
+  return grid;
+}
 
-  profileContentEl.appendChild(grid);
+function buildProfileListSamples(payload) {
+  return Array.isArray(payload?.list)
+    ? payload.list
+      .map((row) => {
+        const rowLabel = String(row?.rowLabel || '').trim() || `#DB:${row?.row ?? '?'}`;
+        const handNumber = String(row?.handNumber || '').trim();
+        const room = String(row?.room || '').trim().toLowerCase();
+        const manual = {
+          preflop: String(row?.manualPreflop || ''),
+          flop: String(row?.manualFlop || ''),
+          turn: String(row?.manualTurn || ''),
+          river: String(row?.manualRiver || ''),
+          handPresupposition: String(row?.handPresupposition || '')
+        };
+        const timings = Array.isArray(row?.manualTimings)
+          ? row.manualTimings
+            .map((item) => ({
+              street: String(item?.street || '').trim().toLowerCase(),
+              actionIndex: Number(item?.actionIndex),
+              actionKey: String(item?.actionKey || ''),
+              timing: normalizeTimingValue(item?.timing)
+            }))
+            .filter((item) => HH_STREET_KEYS.has(item.street) && Number.isFinite(item.actionIndex) && item.actionIndex >= 0)
+          : [];
+        const context = {
+          row: Number.isFinite(Number(row?.row)) && Number(row.row) > 0
+            ? Math.trunc(Number(row.row))
+            : null,
+          handNumber,
+          room,
+          opponent: String(payload?.opponent || ''),
+          source: String(row?.nickname || '').toLowerCase() === 'hh' ? 'hh' : 'voice',
+          targetIdentity: extractTargetIdentity(payload?.opponent || '')
+        };
+        return JSON.stringify({
+          type: 'profile_sample_v2',
+          rowLabel,
+          focusStreet: '',
+          manual,
+          context,
+          timings,
+          streets: {
+            preflop: String(row?.preflop || ''),
+            flop: String(row?.flop || ''),
+            turn: String(row?.turn || ''),
+            river: String(row?.river || '')
+          }
+        });
+      })
+      .filter(Boolean)
+    : [];
+}
+
+function buildProfileListView(payload, emptyText = 'По текущим фильтрам раздач нет.') {
+  const samples = buildProfileListSamples(payload);
+  if (!samples.length) {
+    const empty = document.createElement('div');
+    empty.className = 'profile-list-empty';
+    empty.textContent = emptyText;
+    return empty;
+  }
+
+  const listWrap = document.createElement('div');
+  listWrap.className = 'profile-list-view';
+  listWrap.appendChild(buildProfileTooltipContent(samples, { interactive: true, hideEmptyTimingControls: true }));
+  return listWrap;
+}
+
+async function appendMirrorPerspectiveSection(container) {
+  if (profileModalSource !== 'hh') return;
+  const roomKey = currentMainRoomKey();
+  const myNickname = profileMyNicknameForRoom(roomKey);
+  if (!myNickname) return;
+
+  const mirrorBlock = document.createElement('section');
+  mirrorBlock.className = 'profile-mirror-section';
+  const mirrorTitle = document.createElement('h4');
+  mirrorTitle.className = 'profile-mirror-title';
+  mirrorTitle.textContent = `Мой профиль: ${myNickname}`;
+  mirrorBlock.appendChild(mirrorTitle);
+
+  profileMirrorFilterOptions = { rooms: Array.isArray(profileFilterOptions.rooms) ? [...profileFilterOptions.rooms] : [] };
+  if (profileMirrorVsHimEnabled) {
+    profileMirrorFilters = {
+      ...cloneProfileFilters(profileMirrorFilters),
+      vsOpponent: String(profileModalOpponent || '').trim()
+    };
+  }
+  mirrorBlock.appendChild(renderProfileFilters('mirror'));
+
+  const mirrorBody = document.createElement('div');
+  mirrorBody.className = 'profile-mirror-body';
+  mirrorBody.textContent = profileViewMode === 'list'
+    ? 'Собираю мой список раздач...'
+    : 'Собираю мою визуализацию...';
+  mirrorBlock.appendChild(mirrorBody);
+  container.appendChild(mirrorBlock);
+
+  const requestId = ++profileMirrorRequestId;
+  if (profileViewMode === 'list') {
+    const payload = await prefetchOpponentProfileList(myNickname, {
+      force: false,
+      source: profileModalSource,
+      filters: profileMirrorFilters,
+      suppressRender: true
+    });
+    if (requestId !== profileMirrorRequestId || !mirrorBody.isConnected) return;
+    if (!payload) {
+      mirrorBody.textContent = 'Не удалось построить мой список.';
+      return;
+    }
+    profileMirrorFilterOptions = {
+      rooms: Array.isArray(payload?.filters?.options?.rooms) ? payload.filters.options.rooms : profileMirrorFilterOptions.rooms
+    };
+    mirrorBody.innerHTML = '';
+    mirrorBody.appendChild(buildProfileListView(payload, 'Для моего профиля по текущим фильтрам раздач нет.'));
+    return;
+  }
+
+  const profile = await prefetchOpponentProfile(myNickname, {
+    force: false,
+    source: profileModalSource,
+    filters: profileMirrorFilters,
+    suppressRender: true
+  });
+  if (requestId !== profileMirrorRequestId || !mirrorBody.isConnected) return;
+  if (!profile) {
+    mirrorBody.textContent = 'Не удалось построить мою визуализацию.';
+    return;
+  }
+  profileMirrorFilterOptions = {
+    rooms: Array.isArray(profile?.filters?.options?.rooms) ? profile.filters.options.rooms : profileMirrorFilterOptions.rooms
+  };
+  mirrorBody.innerHTML = '';
+  mirrorBody.appendChild(buildProfileLegend(profile?.legend || []));
+  mirrorBody.appendChild(buildProfileGrid(profile?.sections || [], profile?.legend || []));
+}
+
+function renderProfileModal(profile) {
+  if (!profileContentEl || !profileMetaEl || !profileTitleEl) return;
+  profileContentEl.innerHTML = '';
+  profileTitleEl.textContent = `Профиль: ${profile?.opponent || '—'}`;
+  const sources = Array.isArray(profile?.sources) ? profile.sources : [];
+  const sourceText = sources.length
+    ? ` • источники: ${sources.map((item) => `${item.sheetName || 'active'}=${item.rows || 0}`).join(', ')}`
+    : '';
+  profileMetaEl.textContent = `строк в выборке: ${profile?.totalRows || 0} • учтено в секциях: ${profile?.analyzedRows || 0}${sourceText}`;
+
+  const rooms = Array.isArray(profile?.filters?.options?.rooms)
+    ? profile.filters.options.rooms
+    : [];
+  profileFilterOptions = { rooms };
+  profileContentEl.appendChild(renderProfileFilters('main'));
+  profileContentEl.appendChild(buildProfileLegend(profile?.legend || []));
+  profileContentEl.appendChild(buildProfileGrid(profile?.sections || [], profile?.legend || []));
+  appendMirrorPerspectiveSection(profileContentEl);
 }
 
 function renderProfileListPayload(payload) {
@@ -1256,39 +2786,9 @@ function renderProfileListPayload(payload) {
     ? payload.filters.options.rooms
     : [];
   profileFilterOptions = { rooms };
-  profileContentEl.appendChild(renderProfileFilters());
-
-  const samples = Array.isArray(payload?.list)
-    ? payload.list
-      .map((row) => {
-        const rowLabel = String(row?.rowLabel || '').trim() || `#DB:${row?.row ?? '?'}`;
-        return JSON.stringify({
-          type: 'profile_sample_v2',
-          rowLabel,
-          focusStreet: '',
-          streets: {
-            preflop: String(row?.preflop || ''),
-            flop: String(row?.flop || ''),
-            turn: String(row?.turn || ''),
-            river: String(row?.river || '')
-          }
-        });
-      })
-      .filter(Boolean)
-    : [];
-
-  if (!samples.length) {
-    const empty = document.createElement('div');
-    empty.className = 'profile-list-empty';
-    empty.textContent = 'По текущим фильтрам раздач нет.';
-    profileContentEl.appendChild(empty);
-    return;
-  }
-
-  const listWrap = document.createElement('div');
-  listWrap.className = 'profile-list-view';
-  listWrap.appendChild(buildProfileTooltipContent(samples));
-  profileContentEl.appendChild(listWrap);
+  profileContentEl.appendChild(renderProfileFilters('main'));
+  profileContentEl.appendChild(buildProfileListView(payload));
+  appendMirrorPerspectiveSection(profileContentEl);
 }
 
 function renderProfileModalState(opponent, source = PROFILE_DEFAULT_SOURCE) {
@@ -1334,7 +2834,9 @@ async function prefetchOpponentProfile(opponent, options = {}) {
   const name = String(opponent || '').trim();
   if (!name) return null;
   const source = normalizeProfileSource(options.source || PROFILE_DEFAULT_SOURCE);
-  const key = profileCacheKey(name, source, profileFilters);
+  const filters = options.filters || profileFilters;
+  const suppressRender = options.suppressRender === true;
+  const key = profileCacheKey(name, source, filters);
   const force = options.force === true;
   const current = profileCache.get(key);
   if (!force && current && (current.status === 'loading' || current.status === 'ready')) {
@@ -1342,36 +2844,42 @@ async function prefetchOpponentProfile(opponent, options = {}) {
   }
 
   profileCache.set(key, { status: 'loading', profile: null, error: '' });
-  if (profileModalOpponent === name && profileModalSource === source) {
+  if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
     renderProfileModalState(name, source);
   }
 
   try {
     const params = new URLSearchParams({ opponent: name, source });
-    if (Array.isArray(profileFilters.playerGroups) && profileFilters.playerGroups.length) {
-      params.set('players', profileFilters.playerGroups.join(','));
+    if (Array.isArray(filters.playerGroups) && filters.playerGroups.length) {
+      params.set('players', filters.playerGroups.join(','));
     }
-    if (profileFilters.datePreset && profileFilters.datePreset !== 'all') {
-      params.set('date', profileFilters.datePreset);
+    if (filters.datePreset && filters.datePreset !== 'all') {
+      params.set('date', filters.datePreset);
     }
-    if (Array.isArray(profileFilters.gameCards) && profileFilters.gameCards.length) {
-      params.set('games', profileFilters.gameCards.join(','));
+    if (Array.isArray(filters.gameCards) && filters.gameCards.length) {
+      params.set('games', filters.gameCards.join(','));
     }
-    if (Array.isArray(profileFilters.rooms) && profileFilters.rooms.length) {
-      params.set('rooms', profileFilters.rooms.join(','));
+    if (Array.isArray(filters.rooms) && filters.rooms.length) {
+      params.set('rooms', filters.rooms.join(','));
     }
-    if (Array.isArray(profileFilters.potBuckets) && profileFilters.potBuckets.length) {
-      params.set('pots', profileFilters.potBuckets.join(','));
+    if (Array.isArray(filters.potBuckets) && filters.potBuckets.length) {
+      params.set('pots', filters.potBuckets.join(','));
     }
-    if (Array.isArray(profileFilters.limits) && profileFilters.limits.length) {
-      params.set('limits', profileFilters.limits.join(','));
+    if (Array.isArray(filters.limits) && filters.limits.length) {
+      params.set('limits', filters.limits.join(','));
     }
-    if (profileFilters.vsOpponent) {
-      params.set('vs', profileFilters.vsOpponent);
+    if (filters.vsOpponent) {
+      params.set('vs', filters.vsOpponent);
     }
-    if (profileFilters.recentLimit && profileFilters.recentLimit !== 'all') {
-      params.set('recent', profileFilters.recentLimit);
-      params.set('limit', profileFilters.recentLimit);
+    if (String(filters.cardsVisibility || '').toLowerCase() === 'known') {
+      params.set('cards', 'known');
+    }
+    if (filters.recentLimit && filters.recentLimit !== 'all') {
+      params.set('recent', filters.recentLimit);
+      params.set('limit', filters.recentLimit);
+    }
+    if (filters.manualOnly === true) {
+      params.set('manual', '1');
     }
     if (force) params.set('force', '1');
     const response = await fetch(`/api/opponent-visual-profile?${params.toString()}`);
@@ -1380,13 +2888,13 @@ async function prefetchOpponentProfile(opponent, options = {}) {
       throw new Error(data.error || 'Не удалось собрать визуализацию.');
     }
     profileCache.set(key, { status: 'ready', profile: data.profile, error: '' });
-    if (profileModalOpponent === name && profileModalSource === source) {
+    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
       renderProfileModalState(name, source);
     }
     return data.profile;
   } catch (error) {
     profileCache.set(key, { status: 'error', profile: null, error: error.message || 'Ошибка профиля.' });
-    if (profileModalOpponent === name && profileModalSource === source) {
+    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
       renderProfileModalState(name, source);
     }
     return null;
@@ -1397,7 +2905,9 @@ async function prefetchOpponentProfileList(opponent, options = {}) {
   const name = String(opponent || '').trim();
   if (!name) return null;
   const source = normalizeProfileSource(options.source || PROFILE_DEFAULT_SOURCE);
-  const key = profileListCacheKey(name, source, profileFilters);
+  const filters = options.filters || profileFilters;
+  const suppressRender = options.suppressRender === true;
+  const key = profileListCacheKey(name, source, filters);
   const force = options.force === true;
   const current = profileListCache.get(key);
   if (!force && current && (current.status === 'loading' || current.status === 'ready')) {
@@ -1405,36 +2915,42 @@ async function prefetchOpponentProfileList(opponent, options = {}) {
   }
 
   profileListCache.set(key, { status: 'loading', payload: null, error: '' });
-  if (profileModalOpponent === name && profileModalSource === source) {
+  if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
     renderProfileModalState(name, source);
   }
 
   try {
     const params = new URLSearchParams({ opponent: name, source });
-    if (Array.isArray(profileFilters.playerGroups) && profileFilters.playerGroups.length) {
-      params.set('players', profileFilters.playerGroups.join(','));
+    if (Array.isArray(filters.playerGroups) && filters.playerGroups.length) {
+      params.set('players', filters.playerGroups.join(','));
     }
-    if (profileFilters.datePreset && profileFilters.datePreset !== 'all') {
-      params.set('date', profileFilters.datePreset);
+    if (filters.datePreset && filters.datePreset !== 'all') {
+      params.set('date', filters.datePreset);
     }
-    if (Array.isArray(profileFilters.gameCards) && profileFilters.gameCards.length) {
-      params.set('games', profileFilters.gameCards.join(','));
+    if (Array.isArray(filters.gameCards) && filters.gameCards.length) {
+      params.set('games', filters.gameCards.join(','));
     }
-    if (Array.isArray(profileFilters.rooms) && profileFilters.rooms.length) {
-      params.set('rooms', profileFilters.rooms.join(','));
+    if (Array.isArray(filters.rooms) && filters.rooms.length) {
+      params.set('rooms', filters.rooms.join(','));
     }
-    if (Array.isArray(profileFilters.potBuckets) && profileFilters.potBuckets.length) {
-      params.set('pots', profileFilters.potBuckets.join(','));
+    if (Array.isArray(filters.potBuckets) && filters.potBuckets.length) {
+      params.set('pots', filters.potBuckets.join(','));
     }
-    if (Array.isArray(profileFilters.limits) && profileFilters.limits.length) {
-      params.set('limits', profileFilters.limits.join(','));
+    if (Array.isArray(filters.limits) && filters.limits.length) {
+      params.set('limits', filters.limits.join(','));
     }
-    if (profileFilters.vsOpponent) {
-      params.set('vs', profileFilters.vsOpponent);
+    if (filters.vsOpponent) {
+      params.set('vs', filters.vsOpponent);
     }
-    if (profileFilters.recentLimit && profileFilters.recentLimit !== 'all') {
-      params.set('recent', profileFilters.recentLimit);
-      params.set('limit', profileFilters.recentLimit);
+    if (String(filters.cardsVisibility || '').toLowerCase() === 'known') {
+      params.set('cards', 'known');
+    }
+    if (filters.recentLimit && filters.recentLimit !== 'all') {
+      params.set('recent', filters.recentLimit);
+      params.set('limit', filters.recentLimit);
+    }
+    if (filters.manualOnly === true) {
+      params.set('manual', '1');
     }
 
     const response = await fetch(`/api/opponent-visual-list?${params.toString()}`);
@@ -1450,13 +2966,13 @@ async function prefetchOpponentProfileList(opponent, options = {}) {
       filters: data.filters || { options: { rooms: [] } }
     };
     profileListCache.set(key, { status: 'ready', payload, error: '' });
-    if (profileModalOpponent === name && profileModalSource === source) {
+    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
       renderProfileModalState(name, source);
     }
     return payload;
   } catch (error) {
     profileListCache.set(key, { status: 'error', payload: null, error: error.message || 'Ошибка списка.' });
-    if (profileModalOpponent === name && profileModalSource === source) {
+    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
       renderProfileModalState(name, source);
     }
     return null;
@@ -1466,30 +2982,41 @@ async function prefetchOpponentProfileList(opponent, options = {}) {
 function openProfileModal(opponent, options = {}) {
   if (!profileModalEl) return;
   const source = normalizeProfileSource(options.source || PROFILE_DEFAULT_SOURCE);
+  hideProfileTooltip({ force: true });
+  hhManualReportDrafts.clear();
   profileModalOpponent = opponent;
   profileModalSource = source;
   profileViewMode = 'chart';
   profileFilters = createDefaultProfileFilters();
-  if (source === 'hh') {
-    applyVsDefaultForCurrentRoom();
-  } else {
-    setVsFilter('', { persist: false });
-  }
+  profileVsMeEnabled = false;
   profileFilterOptions = { rooms: [] };
+  profileMirrorFilterOptions = { rooms: [] };
+  profileMirrorVsHimEnabled = true;
+  profileMirrorRequestId += 1;
+  resetMirrorFilters();
+  if (source !== 'hh') {
+    profileMirrorFilters = createDefaultProfileFilters();
+  }
   profileModalEl.classList.remove('hidden');
   profileModalEl.setAttribute('aria-hidden', 'false');
   renderProfileModalState(opponent, source);
-  prefetchOpponentProfile(opponent, { force: true, source });
+  prefetchOpponentProfile(opponent, { force: true, source, filters: profileFilters });
 }
 
 function closeProfileModal() {
   if (!profileModalEl) return;
+  if (isHhManualRecordingActive()) {
+    hhManualRecorder.stop();
+  }
+  hhManualReportDrafts.clear();
   profileModalOpponent = '';
   profileModalSource = PROFILE_DEFAULT_SOURCE;
   profileViewMode = 'chart';
+  profileVsMeEnabled = false;
+  profileMirrorRequestId += 1;
   profileModalEl.classList.add('hidden');
   profileModalEl.setAttribute('aria-hidden', 'true');
-  hideProfileTooltip();
+  hideProfileTooltip({ force: true });
 }
 
 function cardElement(card, options = {}) {
@@ -1787,7 +3314,7 @@ function renderHandHistoryOpponents() {
       btn.classList.add('active');
     }
     btn.addEventListener('click', () => {
-      if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+      if (isAnyRecordingActive() || isBatchProcessing) {
         setStatus('Сначала дождись завершения текущей операции.', 'error');
         return;
       }
@@ -1802,14 +3329,19 @@ function renderHandHistoryOpponents() {
 
 function updateRecordUI() {
   activeOpponentEl.textContent = activeOpponent || '—';
-  const isRecording = Boolean(mediaRecorder && mediaRecorder.state === 'recording');
-  const isBusy = isRecording || isBatchProcessing;
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
+  const isMainRecording = isMainRecordingActive();
+  const isManualRecording = isHhManualRecordingActive();
+  const isBusy = isMainRecording || isManualRecording || isBatchProcessing;
+  if (isMainRecording) {
     recordStatusEl.textContent = currentRecordMode === 'field' ? `правка: ${currentEditField}` : 'запись…';
     recordHint.textContent = currentRecordMode === 'field'
       ? `передиктовка поля ${currentEditField}`
       : 'говори улицы и пресуппозицию';
     stopRecordBtn.disabled = false;
+  } else if (isManualRecording) {
+    recordStatusEl.textContent = 'запись HH поля...';
+    recordHint.textContent = 'идет ручная голосовая правка раздачи';
+    stopRecordBtn.disabled = true;
   } else if (isBatchProcessing) {
     recordStatusEl.textContent = 'обработка HH файлов...';
     recordHint.textContent = activeOpponent ? 'идет пакетная обработка' : 'нет выбранного оппа';
@@ -1847,7 +3379,7 @@ function updateRecordUI() {
 }
 
 async function handleOpponentClick(name) {
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }
@@ -1906,7 +3438,7 @@ function removeOpponent(name) {
 }
 
 function clearActiveOpponents() {
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }
@@ -1923,6 +3455,9 @@ function clearActiveOpponents() {
 
 addOpponentBtn.addEventListener('click', addOpponent);
 clearOpponentsBtn.addEventListener('click', clearActiveOpponents);
+if (clearHhDbBtn) {
+  clearHhDbBtn.addEventListener('click', clearAllHhHandsInDb);
+}
 if (saveReportBtn) {
   saveReportBtn.addEventListener('click', saveReport);
 }
@@ -1988,6 +3523,14 @@ if (profileModalEl) {
     }
   });
   profileModalEl.addEventListener('mouseleave', hideProfileTooltip);
+}
+if (profileTooltipEl) {
+  profileTooltipEl.addEventListener('dblclick', (event) => {
+    if (event.button !== 0) return;
+    hideProfileTooltip({ force: true });
+    event.preventDefault();
+    event.stopPropagation();
+  });
 }
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && profileModalEl && !profileModalEl.classList.contains('hidden')) {
@@ -2147,7 +3690,7 @@ async function submitHandHistory() {
     setStatus('Вставь hand history.', 'error');
     return;
   }
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }
@@ -2213,7 +3756,7 @@ async function submitHandHistoryFiles() {
     setStatus('Выбери минимум один файл с hand history.', 'error');
     return;
   }
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }
@@ -2311,7 +3854,7 @@ function renderParsed(parsed = {}) {
     input.type = 'text';
     input.value = parsed[key] || '';
     input.placeholder = '—';
-    input.disabled = !activeOpponent || !lastSavedRow || (mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing;
+    input.disabled = !activeOpponent || !lastSavedRow || isAnyRecordingActive() || isBatchProcessing;
     input.addEventListener('input', () => {
       lastParsed[key] = input.value;
     });
@@ -2331,13 +3874,13 @@ function renderParsed(parsed = {}) {
     const editBtn = document.createElement('button');
     editBtn.className = 'field-edit-btn ghost';
     editBtn.textContent = 'передиктовать';
-    editBtn.disabled = !activeOpponent || !lastSavedRow || (mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing;
+    editBtn.disabled = !activeOpponent || !lastSavedRow || isAnyRecordingActive() || isBatchProcessing;
     editBtn.addEventListener('click', () => redictateField(key));
 
     const saveBtn = document.createElement('button');
     saveBtn.className = 'field-save-btn ghost';
     saveBtn.textContent = 'сохранить';
-    saveBtn.disabled = !activeOpponent || !lastSavedRow || (mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing;
+    saveBtn.disabled = !activeOpponent || !lastSavedRow || isAnyRecordingActive() || isBatchProcessing;
     saveBtn.addEventListener('click', async () => saveFieldText(key, input.value));
 
     actions.appendChild(editBtn);
@@ -2357,7 +3900,7 @@ async function saveFieldText(field, value) {
     setStatus('Нет сохраненной строки для правки. Сначала сделай обычную запись.', 'error');
     return;
   }
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }
@@ -2416,7 +3959,7 @@ async function redictateField(field) {
     setStatus('Нет сохраненной строки для правки. Сначала сделай обычную запись.', 'error');
     return;
   }
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }
@@ -2429,7 +3972,7 @@ async function saveReport() {
     setStatus('Сначала сделай запись раздачи, затем можно сохранить репорт.', 'error');
     return;
   }
-  if ((mediaRecorder && mediaRecorder.state === 'recording') || isBatchProcessing) {
+  if (isAnyRecordingActive() || isBatchProcessing) {
     setStatus('Сначала дождись завершения текущей операции.', 'error');
     return;
   }

@@ -198,6 +198,95 @@ test('parseHandHistory extracts blinds target and pot-based sizing context', () 
   assert.equal(flopBet.pctPot, 75);
 });
 
+test('parseHandHistory defaults Omaha Pot Limit without card count to PLO4 and parses blinds', () => {
+  const hand = `
+PokerStars Hand #376591149: Omaha Pot Limit (¥10/¥20 CNY) - 2026/02/02 18:18:15 UTC
+Table 'PMS_Cpr_PLO ₮2,000 I - 20490' 7-max Seat #5 is the button
+Seat 1: armdll66 (¥5746.49 in chips)
+Seat 2: OnionKnights (¥1137.17 in chips)
+Sepp: posts small blind ¥10
+happysally: posts big blind ¥20
+*** HOLE CARDS ***
+armdll66: folds
+OnionKnights: folds
+*** FLOP *** [Ad Th Td]
+  `.trim();
+
+  const parsed = parseHandHistory(hand, 'armdll66');
+  assert.equal(parsed.gameCardCount, 4);
+  assert.equal(parsed.blinds.smallBlind, 10);
+  assert.equal(parsed.blinds.bigBlind, 20);
+});
+
+test('parseHandHistory keeps dealt hero cards as known cards without showdown', () => {
+  const hand = `
+PokerStars Hand #390447060:  5 Card Omaha Pot Limit (¥10/¥20 CNY) - 2026/02/23 20:50:01 UTC
+Table 'PMS_Cpr_5PLO ₮2,000 II - 22601' 7-max Seat #4 is the button
+Seat 1: Zihuatanejo (¥3778.64 in chips)
+Seat 6: Grexometr (¥2372.60 in chips)
+Seat 7: cryptopunk0 (¥12471.27 in chips)
+Grexometr: posts big blind ¥20
+*** HOLE CARDS ***
+Dealt to cryptopunk0 [Jc As Js Ad Qs]
+cryptopunk0: calls ¥20
+Grexometr: raises ¥80 to ¥100
+cryptopunk0: raises ¥240 to ¥340
+Grexometr: calls ¥240
+*** FLOP *** [9h 8c 6s]
+Grexometr: bets ¥363
+cryptopunk0: folds
+Uncalled bet (¥363) returned to Grexometr
+*** SUMMARY ***
+Total pot ¥734 | Rake ¥8
+`.trim();
+
+  const parsed = parseHandHistory(hand, 'cryptopunk0');
+  assert.equal(parsed.targetPlayer, 'cryptopunk0');
+  assert.equal(parsed.showdown.mandatory, false);
+  assert.deepEqual(parsed.targetCards, ['Jc', 'As', 'Js', 'Ad', 'Qs']);
+  assert.equal(parsed.showdown.targetCardSource, 'dealt');
+  assert.deepEqual(parsed.showdown.dealtCardsByPlayer.cryptopunk0, ['Jc', 'As', 'Js', 'Ad', 'Qs']);
+  assert.deepEqual(parsed.showdown.knownCardsByPlayer.cryptopunk0, ['Jc', 'As', 'Js', 'Ad', 'Qs']);
+  assert.equal(parsed.showdown.showCardsByPlayer.cryptopunk0, undefined);
+});
+
+test('parseHandHistory prioritizes showdown cards over dealt cards when both exist', () => {
+  const hand = `
+PokerStars Hand #390435830:  5 Card Omaha Pot Limit (¥10/¥20 CNY) - 2026/02/23 20:34:43 UTC
+Table 'PMS_Cpr_5PLO ₮2,000 II - 22601' 7-max Seat #7 is the button
+Seat 2: H0ffa (¥2000 in chips)
+Seat 5: NiceHandSir (¥718 in chips)
+Seat 7: cryptopunk0 (¥11185.27 in chips)
+H0ffa: posts big blind ¥20
+*** HOLE CARDS ***
+Dealt to cryptopunk0 [2h 6d 7h Ad Ah]
+NiceHandSir: raises ¥50 to ¥70
+cryptopunk0: raises ¥170 to ¥240
+H0ffa: calls ¥220
+NiceHandSir: calls ¥170
+*** FLOP *** [9d 3s 7d]
+H0ffa: checks
+NiceHandSir: checks
+cryptopunk0: bets ¥368
+H0ffa: calls ¥368
+NiceHandSir: calls ¥368
+*** TURN *** [9d 3s 7d] [3c]
+H0ffa: checks
+cryptopunk0: checks
+*** RIVER *** [9d 3s 7d 3c] [2c]
+H0ffa: checks
+cryptopunk0: checks
+*** SHOW DOWN ***
+NiceHandSir: shows [Jc 6s 8h 7c Jh]
+cryptopunk0: shows [2h 6d 7h Ad Ah]
+`.trim();
+
+  const parsed = parseHandHistory(hand, 'cryptopunk0');
+  assert.equal(parsed.showdown.targetCardSource, 'showdown');
+  assert.deepEqual(parsed.showdown.showCardsByPlayer.cryptopunk0, ['2h', '6d', '7h', 'Ad', 'Ah']);
+  assert.deepEqual(parsed.showdown.knownCardsByPlayer.cryptopunk0, ['2h', '6d', '7h', 'Ad', 'Ah']);
+});
+
 test('buildHandHistoryContext renders TARGET/OTHER summary', () => {
   const parsed = parseHandHistory(SAMPLE_HH, 'ThatWas 86761294');
   const context = buildHandHistoryContext(parsed);

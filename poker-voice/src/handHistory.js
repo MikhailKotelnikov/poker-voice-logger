@@ -28,7 +28,7 @@ function escapeRegExp(value) {
 function parseBlinds(handHistory) {
   const line = String(handHistory || '')
     .split(/\r?\n/)
-    .find((item) => item.includes('(') && item.includes('/') && item.includes('Card'));
+    .find((item) => item.includes('(') && item.includes('/') && /omaha/i.test(item));
   if (!line) {
     return { smallBlind: null, bigBlind: null };
   }
@@ -52,7 +52,9 @@ function parseBlinds(handHistory) {
 function parseGameCardCount(handHistory) {
   const source = String(handHistory || '');
   const match = source.match(/(\d+)\s*Card\s+Omaha/i);
-  if (!match?.[1]) return null;
+  if (!match?.[1]) {
+    return /omaha\s+pot\s+limit/i.test(source) ? 4 : null;
+  }
   const value = Number(match[1]);
   return Number.isFinite(value) ? value : null;
 }
@@ -211,6 +213,19 @@ function parseActionLine(line) {
     return { player, type: 'show', cards: cards.split(/\s+/).filter(Boolean), raw: action };
   }
   return { player, type: 'other', raw: action };
+}
+
+function parseDealtCardsLine(line) {
+  const match = String(line || '').match(/^Dealt to\s+(.+?)\s+\[([^\]]+)\]\s*$/i);
+  if (!match?.[1] || !match?.[2]) return null;
+  const player = String(match[1] || '').trim();
+  const cards = String(match[2] || '')
+    .trim()
+    .split(/\s+/)
+    .map((card) => card.trim())
+    .filter(Boolean);
+  if (!player || !cards.length) return null;
+  return { player, cards };
 }
 
 function parseUncalledReturnLine(line) {
@@ -989,6 +1004,7 @@ export function parseHandHistory(handHistory, opponent) {
   const streetStartPot = { preflop: 0, flop: null, turn: null, river: null };
   const events = { preflop: [], flop: [], turn: [], river: [] };
   const showEvents = [];
+  const dealtCardsByPlayer = {};
   const voluntaryShowEvents = [];
   const playersSet = new Set();
   const seatToPlayer = new Map();
@@ -1085,6 +1101,13 @@ export function parseHandHistory(handHistory, opponent) {
 
         streetEvents.push(event);
       }
+      continue;
+    }
+
+    const dealtCards = parseDealtCardsLine(line);
+    if (dealtCards) {
+      playersSet.add(dealtCards.player);
+      dealtCardsByPlayer[dealtCards.player] = dealtCards.cards;
       continue;
     }
 
@@ -1216,12 +1239,28 @@ export function parseHandHistory(handHistory, opponent) {
   const positionsByPlayer = buildPositionMap(buttonSeat, seatToPlayer);
   const targetPlayer = findTargetPlayer(opponent, players);
   const targetShow = showEvents.find((event) => event.player === targetPlayer);
-  const targetCards = targetShow?.cards || [];
+  const targetShowCards = targetShow?.cards || [];
   const showCardsByPlayer = {};
   for (const event of showEvents) {
     if (!event?.player || !Array.isArray(event.cards) || !event.cards.length) continue;
     showCardsByPlayer[event.player] = event.cards;
   }
+  const knownCardsByPlayer = {};
+  const knownCardsSourceByPlayer = {};
+  for (const player of players) {
+    const showCards = Array.isArray(showCardsByPlayer[player]) ? showCardsByPlayer[player] : [];
+    const dealtCards = Array.isArray(dealtCardsByPlayer[player]) ? dealtCardsByPlayer[player] : [];
+    if (showCards.length) {
+      knownCardsByPlayer[player] = showCards;
+      knownCardsSourceByPlayer[player] = 'showdown';
+      continue;
+    }
+    if (dealtCards.length) {
+      knownCardsByPlayer[player] = dealtCards;
+      knownCardsSourceByPlayer[player] = 'dealt';
+    }
+  }
+  const targetCards = Array.isArray(knownCardsByPlayer[targetPlayer]) ? knownCardsByPlayer[targetPlayer] : targetShowCards;
   const streetClassByPlayer = {};
   const streetDrawByPlayer = {};
   for (const [player, cards] of Object.entries(showCardsByPlayer)) {
@@ -1261,11 +1300,15 @@ export function parseHandHistory(handHistory, opponent) {
       showEvents,
       voluntaryShowEvents,
       targetCards,
+      targetCardSource: String(knownCardsSourceByPlayer[targetPlayer] || ''),
       targetStreetClass,
       primaryOpponent: primaryOpponentShow?.player || '',
       primaryOpponentCards,
       opponentStreetClass,
       showCardsByPlayer,
+      dealtCardsByPlayer,
+      knownCardsByPlayer,
+      knownCardsSourceByPlayer,
       streetClassByPlayer,
       streetDrawByPlayer
     }
@@ -1303,6 +1346,7 @@ export function buildHandHistoryContext(parsed) {
   lines.push(`street_start_pot=preflop:${formatNum(parsed?.streetStartPot?.preflop)} flop:${formatNum(parsed?.streetStartPot?.flop)} turn:${formatNum(parsed?.streetStartPot?.turn)} river:${formatNum(parsed?.streetStartPot?.river)}`);
   lines.push(`board=flop:[${(parsed?.board?.flop || []).join(' ')}] turn:[${parsed?.board?.turn || ''}] river:[${parsed?.board?.river || ''}]`);
   lines.push(`target_cards=[${(parsed?.targetCards || []).join(' ')}]`);
+  lines.push(`target_cards_source=${parsed?.showdown?.targetCardSource || ''}`);
   const positions = parsed?.positionsByPlayer || {};
   const positionPairs = Object.entries(positions)
     .map(([player, position]) => `${player}:${position}`)
@@ -1573,7 +1617,10 @@ function formatPlayerPrefix(player, parsedHistory) {
 }
 
 function playerStreetHandToken(parsedHistory, player, street) {
-  const cards = compactCards(parsedHistory?.showdown?.showCardsByPlayer?.[player]);
+  const knownCards = parsedHistory?.showdown?.knownCardsByPlayer?.[player]
+    || parsedHistory?.showdown?.showCardsByPlayer?.[player]
+    || [];
+  const cards = compactCards(knownCards);
   if (!cards) return '';
   const cls = parsedHistory?.showdown?.streetClassByPlayer?.[player]?.[street] || '';
   const drawTokens = parsedHistory?.showdown?.streetDrawByPlayer?.[player]?.[street] || [];
@@ -1581,7 +1628,7 @@ function playerStreetHandToken(parsedHistory, player, street) {
   const boardCards = streetBoardCards(parsedHistory, street);
   const pairedBoardModifier = (
     cls === 'ov'
-    && hasPairToBoard(parsedHistory?.showdown?.showCardsByPlayer?.[player] || [], boardCards)
+    && hasPairToBoard(knownCards, boardCards)
   )
     ? ['p']
     : [];

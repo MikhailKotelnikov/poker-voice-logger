@@ -70,6 +70,21 @@ Load this file before any substantial task. Then load only relevant rule files.
 63. [Probe Miss Must Track Flop Check-Through Turn Spot](./visual-profile-probe-miss-must-track-check-through-turn.md)
 64. [Tooltip Samples Must Preserve HH Meta](./visual-tooltip-samples-must-preserve-hh-meta.md)
 65. [Visual All-In Lane Must Use Anchor Action, Not Any Street All-In](./visual-profile-all-in-lane-must-use-anchor-action.md)
+66. [HH Manual Observations Must Survive HH Clears](./process-hh-manual-observations-must-survive-hh-clears.md)
+67. [Visual Profile Meta Must Not Coerce Null To Zero](./visual-profile-meta-must-not-coerce-null-to-zero.md)
+68. [HH Parser Must Default Omaha Pot Limit To PLO4](./process-hh-parser-omaha-pot-limit-defaults-to-plo4.md)
+69. [Visual Tooltip Interactive Mode Must Support Pin](./visual-tooltip-interactive-mode-must-support-pin.md)
+70. [HH Manual Fields Must Use Enter-Save And Inline Mic](./visual-hh-manual-fields-enter-save-inline-mic.md)
+71. [Visual Tooltip Manual Inputs Must Override Global Text Input Style](./visual-tooltip-manual-input-must-override-global-text-style.md)
+72. [HH Manual Join Must Use Selected Target Identity](./process-hh-manual-joins-must-use-selected-target-identity.md)
+73. [Pinned Tooltip Edits Must Sync Source Sample Payload](./visual-tooltip-pinned-edits-must-sync-sample-payload.md)
+74. [HH Clear Opponent Must Match Profile Selection Predicate](./process-hh-clear-opponent-must-match-profile-selection.md)
+75. [Visual Tooltip Readonly Mode Must Show Saved Timings](./visual-tooltip-readonly-must-show-saved-timings.md)
+76. [Visual List Mode Must Hide Empty Timing Controls And Fit Viewport](./visual-list-mode-must-hide-empty-timing-controls-and-fit-viewport.md)
+77. [HH Manual Presupposition Fields Must Offer Click Presets](./visual-hh-manual-presup-fields-must-offer-presets.md)
+78. [Profile VS-Me Filter Must Use Room-Scoped My Nickname](./visual-profile-vs-me-must-use-room-scoped-my-nickname.md)
+79. [HH Preset Selection Must Commit On Pointerdown](./visual-hh-presets-must-commit-on-pointerdown.md)
+80. [HH Card Visibility Must Distinguish Showdown vs Dealt Source](./process-hh-cards-visibility-showdown-vs-dealt.md)
 
 ## How to Add a Rule
 

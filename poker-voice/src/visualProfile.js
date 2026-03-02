@@ -88,7 +88,22 @@ function cleanText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
-function buildSamplePayload(rowLabel, streets, focusStreet = '', meta = null, manual = null) {
+function normalizeSampleTimingEntries(timings) {
+  if (!Array.isArray(timings)) return [];
+  return timings
+    .map((item) => ({
+      street: String(item?.street || '').trim().toLowerCase(),
+      actionIndex: Number(item?.actionIndex),
+      actionKey: cleanText(item?.actionKey),
+      timing: cleanText(item?.timing).toLowerCase()
+    }))
+    .filter((item) => ['preflop', 'flop', 'turn', 'river'].includes(item.street)
+      && Number.isFinite(item.actionIndex)
+      && item.actionIndex >= 0
+      && item.timing);
+}
+
+function buildSamplePayload(rowLabel, streets, focusStreet = '', meta = null, manual = null, context = null, timings = null) {
   const manualFields = manual && typeof manual === 'object'
     ? {
       preflop: cleanText(manual.preflop),
@@ -98,12 +113,25 @@ function buildSamplePayload(rowLabel, streets, focusStreet = '', meta = null, ma
       handPresupposition: cleanText(manual.handPresupposition || manual.hand_presupposition)
     }
     : null;
+  const contextFields = context && typeof context === 'object'
+    ? {
+      row: Number.isFinite(Number(context.row)) ? Number(context.row) : null,
+      handNumber: cleanText(context.handNumber),
+      room: cleanText(context.room).toLowerCase(),
+      opponent: cleanText(context.opponent),
+      source: cleanText(context.source).toLowerCase(),
+      targetIdentity: cleanText(context.targetIdentity).toLowerCase()
+    }
+    : null;
+  const timingEntries = normalizeSampleTimingEntries(timings);
   return JSON.stringify({
     type: 'profile_sample_v2',
     rowLabel: cleanText(rowLabel),
     focusStreet: String(focusStreet || '').toLowerCase(),
     meta: meta && typeof meta === 'object' ? meta : undefined,
     manual: manualFields || undefined,
+    context: contextFields || undefined,
+    timings: timingEntries.length ? timingEntries : undefined,
     streets: {
       preflop: cleanText(streets?.preflop),
       flop: cleanText(streets?.flop),
@@ -320,6 +348,34 @@ function findTargetCallVsAggressor(segments, targetIdentity) {
     }
   }
   return null;
+}
+
+function isTargetAnchorAllIn(segments, targetIdentity) {
+  if (!Array.isArray(segments) || !segments.length || !targetIdentity) return false;
+  let anchorIndex = -1;
+  let anchorAllIn = false;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (!segment || segment.identity !== targetIdentity) continue;
+    if (segment.kind !== 'bet' && segment.kind !== 'raise') continue;
+    anchorIndex = index;
+    anchorAllIn = Boolean(segment.allIn);
+    break;
+  }
+  if (anchorIndex < 0) return false;
+  if (anchorAllIn) return true;
+
+  for (let index = anchorIndex + 1; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (!segment || segment.kind === 'other') continue;
+    if (segment.identity === targetIdentity && (segment.kind === 'bet' || segment.kind === 'raise')) {
+      break;
+    }
+    if (segment.identity !== targetIdentity && segment.kind === 'call' && segment.allIn) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function firstActionIndex(segments, identity) {
@@ -818,21 +874,36 @@ function groupToRows(groupCounters, bucketOrder = DEFAULT_BUCKET_ORDER) {
 }
 
 function buildSampleMeta(row = {}) {
-  const gameCards = Number(row?.gameCardCount);
-  const activePlayers = Number(row?.activePlayersCount);
-  const finalPotBb = Number(row?.finalPotBb);
-  const sb = Number(row?.sb);
-  const bb = Number(row?.bb);
+  const toFinite = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+
+  const gameCards = toFinite(row?.gameCardCount);
+  const activePlayers = toFinite(row?.activePlayersCount);
+  const finalPotBb = toFinite(row?.finalPotBb);
+  const sb = toFinite(row?.sb);
+  const bb = toFinite(row?.bb);
   const room = cleanText(row?.room || '').toLowerCase();
   const handNumber = cleanText(row?.handNumber || '');
   const playedAtUtc = cleanText(row?.playedAtUtc || '');
+  const limitText = cleanText(row?.limitText || '');
+  const parsedLimitFromText = (() => {
+    if (!limitText) return '';
+    const match = limitText.match(/(\d+(?:[.,]\d+)?)\s*\/\s*(\d+(?:[.,]\d+)?)/);
+    if (!match?.[1] || !match?.[2]) return '';
+    const left = String(match[1]).replace(',', '.');
+    const right = String(match[2]).replace(',', '.');
+    return `${left}-${right}`;
+  })();
 
   const potBucket = Number.isFinite(finalPotBb)
     ? (finalPotBb < 15 ? 'small' : finalPotBb < 35 ? 'medium' : finalPotBb < 90 ? 'large' : 'huge')
     : '';
   const limit = Number.isFinite(sb) && Number.isFinite(bb)
     ? `${sb}-${bb}`
-    : '';
+    : parsedLimitFromText;
 
   const out = {
     handNumber,
@@ -891,6 +962,31 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       river: riverRaw
     };
     const sampleMeta = buildSampleMeta(row);
+    const sampleManual = {
+      preflop: row?.manualPreflop,
+      flop: row?.manualFlop,
+      turn: row?.manualTurn,
+      river: row?.manualRiver,
+      handPresupposition: row?.handPresupposition
+    };
+    const sampleContext = {
+      row: Number(row?.row),
+      handNumber: row?.handNumber,
+      room: row?.room,
+      opponent: options?.opponent || '',
+      source: String(row?.nickname || '').toLowerCase() === 'hh' ? 'hh' : 'voice',
+      targetIdentity
+    };
+    const sampleTimings = Array.isArray(row?.manualTimings) ? row.manualTimings : [];
+    const sampleForStreet = (street) => buildSamplePayload(
+      rowLabel,
+      sampleBase,
+      street,
+      sampleMeta,
+      sampleManual,
+      sampleContext,
+      sampleTimings
+    );
     const actionByStreet = {
       flop: extractStreetActionSummary(flopText),
       turn: extractStreetActionSummary(turnText),
@@ -900,6 +996,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
       flop: parseStreetSegments(flopRaw),
       turn: parseStreetSegments(turnRaw),
       river: parseStreetSegments(riverRaw)
+    };
+    const anchorAllInByStreet = {
+      flop: isTargetAnchorAllIn(segmentsByStreet.flop, targetIdentity),
+      turn: isTargetAnchorAllIn(segmentsByStreet.turn, targetIdentity),
+      river: isTargetAnchorAllIn(segmentsByStreet.river, targetIdentity)
     };
     const hasVsByStreet = {
       flop: streetHasIdentityAction(segmentsByStreet.flop, vsIdentity),
@@ -960,8 +1061,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           group,
           bucket,
           strength,
-          buildSamplePayload(rowLabel, sampleBase, 'flop', sampleMeta),
-          { allIn: actionByStreet.flop.firstBetAllIn }
+          sampleForStreet('flop'),
+          { allIn: hasActorContext ? anchorAllInByStreet.flop : actionByStreet.flop.firstBetAllIn }
         );
         analyzedRows += 1;
       }
@@ -981,11 +1082,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             'All',
             turnBucket,
             turnStrength,
-            buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta),
-            { allIn: actionByStreet.turn.firstBetAllIn }
+            sampleForStreet('turn'),
+            { allIn: hasActorContext ? anchorAllInByStreet.turn : actionByStreet.turn.firstBetAllIn }
           );
         } else if (actionByStreet.turn.hasAction && targetTurnHasCheck && !targetTurnHasBet) {
-          addCount(sections.betbet, 'All', 'Miss', turnStrength, buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta));
+          addCount(sections.betbet, 'All', 'Miss', turnStrength, sampleForStreet('turn'));
         }
       }
 
@@ -998,8 +1099,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           'All',
           turnDonkOutcome.outcome,
           turnStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta),
-          { allIn: turnDonkOutcome.outcome === 'Donk' && turnDonkOutcome.allIn }
+          sampleForStreet('turn'),
+          {
+            allIn: turnDonkOutcome.outcome === 'Donk'
+              && (turnDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.turn : false))
+          }
         );
       }
 
@@ -1011,8 +1115,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           group,
           turnBucket,
           turnStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta),
-          { allIn: actionByStreet.turn.firstBetAllIn }
+          sampleForStreet('turn'),
+          { allIn: hasActorContext ? anchorAllInByStreet.turn : actionByStreet.turn.firstBetAllIn }
         );
       } else if (flopAllChecked && actionByStreet.turn.hasAction && targetTurnHasCheck && !targetTurnHasBet && hasVsByStreet.turn) {
         const group = detectMultiway(turnRaw || turnText) ? 'MW' : 'HU';
@@ -1021,7 +1125,7 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           group,
           'Miss',
           turnStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'turn', sampleMeta)
+          sampleForStreet('turn')
         );
       }
     }
@@ -1041,8 +1145,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           'All',
           riverBucket,
           riverStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-          { allIn: actionByStreet.river.firstBetAllIn }
+          sampleForStreet('river'),
+          { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
         );
       }
 
@@ -1055,11 +1159,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             'All',
             riverBucket,
             riverStrength,
-            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-            { allIn: actionByStreet.river.firstBetAllIn }
+            sampleForStreet('river'),
+            { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverXbb, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
+          addCount(sections.riverXbb, 'All', 'Miss', riverStrength, sampleForStreet('river'));
         }
       }
 
@@ -1073,8 +1177,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           'All',
           riverDonkOutcome.outcome,
           riverStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-          { allIn: riverDonkOutcome.outcome === 'Donk' && riverDonkOutcome.allIn }
+          sampleForStreet('river'),
+          {
+            allIn: riverDonkOutcome.outcome === 'Donk'
+              && (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+          }
         );
       }
 
@@ -1087,11 +1194,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             'All',
             riverBucket,
             riverStrength,
-            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-            { allIn: actionByStreet.river.firstBetAllIn }
+            sampleForStreet('river'),
+            { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverBxb, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
+          addCount(sections.riverBxb, 'All', 'Miss', riverStrength, sampleForStreet('river'));
         }
       }
 
@@ -1101,8 +1208,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           'All',
           riverDonkOutcome.outcome,
           riverStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-          { allIn: riverDonkOutcome.outcome === 'Donk' && riverDonkOutcome.allIn }
+          sampleForStreet('river'),
+          {
+            allIn: riverDonkOutcome.outcome === 'Donk'
+              && (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+          }
         );
       }
 
@@ -1115,11 +1225,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             'All',
             riverBucket,
             riverStrength,
-            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-            { allIn: actionByStreet.river.firstBetAllIn }
+            sampleForStreet('river'),
+            { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         } else if (hasRiverAction && hasRiverCheck) {
-          addCount(sections.riverOnce, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
+          addCount(sections.riverOnce, 'All', 'Miss', riverStrength, sampleForStreet('river'));
         }
       } else if (!hasActorContext && !vsIdentity && detectSingleRiverBetLine(riverText) && riverBucket) {
         // Voice-format fallback without structured actors.
@@ -1128,8 +1238,8 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           'All',
           riverBucket,
           riverStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-          { allIn: actionByStreet.river.firstBetAllIn }
+          sampleForStreet('river'),
+          { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
         );
       }
 
@@ -1143,12 +1253,12 @@ export function buildOpponentVisualProfile(rows, options = {}) {
             'All',
             riverBucket,
             riverStrength,
-            buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-            { allIn: actionByStreet.river.firstBetAllIn }
+            sampleForStreet('river'),
+            { allIn: hasActorContext ? anchorAllInByStreet.river : actionByStreet.river.firstBetAllIn }
           );
         }
       } else if (isTripleMiss && hasVsByStreet.river) {
-        addCount(sections.betbetbet, 'All', 'Miss', riverStrength, buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta));
+        addCount(sections.betbetbet, 'All', 'Miss', riverStrength, sampleForStreet('river'));
       }
 
       const hasCallFlopAndTurnVsAggressor = Boolean(flopCallVsAggressor && turnCallVsAggressor);
@@ -1158,8 +1268,11 @@ export function buildOpponentVisualProfile(rows, options = {}) {
           'All',
           riverDonkOutcome.outcome,
           riverStrength,
-          buildSamplePayload(rowLabel, sampleBase, 'river', sampleMeta),
-          { allIn: riverDonkOutcome.outcome === 'Donk' && riverDonkOutcome.allIn }
+          sampleForStreet('river'),
+          {
+            allIn: riverDonkOutcome.outcome === 'Donk'
+              && (riverDonkOutcome.allIn || (hasActorContext ? anchorAllInByStreet.river : false))
+          }
         );
       }
 
