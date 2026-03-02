@@ -857,8 +857,16 @@ function syncProfileTooltipSampleInput(parsed) {
   patchCachedProfileLists(parsedContext, manual, timings);
 
   if (Array.isArray(profileTooltipSampleInput)) {
-    profileTooltipSampleInput = profileTooltipSampleInput
-      .map((item) => patchSamplePayloadWithParsed(item, parsedContext, manual, timings));
+    // Keep the same array reference: rendered chart/list segment handlers
+    // may still hold this exact samples array between tooltip reopen events.
+    for (let index = 0; index < profileTooltipSampleInput.length; index += 1) {
+      profileTooltipSampleInput[index] = patchSamplePayloadWithParsed(
+        profileTooltipSampleInput[index],
+        parsedContext,
+        manual,
+        timings
+      );
+    }
     return;
   }
   if (typeof profileTooltipSampleInput === 'string') {

@@ -90,6 +90,7 @@ Load this file before any substantial task. Then load only relevant rule files.
 83. [HH Manual Inputs Must Roll Back Optimistic Values On Save Failure](./visual-hh-manual-optimistic-input-must-rollback-on-save-error.md)
 84. [Tooltip Manual Edits Must Patch In-Memory Profile Caches](./visual-tooltip-manual-edits-must-sync-profile-caches.md)
 85. [HH Manual Concurrent Saves Must Patch Only The Edited Field](./visual-hh-manual-concurrent-saves-must-patch-field-locally.md)
+86. [Tooltip Sample Array Reference Must Stay Stable During Live Patch](./visual-tooltip-sample-array-reference-must-stay-stable.md)
 
 ## How to Add a Rule
 
