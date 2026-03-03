@@ -92,6 +92,13 @@ Load this file before any substantial task. Then load only relevant rule files.
 85. [HH Manual Concurrent Saves Must Patch Only The Edited Field](./visual-hh-manual-concurrent-saves-must-patch-field-locally.md)
 86. [Tooltip Sample Array Reference Must Stay Stable During Live Patch](./visual-tooltip-sample-array-reference-must-stay-stable.md)
 
+87. [HH Baseline/Quality Servers Must Use Isolated Runtime Paths](./process-hh-dual-server-ab-isolation.md)
+88. [Promoting Experimental Server To Main Must Archive Previous Entrypoints](./process-server-promotion-must-archive-previous-entrypoints.md)
+
+89. [HH Room For CPR Families Must Be Derived From Table Token](./process-hh-room-from-table-for-cpr-families.md)
+90. [HH Room For Phenom Poker Must Be Derived From Header Line](./process-hh-room-from-header-for-phenom.md)
+91. [HH Header Timezone Must Be Converted To UTC](./process-hh-header-timezone-must-convert-to-utc.md)
+
 ## How to Add a Rule
 
 1. Copy `rules/rule-template.md` into a new file named `rules/<category>-<slug>.md`.

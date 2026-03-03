@@ -359,18 +359,122 @@ function parseMoneyValue(raw) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+const HEADER_TIME_ZONE_ALIASES = {
+  UTC: 'UTC',
+  GMT: 'UTC',
+  ET: 'America/New_York',
+  EST: 'America/New_York',
+  EDT: 'America/New_York'
+};
+
+const TZ_FORMATTER_CACHE = new Map();
+
+function getTimeZoneFormatter(timeZone) {
+  const key = String(timeZone || '').trim();
+  if (!key) return null;
+  if (TZ_FORMATTER_CACHE.has(key)) {
+    return TZ_FORMATTER_CACHE.get(key);
+  }
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: key,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  TZ_FORMATTER_CACHE.set(key, formatter);
+  return formatter;
+}
+
+function getTimeZoneOffsetMs(timeZone, utcMillis) {
+  const formatter = getTimeZoneFormatter(timeZone);
+  if (!formatter || !Number.isFinite(utcMillis)) return null;
+  const parts = formatter.formatToParts(new Date(utcMillis));
+  const map = Object.create(null);
+  for (const part of parts) {
+    if (!part?.type || part.type === 'literal') continue;
+    map[part.type] = part.value;
+  }
+  const year = Number(map.year);
+  const month = Number(map.month);
+  const day = Number(map.day);
+  const hour = Number(map.hour);
+  const minute = Number(map.minute);
+  const second = Number(map.second);
+  if (![year, month, day, hour, minute, second].every(Number.isFinite)) {
+    return null;
+  }
+  const asUtcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
+  return asUtcMillis - utcMillis;
+}
+
+function wallTimeToUtcIso({ year, month, day, hour, minute, second, timeZone } = {}) {
+  if (![year, month, day, hour, minute, second].every(Number.isFinite)) return null;
+  const naiveUtcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
+  if (!Number.isFinite(naiveUtcMillis)) return null;
+  const offsetMs = getTimeZoneOffsetMs(timeZone, naiveUtcMillis);
+  if (!Number.isFinite(offsetMs)) return null;
+
+  let utcMillis = naiveUtcMillis - offsetMs;
+  const correctedOffsetMs = getTimeZoneOffsetMs(timeZone, utcMillis);
+  if (Number.isFinite(correctedOffsetMs) && correctedOffsetMs !== offsetMs) {
+    utcMillis = naiveUtcMillis - correctedOffsetMs;
+  }
+
+  const iso = new Date(utcMillis).toISOString();
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso)
+    ? iso.replace('.000Z', 'Z')
+    : iso;
+}
+
 function formatUtcIso(rawUtc) {
   const source = String(rawUtc || '').trim();
   if (!source) return null;
-  const match = source.match(/(\d{4})[/-](\d{2})[/-](\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+  const match = source.match(
+    /(\d{4})[/-](\d{2})[/-](\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\s+([A-Za-z]+))?/
+  );
   if (!match) return null;
-  return `${match[1]}-${match[2]}-${match[3]}T${match[4]}Z`;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const zoneToken = String(match[7] || '').trim().toUpperCase();
+  const resolvedZone = HEADER_TIME_ZONE_ALIASES[zoneToken] || '';
+
+  if (!resolvedZone || resolvedZone === 'UTC') {
+    return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`;
+  }
+
+  const converted = wallTimeToUtcIso({
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+    timeZone: resolvedZone
+  });
+
+  if (converted) {
+    return converted;
+  }
+  return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`;
+}
+
+function extractHandHeaderLine(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .find((line) => /Hand\s+#/i.test(line) && /Omaha/i.test(line));
 }
 
 function parseHeaderMeta(text) {
-  const headerLine = String(text || '')
-    .split(/\r?\n/)
-    .find((line) => /Hand #/i.test(line) && /Omaha/i.test(line));
+  const headerLine = extractHandHeaderLine(text);
   if (!headerLine) {
     return {
       gameType: null,
@@ -380,7 +484,7 @@ function parseHeaderMeta(text) {
     };
   }
 
-  const gameLabel = String(headerLine.match(/Hand\s+#\d+:\s+(.+?)\s+\([^)]+\)\s*-\s*/i)?.[1] || '').trim();
+  const gameLabel = String(headerLine.match(/Hand\s+#[A-Za-z0-9]+:\s+(.+?)\s+\([^)]+\)\s*-\s*/i)?.[1] || '').trim();
   const gameCardCountRaw = Number(headerLine.match(/(\d+)\s*Card\s+Omaha/i)?.[1]);
   const gameCardCount = Number.isFinite(gameCardCountRaw)
     ? gameCardCountRaw
@@ -416,6 +520,30 @@ function deriveRoomFromTableName(tableName) {
   const firstToken = value.split(/\s+/)[0] || '';
   const prefix = String(firstToken.match(/^([A-Za-z0-9]+(?:_[A-Za-z0-9]+)?)/)?.[1] || '').trim();
   return prefix || null;
+}
+
+function deriveSpecialRoomFromTableName(tableName) {
+  const value = String(tableName || '').trim();
+  if (!value) return null;
+  const firstToken = value.split(/\s+/)[0] || '';
+  if (!firstToken) return null;
+
+  if (/^CPR_(?:\d+PLO|PLO)\b/i.test(firstToken)) {
+    return 'CPR';
+  }
+  if (/^PMS_Cpr_(?:\d+PLO|PLO)\b/i.test(firstToken)) {
+    return 'PMS_Cpr';
+  }
+  return null;
+}
+
+function deriveSpecialRoomFromHeaderLine(headerLineRaw) {
+  const headerLine = String(headerLineRaw || '').trim();
+  if (!headerLine) return null;
+  if (/^Phenom\s+Poker\s+Hand\s+#[A-Za-z0-9]+:/i.test(headerLine)) {
+    return 'Phenom Poker';
+  }
+  return null;
 }
 
 function countActivePlayers(parsedHH) {
@@ -462,7 +590,8 @@ function extractFinalPotBb(handHistory, parsedHH) {
 
 function parseHandMeta(handHistory, parsedHH) {
   const text = String(handHistory || '');
-  const handNumber = String(text.match(/PokerStars Hand #(\d+)/i)?.[1] || '').trim();
+  const headerLine = extractHandHeaderLine(text);
+  const handNumber = String(headerLine?.match(/\bHand\s+#([A-Za-z0-9]+)\b/i)?.[1] || '').trim();
   const tableName = String(text.match(/Table\s+'([^']+)'/i)?.[1] || '').trim();
   const metaJsonRaw = String(text.match(/^#\s+(\{.*\})$/m)?.[1] || '').trim();
   const headerMeta = parseHeaderMeta(text);
@@ -481,12 +610,16 @@ function parseHandMeta(handHistory, parsedHH) {
     : (Number.isFinite(headerMeta.gameCardCount)
         ? Number(headerMeta.gameCardCount)
         : deriveGameCardCountFromGameType(resolvedGameType));
+  const headerRoomSpecial = deriveSpecialRoomFromHeaderLine(headerLine);
+  const tableRoomSpecial = deriveSpecialRoomFromTableName(tableName);
+  const tableRoomGeneric = deriveRoomFromTableName(tableName);
+  const metaRoom = String(meta.room || '').trim();
 
   return {
     handNumber: handNumber || '',
     tableName,
     playedAtUtc: headerMeta.playedAtUtc || null,
-    room: String(meta.room || '').trim() || deriveRoomFromTableName(tableName) || null,
+    room: headerRoomSpecial || tableRoomSpecial || metaRoom || tableRoomGeneric || null,
     gameType: resolvedGameType,
     gameCardCount: resolvedGameCardCount,
     limitText: headerMeta.limitText || null

@@ -951,3 +951,248 @@ Table 'TEST' 6-max Seat #1 is the button
   const filtered = getHhOpponentSuggestions(dbPath, { query: 'irit', limit: 20 });
   assert.deepEqual(filtered, ['spirituallybroken']);
 });
+
+test('saveHhParsedRecord applies CPR/PMS_Cpr room normalization from Table line for known HH families', () => {
+  const dbPath = makeTempDbPath();
+  initHhDb(dbPath);
+  const runId = beginHhImportRun(dbPath, { sourceType: 'batch', fileCount: 3 });
+
+  const parsedHH = {
+    blinds: { smallBlind: 10, bigBlind: 20 },
+    players: ['hero', 'villain'],
+    positionsByPlayer: { hero: 'BTN', villain: 'BB' },
+    targetPlayer: 'hero',
+    board: { flop: ['Ah', '7d', '3c'], turn: '', river: '' },
+    events: {
+      preflop: [
+        { player: 'hero', type: 'raise', amount: 60, amountBb: 3, potBefore: 0, potAfter: 60 },
+        { player: 'villain', type: 'fold', amount: 0, amountBb: 0, potBefore: 60, potAfter: 60 }
+      ],
+      flop: [],
+      turn: [],
+      river: []
+    },
+    showdown: { showCardsByPlayer: {} }
+  };
+
+  const parsed = {
+    preflop: 'BTN_hero r3bb / BB_villain f',
+    flop: '',
+    turn: '',
+    river: '',
+    presupposition: ''
+  };
+
+  const saveSample = ({ handNumber, tableName, extraLine = '' }) => {
+    const handHistory = `PokerStars Hand #${handNumber}:  5 Card Omaha Pot Limit (€10/€20 EUR) - 2026/02/22 21:12:14 UTC
+Table '${tableName}' 7-max Seat #5 is the button
+${extraLine}
+*** HOLE CARDS ***
+hero: raises €50 to €70
+villain: folds`;
+
+    saveHhParsedRecord(dbPath, {
+      runId,
+      handHistory,
+      parsedHH,
+      parsed,
+      parserVersion: 'test-room-normalize-v1',
+      targetIdentity: 'hero',
+      targetPlayer: 'hero'
+    });
+  };
+
+  saveSample({
+    handNumber: '389781591',
+    tableName: 'CPR_5PLO ₮2,000 I'
+  });
+  saveSample({
+    handNumber: '383739154',
+    tableName: 'CPR_PLO ₮1,000 I'
+  });
+  saveSample({
+    handNumber: '390445571',
+    tableName: 'PMS_Cpr_5PLO ₮2,000 II - 22601',
+    extraLine: '# {"gt":"PLO5","room":"Cpr"}'
+  });
+
+  finishHhImportRun(dbPath, runId, {
+    handCount: 3,
+    savedCount: 3,
+    failedCount: 0,
+    errors: []
+  });
+
+  const db = new DatabaseSync(dbPath);
+  const rows = db.prepare(`
+    SELECT hand_number, room, played_at_utc
+    FROM hh_hands
+    WHERE parser_version = 'test-room-normalize-v1'
+    ORDER BY hand_number
+  `).all();
+  db.close();
+
+  const normalizedRows = rows.map((row) => ({
+    hand_number: String(row?.hand_number || ''),
+    room: String(row?.room || ''),
+    played_at_utc: String(row?.played_at_utc || '')
+  }));
+
+  assert.deepEqual(normalizedRows, [
+    { hand_number: '383739154', room: 'CPR', played_at_utc: '2026-02-22T21:12:14Z' },
+    { hand_number: '389781591', room: 'CPR', played_at_utc: '2026-02-22T21:12:14Z' },
+    { hand_number: '390445571', room: 'PMS_Cpr', played_at_utc: '2026-02-22T21:12:14Z' }
+  ]);
+});
+
+test('saveHhParsedRecord derives room from Phenom header and keeps alphanumeric hand_number', () => {
+  const dbPath = makeTempDbPath();
+  initHhDb(dbPath);
+  const runId = beginHhImportRun(dbPath, { sourceType: 'batch', fileCount: 2 });
+
+  const parsedHH = {
+    blinds: { smallBlind: 10, bigBlind: 20 },
+    players: ['hero', 'villain'],
+    positionsByPlayer: { hero: 'BTN', villain: 'BB' },
+    targetPlayer: 'hero',
+    board: { flop: ['Ah', '7d', '3c'], turn: '', river: '' },
+    events: {
+      preflop: [
+        { player: 'hero', type: 'raise', amount: 60, amountBb: 3, potBefore: 0, potAfter: 60 },
+        { player: 'villain', type: 'fold', amount: 0, amountBb: 0, potBefore: 60, potAfter: 60 }
+      ],
+      flop: [],
+      turn: [],
+      river: []
+    },
+    showdown: { showCardsByPlayer: {} }
+  };
+
+  const parsed = {
+    preflop: 'BTN_hero r3bb / BB_villain f',
+    flop: '',
+    turn: '',
+    river: '',
+    presupposition: ''
+  };
+
+  const saveSample = ({ headerLine, tableName }) => {
+    const handHistory = `${headerLine}
+Table '${tableName}' 6-max Seat #1 is the button
+*** HOLE CARDS ***
+hero: raises $40.00 to $60.00
+villain: folds`;
+
+    saveHhParsedRecord(dbPath, {
+      runId,
+      handHistory,
+      parsedHH,
+      parsed,
+      parserVersion: 'test-room-phenom-v1',
+      targetIdentity: 'hero',
+      targetPlayer: 'hero'
+    });
+  };
+
+  saveSample({
+    headerLine: 'Phenom Poker Hand #84fb311b1db1: 5 Card Omaha Pot Limit ($10.00/$20.00 USD) - 2026/02/24 12:59:35 ET',
+    tableName: 'Glacium 6max'
+  });
+  saveSample({
+    headerLine: 'Phenom Poker Hand #db20f81eebce: 6 Card Omaha Pot Limit ($5.00/$10.00 USD) - 2026/02/24 15:07:47 ET',
+    tableName: 'PLOBROTHERS'
+  });
+
+  finishHhImportRun(dbPath, runId, {
+    handCount: 2,
+    savedCount: 2,
+    failedCount: 0,
+    errors: []
+  });
+
+  const db = new DatabaseSync(dbPath);
+  const rows = db.prepare(`
+    SELECT hand_number, room, played_at_utc
+    FROM hh_hands
+    WHERE parser_version = 'test-room-phenom-v1'
+    ORDER BY hand_number
+  `).all();
+  db.close();
+
+  const normalizedRows = rows.map((row) => ({
+    hand_number: String(row?.hand_number || ''),
+    room: String(row?.room || ''),
+    played_at_utc: String(row?.played_at_utc || '')
+  }));
+
+  assert.deepEqual(normalizedRows, [
+    { hand_number: '84fb311b1db1', room: 'Phenom Poker', played_at_utc: '2026-02-24T17:59:35Z' },
+    { hand_number: 'db20f81eebce', room: 'Phenom Poker', played_at_utc: '2026-02-24T20:07:47Z' }
+  ]);
+});
+
+test('saveHhParsedRecord keeps Phenom room from header even when Table line is missing', () => {
+  const dbPath = makeTempDbPath();
+  initHhDb(dbPath);
+  const runId = beginHhImportRun(dbPath, { sourceType: 'single', fileCount: 1 });
+
+  const parsedHH = {
+    blinds: { smallBlind: 5, bigBlind: 10 },
+    players: ['hero', 'villain'],
+    positionsByPlayer: { hero: 'BTN', villain: 'BB' },
+    targetPlayer: 'hero',
+    board: { flop: [], turn: '', river: '' },
+    events: {
+      preflop: [
+        { player: 'hero', type: 'raise', amount: 30, amountBb: 3, potBefore: 0, potAfter: 30 },
+        { player: 'villain', type: 'fold', amount: 0, amountBb: 0, potBefore: 30, potAfter: 30 }
+      ],
+      flop: [],
+      turn: [],
+      river: []
+    },
+    showdown: { showCardsByPlayer: {} }
+  };
+
+  const parsed = {
+    preflop: 'BTN_hero r3bb / BB_villain f',
+    flop: '',
+    turn: '',
+    river: '',
+    presupposition: ''
+  };
+
+  saveHhParsedRecord(dbPath, {
+    runId,
+    handHistory: `Phenom Poker Hand #a1b2c3d4e5f6: Omaha Pot Limit ($5.00/$10.00 USD) - 2026/02/24 15:08:13 ET
+*** HOLE CARDS ***
+hero: raises $20.00 to $30.00
+villain: folds`,
+    parsedHH,
+    parsed,
+    parserVersion: 'test-room-phenom-no-table-v1',
+    targetIdentity: 'hero',
+    targetPlayer: 'hero'
+  });
+
+  finishHhImportRun(dbPath, runId, {
+    handCount: 1,
+    savedCount: 1,
+    failedCount: 0,
+    errors: []
+  });
+
+  const db = new DatabaseSync(dbPath);
+  const row = db.prepare(`
+    SELECT hand_number, room, table_name, played_at_utc
+    FROM hh_hands
+    WHERE parser_version = 'test-room-phenom-no-table-v1'
+    LIMIT 1
+  `).get();
+  db.close();
+
+  assert.equal(String(row?.hand_number || ''), 'a1b2c3d4e5f6');
+  assert.equal(String(row?.room || ''), 'Phenom Poker');
+  assert.equal(row?.table_name ?? null, null);
+  assert.equal(String(row?.played_at_utc || ''), '2026-02-24T20:08:13Z');
+});

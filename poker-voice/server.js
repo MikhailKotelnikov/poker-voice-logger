@@ -31,6 +31,14 @@ import {
   parseHandHistory
 } from './src/handHistory.js';
 import {
+  parseHandHistoryDeterministic
+} from './src/hhDeterministicParse.js';
+import {
+  defaultParseConcurrency,
+  parseHandsDeterministicPool,
+  parseHandsDeterministicSequential
+} from './src/hhParsePool.js';
+import {
   buildOpponentVisualProfile
 } from './src/visualProfile.js';
 import {
@@ -61,6 +69,7 @@ import {
 dotenv.config();
 
 const app = express();
+const runtimeLabel = String(process.env.RUNTIME_LABEL || 'main-quality').trim() || 'main-quality';
 const port = process.env.PORT || 8787;
 const host = process.env.HOST || '127.0.0.1';
 
@@ -117,6 +126,10 @@ const REPORTS_PATH = process.env.REPORTS_PATH || path.resolve(process.cwd(), 're
 const FIELD_KEYS = new Set(['preflop', 'flop', 'turn', 'river', 'presupposition']);
 const HH_PRESUPP_FIELDS = new Set(['preflop', 'flop', 'turn', 'river', 'hand_presupposition']);
 const VISUAL_PROFILE_CACHE_TTL_MS = Number(process.env.VISUAL_PROFILE_CACHE_TTL_MS || '180000');
+const HH_QF_PARSE_CONCURRENCY_RAW = Number(process.env.HH_QF_PARSE_CONCURRENCY || '0');
+const HH_QF_PARSE_CONCURRENCY = Number.isFinite(HH_QF_PARSE_CONCURRENCY_RAW) && HH_QF_PARSE_CONCURRENCY_RAW > 0
+  ? Math.max(1, Math.trunc(HH_QF_PARSE_CONCURRENCY_RAW))
+  : defaultParseConcurrency();
 
 const visualProfileCache = new Map();
 
@@ -169,6 +182,100 @@ function appendRuntimeLog(logPath, event, payload = {}) {
     };
     fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, 'utf8');
   } catch {}
+}
+
+function createDeterministicParserMeta(targetPlayer = '') {
+  return {
+    source: 'deterministic',
+    model: null,
+    confidence: null,
+    unresolved: [`target_player=${targetPlayer || 'none'}`],
+    semanticError: null
+  };
+}
+
+function finalizeHandHistoryRecord({
+  handHistory,
+  opponent = '',
+  dbRunId = 0,
+  allowEmpty = false,
+  parsedHH = null,
+  parsed = emptyParsedFields(),
+  parserMeta = createDeterministicParserMeta('')
+} = {}) {
+  if (!parsedHH) {
+    throw new Error('Внутренняя ошибка: parsedHH отсутствует.');
+  }
+
+  if (!hasAnyParsedField(parsed)) {
+    if (allowEmpty) {
+      return {
+        parsed,
+        row: null,
+        dbNoteId: null,
+        dbInsertedHand: false,
+        skippedEmpty: true,
+        sheetName: null,
+        storage: HH_STORAGE,
+        parser: parserMeta,
+        targetPlayer: parsedHH.targetPlayer
+      };
+    }
+    throw new Error('Не удалось извлечь структуру раздачи из hand history.');
+  }
+
+  if (!hhStorageUsesDb(HH_STORAGE)) {
+    throw new Error('HH storage должен быть DB.');
+  }
+  if (!dbRunId) {
+    throw new Error('В DB режиме обязателен dbRunId.');
+  }
+
+  const dbResult = saveHhParsedRecord(HH_DB_PATH, {
+    runId: dbRunId,
+    handHistory,
+    parsedHH,
+    parsed,
+    parserVersion: HH_PARSER_VERSION,
+    targetIdentity: extractTargetIdentity(parsedHH.targetPlayer || opponent || ''),
+    targetPlayer: parsedHH.targetPlayer || ''
+  });
+
+  return {
+    parsed,
+    row: null,
+    dbNoteId: dbResult?.noteId || null,
+    dbInsertedHand: Boolean(dbResult?.insertedHand),
+    skippedEmpty: false,
+    sheetName: null,
+    storage: HH_STORAGE,
+    parser: parserMeta,
+    targetPlayer: parsedHH.targetPlayer
+  };
+}
+
+async function parseHandsWithQualityPool(handHistories = [], opponent = '', options = {}) {
+  const allowEmpty = Boolean(options?.allowEmpty);
+  const jobs = Array.isArray(handHistories)
+    ? handHistories.map((item) => String(item || ''))
+    : [];
+
+  if (!jobs.length) return [];
+
+  try {
+    return await parseHandsDeterministicPool(jobs, {
+      opponent,
+      allowEmpty,
+      concurrency: HH_QF_PARSE_CONCURRENCY
+    });
+  } catch (error) {
+    appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.quality.pool_fallback', {
+      runtime: runtimeLabel,
+      reason: error?.message || 'worker_pool_error',
+      jobs: jobs.length
+    });
+    return parseHandsDeterministicSequential(jobs, { opponent, allowEmpty });
+  }
 }
 
 function voiceSheetName() {
@@ -789,7 +896,7 @@ function splitHandHistoryText(rawText) {
   const text = String(rawText || '').replace(/\r\n/g, '\n').trim();
   if (!text) return [];
 
-  const matches = text.match(/PokerStars Hand #\d+:[\s\S]*?(?=PokerStars Hand #\d+:|$)/gi);
+  const matches = text.match(/(?:PokerStars|Phenom\s+Poker)\s+Hand\s+#[A-Za-z0-9]+:[\s\S]*?(?=(?:PokerStars|Phenom\s+Poker)\s+Hand\s+#[A-Za-z0-9]+:|$)/gi);
   if (matches && matches.length) {
     return matches
       .map((item) => item.trim())
@@ -955,53 +1062,148 @@ async function importHandHistoryFoldersOnce({
         file: filePath,
         handsFound: hands.length
       });
+      const handJobs = [];
+      let reachedMaxInThisFile = false;
       for (let i = 0; i < hands.length; i += 1) {
-        if (maxHands > 0 && totalHands >= maxHands) break outer;
+        if (maxHands > 0 && (totalHands + handJobs.length) >= maxHands) {
+          reachedMaxInThisFile = true;
+          break;
+        }
         const handText = String(hands[i] || '').trim();
         if (!handText) continue;
-        totalHands += 1;
-        try {
-          const result = await processHandHistoryRecord(handText, opponent, vocabulary, {
-            dbRunId: runId,
-            allowEmpty: true
-          });
-          if (result.skippedEmpty) {
-            skippedEmptyHands += 1;
-            continue;
-          }
-          if (result.dbInsertedHand) {
-            savedHands += 1;
-          } else {
-            duplicateHands += 1;
-          }
-        } catch (error) {
-          failedHands += 1;
-          appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.hand.error', {
-            runId,
-            file: filePath,
-            handIndex: i + 1,
-            error: error.message || 'Ошибка разбора HH'
-          });
-          if (errors.length < 120) {
-            errors.push({
+        handJobs.push({
+          handText,
+          handIndex: i + 1
+        });
+      }
+
+      if (HH_PARSER_MODE === 'deterministic' && handJobs.length) {
+        const parseResults = await parseHandsWithQualityPool(
+          handJobs.map((job) => job.handText),
+          opponent,
+          { allowEmpty: true }
+        );
+
+        for (let index = 0; index < handJobs.length; index += 1) {
+          const job = handJobs[index];
+          const parsedOutcome = parseResults[index];
+          totalHands += 1;
+
+          if (!parsedOutcome?.ok) {
+            failedHands += 1;
+            const errorMessage = parsedOutcome?.error || 'Ошибка deterministic parse HH';
+            appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.hand.error', {
+              runId,
               file: filePath,
-              handIndex: i + 1,
+              handIndex: job.handIndex,
+              error: errorMessage
+            });
+            if (errors.length < 120) {
+              errors.push({
+                file: filePath,
+                handIndex: job.handIndex,
+                error: errorMessage
+              });
+            }
+          } else {
+            try {
+              const parsedResult = parsedOutcome.result;
+              const result = finalizeHandHistoryRecord({
+                handHistory: job.handText,
+                opponent,
+                dbRunId: runId,
+                allowEmpty: true,
+                parsedHH: parsedResult?.parsedHH,
+                parsed: parsedResult?.parsed,
+                parserMeta: createDeterministicParserMeta(parsedResult?.targetPlayer)
+              });
+              if (result.skippedEmpty) {
+                skippedEmptyHands += 1;
+              } else if (result.dbInsertedHand) {
+                savedHands += 1;
+              } else {
+                duplicateHands += 1;
+              }
+            } catch (error) {
+              failedHands += 1;
+              const errorMessage = error?.message || 'Ошибка записи HH в БД';
+              appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.hand.error', {
+                runId,
+                file: filePath,
+                handIndex: job.handIndex,
+                error: errorMessage
+              });
+              if (errors.length < 120) {
+                errors.push({
+                  file: filePath,
+                  handIndex: job.handIndex,
+                  error: errorMessage
+                });
+              }
+            }
+          }
+
+          if (totalHands >= nextProgressAt) {
+            appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.progress', {
+              runId,
+              filesParsed: parsedFiles,
+              totalHands,
+              savedHands,
+              duplicateHands,
+              skippedEmptyHands,
+              failedHands
+            });
+            nextProgressAt += 250;
+          }
+        }
+      } else {
+        for (const job of handJobs) {
+          totalHands += 1;
+          try {
+            const result = await processHandHistoryRecord(job.handText, opponent, vocabulary, {
+              dbRunId: runId,
+              allowEmpty: true
+            });
+            if (result.skippedEmpty) {
+              skippedEmptyHands += 1;
+            } else if (result.dbInsertedHand) {
+              savedHands += 1;
+            } else {
+              duplicateHands += 1;
+            }
+          } catch (error) {
+            failedHands += 1;
+            appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.hand.error', {
+              runId,
+              file: filePath,
+              handIndex: job.handIndex,
               error: error.message || 'Ошибка разбора HH'
             });
+            if (errors.length < 120) {
+              errors.push({
+                file: filePath,
+                handIndex: job.handIndex,
+                error: error.message || 'Ошибка разбора HH'
+              });
+            }
+          }
+          if (totalHands >= nextProgressAt) {
+            appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.progress', {
+              runId,
+              filesParsed: parsedFiles,
+              totalHands,
+              savedHands,
+              duplicateHands,
+              skippedEmptyHands,
+              failedHands
+            });
+            nextProgressAt += 250;
           }
         }
-        if (totalHands >= nextProgressAt) {
-          appendRuntimeLog(HH_IMPORT_LOG_PATH, 'import.progress', {
-            runId,
-            filesParsed: parsedFiles,
-            totalHands,
-            savedHands,
-            duplicateHands,
-            skippedEmptyHands,
-            failedHands
-          });
-          nextProgressAt += 250;
-        }
+      }
+
+      if (reachedMaxInThisFile) {
+        break outer;
       }
 
       const targetFile = buildImportedFilePath(filePath, inbox, done);
@@ -1101,17 +1303,12 @@ async function importHandHistoryFoldersOnce({
 async function processHandHistoryRecord(handHistory, opponent, vocabulary, options = {}) {
   const dbRunId = Number(options?.dbRunId || 0);
   const allowEmpty = Boolean(options?.allowEmpty);
-  const parsedHH = parseHandHistory(handHistory, opponent);
-  let parserMeta = {
-    source: 'deterministic',
-    model: null,
-    confidence: null,
-    unresolved: [`target_player=${parsedHH.targetPlayer || 'none'}`],
-    semanticError: null
-  };
+  let parsedHH = null;
+  let parserMeta = createDeterministicParserMeta('');
   let parsed = emptyParsedFields();
 
   if (HH_PARSER_MODE === 'semantic') {
+    parsedHH = parseHandHistory(handHistory, opponent);
     const parsedContext = buildHandHistoryContext(parsedHH);
     const semanticResult = await parseHandHistorySemantic(handHistory, opponent, parsedContext, vocabulary);
     parsed = normalizeHandHistoryParsed(semanticResult.parsed, vocabulary);
@@ -1122,54 +1319,24 @@ async function processHandHistoryRecord(handHistory, opponent, vocabulary, optio
       unresolved: [...(semanticResult.unresolved || []), `target_player=${parsedHH.targetPlayer || 'none'}`],
       semanticError: null
     };
+    parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
+    parsed = enrichHandHistoryParsed(parsed, parsedHH);
+  } else {
+    const parsedResult = parseHandHistoryDeterministic(handHistory, opponent, { allowEmpty });
+    parsedHH = parsedResult.parsedHH;
+    parsed = parsedResult.parsed;
+    parserMeta = createDeterministicParserMeta(parsedResult.targetPlayer);
   }
 
-  parsed = canonicalizeHandHistoryUnits(parsed, parsedHH);
-  parsed = enrichHandHistoryParsed(parsed, parsedHH);
-
-  if (!hasAnyParsedField(parsed)) {
-    if (allowEmpty) {
-      return {
-        parsed,
-        row: null,
-        dbNoteId: null,
-        dbInsertedHand: false,
-        skippedEmpty: true,
-        sheetName: null,
-        storage: HH_STORAGE,
-        parser: parserMeta,
-        targetPlayer: parsedHH.targetPlayer
-      };
-    }
-    throw new Error('Не удалось извлечь структуру раздачи из hand history.');
-  }
-
-  if (!hhStorageUsesDb(HH_STORAGE)) {
-    throw new Error('HH storage должен быть DB.');
-  }
-  if (!dbRunId) {
-    throw new Error('В DB режиме обязателен dbRunId.');
-  }
-  const dbResult = saveHhParsedRecord(HH_DB_PATH, {
-    runId: dbRunId,
+  return finalizeHandHistoryRecord({
     handHistory,
+    opponent,
+    dbRunId,
+    allowEmpty,
     parsedHH,
     parsed,
-    parserVersion: HH_PARSER_VERSION,
-    targetIdentity: extractTargetIdentity(parsedHH.targetPlayer || opponent || ''),
-    targetPlayer: parsedHH.targetPlayer || ''
+    parserMeta
   });
-
-  return {
-    parsed,
-    row: null,
-    dbNoteId: dbResult?.noteId || null,
-    dbInsertedHand: Boolean(dbResult?.insertedHand),
-    sheetName: null,
-    storage: HH_STORAGE,
-    parser: parserMeta,
-    targetPlayer: parsedHH.targetPlayer
-  };
 }
 
 async function transcribeAudio(buffer, filename, mimetype) {
@@ -1692,51 +1859,133 @@ app.post('/api/record-hand-history-files', upload.array('files', 200), async (re
     for (const file of files) {
       const text = decodeTextBuffer(file.buffer);
       const hands = splitHandHistoryText(text);
+      const handJobs = [];
+      let reachedMaxInThisFile = false;
       for (let i = 0; i < hands.length; i += 1) {
-        if (maxHands > 0 && totalHands >= maxHands) {
-          break outer;
+        if (maxHands > 0 && (totalHands + handJobs.length) >= maxHands) {
+          reachedMaxInThisFile = true;
+          break;
         }
-        const handHistory = hands[i];
+        const handHistory = String(hands[i] || '').trim();
         if (!handHistory) continue;
-        totalHands += 1;
+        handJobs.push({
+          handHistory,
+          handIndex: i + 1
+        });
+      }
 
-        try {
-          const result = await processHandHistoryRecord(handHistory, opponent, vocabulary, {
-            dbRunId: runId,
-            allowEmpty: true
-          });
-          if (result.skippedEmpty) {
-            skippedEmptyHands += 1;
+      if (HH_PARSER_MODE === 'deterministic' && handJobs.length) {
+        const parseResults = await parseHandsWithQualityPool(
+          handJobs.map((job) => job.handHistory),
+          opponent,
+          { allowEmpty: true }
+        );
+        for (let index = 0; index < handJobs.length; index += 1) {
+          const job = handJobs[index];
+          const parsedOutcome = parseResults[index];
+          totalHands += 1;
+
+          if (!parsedOutcome?.ok) {
+            failedHands += 1;
+            if (errors.length < 80) {
+              errors.push({
+                file: file.originalname || '',
+                handIndex: job.handIndex,
+                error: parsedOutcome?.error || 'Ошибка deterministic parse hand history.'
+              });
+            }
             continue;
           }
-          if (opponent) affectedOpponents.add(opponent);
-          if (result?.targetPlayer) affectedOpponents.add(result.targetPlayer);
-          if (result.dbInsertedHand) {
-            savedHands += 1;
-          }
-          lastResult = {
-            transcript: handHistory,
-            ...result
-          };
-          if (savedRows.length < 150) {
-            savedRows.push({
-              file: file.originalname || `file_${savedRows.length + 1}`,
-              handIndex: i + 1,
-              row: result.row || null,
-              dbNoteId: result.dbNoteId || null,
-              inserted: result.dbInsertedHand
+
+          try {
+            const parsedResult = parsedOutcome.result;
+            const result = finalizeHandHistoryRecord({
+              handHistory: job.handHistory,
+              opponent,
+              dbRunId: runId,
+              allowEmpty: true,
+              parsedHH: parsedResult?.parsedHH,
+              parsed: parsedResult?.parsed,
+              parserMeta: createDeterministicParserMeta(parsedResult?.targetPlayer)
             });
-          }
-        } catch (error) {
-          failedHands += 1;
-          if (errors.length < 80) {
-            errors.push({
-              file: file.originalname || '',
-              handIndex: i + 1,
-              error: error.message || 'Ошибка разбора hand history.'
-            });
+            if (result.skippedEmpty) {
+              skippedEmptyHands += 1;
+              continue;
+            }
+            if (opponent) affectedOpponents.add(opponent);
+            if (result?.targetPlayer) affectedOpponents.add(result.targetPlayer);
+            if (result.dbInsertedHand) {
+              savedHands += 1;
+            }
+            lastResult = {
+              transcript: job.handHistory,
+              ...result
+            };
+            if (savedRows.length < 150) {
+              savedRows.push({
+                file: file.originalname || `file_${savedRows.length + 1}`,
+                handIndex: job.handIndex,
+                row: result.row || null,
+                dbNoteId: result.dbNoteId || null,
+                inserted: result.dbInsertedHand
+              });
+            }
+          } catch (error) {
+            failedHands += 1;
+            if (errors.length < 80) {
+              errors.push({
+                file: file.originalname || '',
+                handIndex: job.handIndex,
+                error: error.message || 'Ошибка разбора hand history.'
+              });
+            }
           }
         }
+      } else {
+        for (const job of handJobs) {
+          totalHands += 1;
+          try {
+            const result = await processHandHistoryRecord(job.handHistory, opponent, vocabulary, {
+              dbRunId: runId,
+              allowEmpty: true
+            });
+            if (result.skippedEmpty) {
+              skippedEmptyHands += 1;
+              continue;
+            }
+            if (opponent) affectedOpponents.add(opponent);
+            if (result?.targetPlayer) affectedOpponents.add(result.targetPlayer);
+            if (result.dbInsertedHand) {
+              savedHands += 1;
+            }
+            lastResult = {
+              transcript: job.handHistory,
+              ...result
+            };
+            if (savedRows.length < 150) {
+              savedRows.push({
+                file: file.originalname || `file_${savedRows.length + 1}`,
+                handIndex: job.handIndex,
+                row: result.row || null,
+                dbNoteId: result.dbNoteId || null,
+                inserted: result.dbInsertedHand
+              });
+            }
+          } catch (error) {
+            failedHands += 1;
+            if (errors.length < 80) {
+              errors.push({
+                file: file.originalname || '',
+                handIndex: job.handIndex,
+                error: error.message || 'Ошибка разбора hand history.'
+              });
+            }
+          }
+        }
+      }
+
+      if (reachedMaxInThisFile) {
+        break outer;
       }
     }
 
@@ -2245,6 +2494,9 @@ const server = app.listen(port, host, () => {
   console.log(`STT config: model=${OPENAI_MODEL} language=${OPENAI_LANGUAGE || 'auto'} prompt=${OPENAI_PROMPT ? 'set' : 'empty'} vocab=${VOCAB_PATH} spelling_mode=${SPELLING_MODE ? 'on' : 'off'}`);
   console.log(`Semantic parser: ${NOTS_SEMANTIC_ENABLED ? 'on' : 'off'} primary=${NOTS_SEMANTIC_MODEL} fallbacks=[${NOTS_SEMANTIC_MODEL_FALLBACKS.join(', ')}] dict=${NOTS_SEMANTIC_DICTIONARY_PATH}`);
   console.log(`HH storage: ${HH_STORAGE}, parser=${HH_PARSER_MODE}, db=${HH_DB_PATH}`);
+  if (HH_PARSER_MODE === 'deterministic') {
+    console.log(`HH quality parser pool: concurrency=${HH_QF_PARSE_CONCURRENCY}`);
+  }
   console.log(`HH profile rows: default=${HH_PROFILE_ROWS_DEFAULT} max=${Number.isFinite(HH_PROFILE_ROWS_MAX) ? HH_PROFILE_ROWS_MAX : 'unlimited'}`);
   console.log(`Sheets config: voice=${voiceSheetName() || 'active-sheet'}`);
   if (HH_IMPORT_ENABLED) {
