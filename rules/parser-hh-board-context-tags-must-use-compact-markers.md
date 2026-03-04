@@ -1,28 +1,28 @@
 # Title
 
-Board Context Tags Must Use Compact Marker Tokens
+HH Board Context Tags Must Use `*_BRD` Tokens Next To Board Cards
 
 ## Problem
 
-Using underscored board-context tags (`str_board`, `flush_board`) in the same suffix stream as class tags (`str`, `set`) creates ambiguity and inconsistent parsing/reading in notes and profile UI.
+Board-context tags mixed into hand suffixes (`..._STRB`, `..._pairedboard`) duplicate the same board info on every action and blur the boundary between hand-strength tags and board-state tags.
 
 ## Rule
 
-When appending board-context metadata to HH hand-class suffixes, then use compact marker tokens without internal underscores (`STRB`, `FLB`, `pairedboard`) and attach qualifiers via separator underscore (for example `lowstr_STRB`), because class tags and board-context tags must stay unambiguous.
+When emitting board context in HH street notes, then place uppercase `*_BRD` tokens immediately after the `on<board>` token (`A_BRD`, `PAIRED_BRD`, `FD_BRD`, `FLUSH_BRD`, `STR_BRD`, `2FD_BRD`, `MONO_BRD`), because board semantics must be street-level metadata, not per-hand suffix metadata.
 
 ## Examples
 
 ### Positive
 
-- `KhKdQs9h2c_set_STRB`
-- `5cTdAcAd2h_str_lowstr_STRB`
-- `AhKhQd9d4h_flush_pairedboard`
+- `... KhKdQs9h2c_set on9cKcQd K_BRD STR_BRD FD_BRD`
+- `... 5c6dAcAd2h_midstr on6c7d8h9sKs K_BRD STR_BRD`
+- `... onAhKhQh A_BRD FLUSH_BRD MONO_BRD`
 
 ### Anti-pattern
 
-- `KhKdQs9h2c_set_str_board`
-- `..._str_lowstr_board`
-- Mixing both `str_board` and `STRB` in one dataset.
+- `KhKdQs9h2c_set_STRB`
+- `..._lowstr_STRB`
+- Repeating `PAIRED_BRD`/`FLUSH_BRD` inside every player hand suffix instead of next to `on...`.
 
 ## Validation Checklist
 

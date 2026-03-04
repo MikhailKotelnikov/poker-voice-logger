@@ -98,6 +98,16 @@ Load this file before any substantial task. Then load only relevant rule files.
 89. [HH Room For CPR Families Must Be Derived From Table Token](./process-hh-room-from-table-for-cpr-families.md)
 90. [HH Room For Phenom Poker Must Be Derived From Header Line](./process-hh-room-from-header-for-phenom.md)
 91. [HH Header Timezone Must Be Converted To UTC](./process-hh-header-timezone-must-convert-to-utc.md)
+92. [Explore Must Bootstrap Missing Workflow Scaffold](./process-explore-bootstrap-workflow-scaffold.md)
+93. [Video-HH Wave 1 Must Freeze Contract And Labeled Baseline Before Extractor Logic](./process-video-hh-wave1-contract-and-labeled-baseline-first.md)
+94. [HH Draw Tags Must Reflect Only Live Improvement Outs](./parser-hh-draw-tags-must-reflect-live-improvement-only.md)
+95. [Visual Profile List Voice Rows Must Map Presupposition And Date](./visual-profile-list-voice-rows-must-map-presup-and-date.md)
+96. [Visual Tooltip Board Tags Must Render As Badge Chips](./visual-tooltip-board-tags-must-render-as-badges.md)
+97. [HH Full Clear For Fresh Baseline Must Reset SQLite Sequences](./process-hh-clear-all-must-reset-sequences-for-fresh-baseline.md)
+98. [Visual Profile New Filter Dimensions Must Propagate End-To-End](./visual-profile-new-filter-dimensions-must-propagate-end-to-end.md)
+99. [Visual Profile Tag Filters Must Apply Per Anchor Street](./visual-profile-tag-filters-must-apply-per-anchor-street.md)
+100. [Visual Profile Tag Mode Must Use A Single OR/AND Toggle](./visual-profile-tag-mode-must-use-single-toggle.md)
+101. [Visual Profile Prefetch Must Await In-Flight Requests](./visual-profile-prefetch-must-await-inflight-requests.md)
 
 ## How to Add a Rule
 

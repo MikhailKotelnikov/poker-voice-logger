@@ -151,13 +151,23 @@
 ## Архитектура (файлы)
 
 - `/Users/parisianreflect/Documents/codex/poker-voice/server.js`
-  - HTTP API, STT, semantic routing, запись в Sheets, кэш/сборка профилей.
+  - основной сервер (включает quality-first deterministic HH import pipeline).
+- `/Users/parisianreflect/Documents/codex/poker-voice/archive/servers/server-baseline-legacy.js`
+  - архивная копия старого baseline-сервера для отката/сравнения.
+- `/Users/parisianreflect/Documents/codex/poker-voice/archive/servers/server-quality-first.js`
+  - архивная копия отдельного quality-first entrypoint (A/B этап).
 - `/Users/parisianreflect/Documents/codex/poker-voice/src/core.js`
   - rule-based parsing и нормализация текста.
 - `/Users/parisianreflect/Documents/codex/poker-voice/src/semantic.js`
   - разбор и валидация JSON-ответов LLM.
 - `/Users/parisianreflect/Documents/codex/poker-voice/src/handHistory.js`
   - детерминированный парсинг HH: позиции, поты, board, showdown, классы, итоговые street-ноты, условные `Lx/Sx`.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/hhDeterministicParse.js`
+  - чистый deterministic HH parse pipeline для основного импорта.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/hhParsePool.js`
+  - worker-pool для параллельного deterministic parse.
+- `/Users/parisianreflect/Documents/codex/poker-voice/src/hhParseWorker.js`
+  - worker-процесс deterministic HH parse.
 - `/Users/parisianreflect/Documents/codex/poker-voice/src/reports.js`
   - санитизация и запись training reports.
 - `/Users/parisianreflect/Documents/codex/poker-voice/src/visualProfile.js`
@@ -178,6 +188,8 @@
   - UI настройки host/port/auto-import + запуск web app.
 - `/Users/parisianreflect/Documents/codex/poker-voice/apps_script/Code.gs`
   - вебхук/формат/операции Google Sheets.
+- `/Users/parisianreflect/Documents/codex/poker-voice/scripts/compare-hh-dbs.mjs`
+  - строгий `DB vs DB` дифф для baseline/quality HH таблиц.
 - `/Users/parisianreflect/Documents/codex/poker-voice/tests/*.test.js`
   - unit-тесты core/semantic/handHistory/reports.
 
@@ -400,6 +412,32 @@ npm run dev
 ```
 
 Открыть: `http://127.0.0.1:8787`
+
+### Архивные entrypoint-ы (для отката)
+
+Основной запуск:
+
+```bash
+npm run start
+```
+
+Архив baseline (legacy):
+
+```bash
+npm run start:archive-baseline
+```
+
+Архив quality entrypoint (A/B этап):
+
+```bash
+npm run start:archive-quality
+```
+
+Сравнение двух БД после прогона одинакового датасета:
+
+```bash
+npm run hh:compare-db -- --left data/hh.db --right data/hh.quality-first.db
+```
 
 ---
 

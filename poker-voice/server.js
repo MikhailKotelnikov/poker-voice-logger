@@ -39,7 +39,8 @@ import {
   parseHandsDeterministicSequential
 } from './src/hhParsePool.js';
 import {
-  buildOpponentVisualProfile
+  buildOpponentVisualProfile,
+  filterProfileRowsByTagFilters
 } from './src/visualProfile.js';
 import {
   buildHandVisualModel
@@ -351,6 +352,27 @@ function normalizeProfileFiltersFromQuery(query = {}) {
   const recentLimit = allowedRecent.has(recentRaw) ? recentRaw : 'all';
   const manualRaw = String(query.manual || query.manualOnly || '').trim().toLowerCase();
   const manualOnly = manualRaw === '1' || manualRaw === 'true';
+  const allowedHandTags = new Set([
+    'nuts', 'full', 'quads', 'strflush', 'topset', 'set', 'tri',
+    'ov', '2p', 'tp', 'mp', 'bp',
+    'nutstr', 'midstr', 'lowstr',
+    'nutflush', '2ndflush', 'midflush', 'lowflush',
+    'nfd', 'fd', 'wrap', 'oe', 'g', 'air'
+  ]);
+  const handTags = parseFilterCsv(query.hands || query.handTags)
+    .map((item) => item.toLowerCase())
+    .filter((item) => allowedHandTags.has(item));
+  const handTagsModeRaw = String(query.handMode || query.handsMode || query.handTagsMode || '').trim().toLowerCase();
+  const handTagsMode = handTagsModeRaw === 'and' ? 'and' : 'or';
+  const allowedBoardTags = new Set([
+    'a_brd', 'k_brd', 'q_brd', 'mid_brd', 'low_brd',
+    'paired_brd', 'tri_brd', 'str_brd', 'fd_brd', '2fd_brd', 'flush_brd', 'mono_brd'
+  ]);
+  const boardTags = parseFilterCsv(query.boards || query.boardTags)
+    .map((item) => item.toLowerCase())
+    .filter((item) => allowedBoardTags.has(item));
+  const boardTagsModeRaw = String(query.boardMode || query.boardsMode || query.boardTagsMode || '').trim().toLowerCase();
+  const boardTagsMode = boardTagsModeRaw === 'and' ? 'and' : 'or';
 
   return {
     playerGroups,
@@ -362,7 +384,11 @@ function normalizeProfileFiltersFromQuery(query = {}) {
     vsOpponent,
     cardsVisibility,
     recentLimit,
-    manualOnly
+    manualOnly,
+    handTags,
+    handTagsMode,
+    boardTags,
+    boardTagsMode
   };
 }
 
@@ -382,7 +408,11 @@ function serializeProfileFilters(filters = {}) {
     `vs=${String(filters.vsOpponent || '').trim().toLowerCase()}`,
     `cards=${String(filters.cardsVisibility || 'showdown')}`,
     `recent=${String(filters.recentLimit || 'all')}`,
-    `manual=${filters.manualOnly ? '1' : '0'}`
+    `manual=${filters.manualOnly ? '1' : '0'}`,
+    `hands=${pack(filters.handTags)}`,
+    `handMode=${String(filters.handTagsMode || 'or')}`,
+    `boards=${pack(filters.boardTags)}`,
+    `boardMode=${String(filters.boardTagsMode || 'or')}`
   ].join('|');
 }
 
@@ -432,6 +462,7 @@ async function collectOpponentRowsForProfile({
     rows.forEach((row) => {
       allRows.push({
         ...row,
+        playedAtUtc: String(row?.playedAtUtc || row?.date || ''),
         rowLabel: `#${resolvedSheetName || 'Sheet'}:${row?.row ?? '?'}`
       });
     });
@@ -463,6 +494,69 @@ async function collectOpponentRowsForProfile({
   }
 
   return { allRows, bySheet, hhFilterOptions };
+}
+
+function sourceNameFromProfileRow(row) {
+  const source = String(row?.nickname || '').trim().toLowerCase();
+  if (source === 'hh') return 'HH_DB';
+  const rowLabel = String(row?.rowLabel || '').trim();
+  const match = rowLabel.match(/^#([^:]+):/);
+  if (match?.[1]) return String(match[1]).trim();
+  return 'Sheet';
+}
+
+function summarizeSourcesFromRows(rows, fallbackSources = []) {
+  const counts = new Map();
+  const items = Array.isArray(rows) ? rows : [];
+  for (const row of items) {
+    const name = sourceNameFromProfileRow(row);
+    counts.set(name, Number(counts.get(name) || 0) + 1);
+  }
+
+  const out = [];
+  const seen = new Set();
+  (Array.isArray(fallbackSources) ? fallbackSources : []).forEach((item) => {
+    const sheetName = String(item?.sheetName || '').trim();
+    if (!sheetName || seen.has(sheetName)) return;
+    seen.add(sheetName);
+    out.push({
+      sheetName,
+      rows: Number(counts.get(sheetName) || 0)
+    });
+  });
+
+  for (const [sheetName, rowsCount] of counts.entries()) {
+    if (seen.has(sheetName)) continue;
+    out.push({ sheetName, rows: Number(rowsCount || 0) });
+  }
+  return out;
+}
+
+function profileRowTimestamp(row) {
+  const raw = String(row?.playedAtUtc || row?.date || '').trim();
+  if (!raw) return Number.NEGATIVE_INFINITY;
+  const value = Date.parse(raw);
+  return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
+}
+
+function sortProfileRowsNewestFirst(rows) {
+  const items = Array.isArray(rows) ? rows.slice() : [];
+  items.sort((a, b) => {
+    const tsA = profileRowTimestamp(a);
+    const tsB = profileRowTimestamp(b);
+    if (tsA !== tsB) return tsB - tsA;
+
+    const rowA = Number(a?.row);
+    const rowB = Number(b?.row);
+    const normalizedA = Number.isFinite(rowA) ? rowA : Number.NEGATIVE_INFINITY;
+    const normalizedB = Number.isFinite(rowB) ? rowB : Number.NEGATIVE_INFINITY;
+    if (normalizedA !== normalizedB) return normalizedB - normalizedA;
+
+    const labelA = String(a?.rowLabel || '');
+    const labelB = String(b?.rowLabel || '');
+    return labelB.localeCompare(labelA);
+  });
+  return items;
 }
 
 function clearProfileCacheForOpponent(opponent) {
@@ -1604,8 +1698,9 @@ app.get('/api/opponent-visual-profile', async (req, res) => {
       filters
     });
 
-    const profile = buildOpponentVisualProfile(allRows, { opponent, filters });
-    profile.sources = bySheet;
+    const filteredRows = filterProfileRowsByTagFilters(allRows, { opponent, filters });
+    const profile = buildOpponentVisualProfile(filteredRows, { opponent, filters });
+    profile.sources = summarizeSourcesFromRows(filteredRows, bySheet);
     profile.filters = {
       ...filters,
       options: {
@@ -1622,10 +1717,10 @@ app.get('/api/opponent-visual-profile', async (req, res) => {
       opponent,
       source,
       cacheKey,
-      totalRows: allRows.length,
-      sections: profile?.sections ? Object.keys(profile.sections).length : 0,
-      sources: bySheet
-    });
+        totalRows: filteredRows.length,
+        sections: profile?.sections ? Object.keys(profile.sections).length : 0,
+        sources: profile.sources
+      });
 
     return res.json({
       ok: true,
@@ -1673,11 +1768,13 @@ app.get('/api/opponent-visual-list', async (req, res) => {
       filters
     });
 
+    const filteredRows = filterProfileRowsByTagFilters(allRows, { opponent, filters });
+    const sortedRows = sortProfileRowsNewestFirst(filteredRows);
     return res.json({
       ok: true,
-      list: allRows,
-      totalRows: allRows.length,
-      sources: bySheet,
+      list: sortedRows,
+      totalRows: sortedRows.length,
+      sources: summarizeSourcesFromRows(sortedRows, bySheet),
       filters: {
         ...filters,
         options: {
@@ -2435,9 +2532,10 @@ app.post('/api/hh-clear-opponent', async (req, res) => {
   }
 });
 
-app.post('/api/hh-clear-all', async (_req, res) => {
+app.post('/api/hh-clear-all', async (req, res) => {
   try {
-    const result = clearAllHhHands(HH_DB_PATH);
+    const resetSequences = req.body?.resetSequences !== false;
+    const result = clearAllHhHands(HH_DB_PATH, { resetSequences });
     visualProfileCache.clear();
     return res.json({ ok: true, ...result });
   } catch (error) {

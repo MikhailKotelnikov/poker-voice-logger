@@ -93,8 +93,11 @@ let profileModalSource = 'voice';
 let isBatchProcessing = false;
 const profileCache = new Map();
 const profileListCache = new Map();
+const profilePendingRequests = new Map();
+const profileListPendingRequests = new Map();
 const PROFILE_DEFAULT_SOURCE = 'voice';
 const PROFILE_MY_NICK_BY_ROOM_KEY = 'pokerVoiceMyNickByRoomV1';
+const PROFILE_MY_NICK_FALLBACK_ROOM_KEY = '__all__';
 let profileViewMode = 'chart';
 let hhManualRecorder = null;
 let hhManualChunks = [];
@@ -135,12 +138,17 @@ let profileMirrorFilters = null;
 let profileMirrorFilterOptions = { rooms: [] };
 let profileMirrorVsHimEnabled = true;
 let profileMirrorRequestId = 0;
+let profileVoiceContextRequestId = 0;
 
 function createDefaultProfileFilters() {
   return {
     playerGroups: [],
     datePreset: 'all',
     gameCards: [],
+    handTags: [],
+    handTagsMode: 'or',
+    boardTags: [],
+    boardTagsMode: 'or',
     rooms: [],
     potBuckets: [],
     limits: [],
@@ -172,6 +180,10 @@ function serializeProfileFilters(filters = profileFilters) {
     `players=${normalizeList(filters.playerGroups)}`,
     `date=${String(filters.datePreset || 'all')}`,
     `games=${normalizeList(filters.gameCards)}`,
+    `hands=${normalizeList(filters.handTags)}`,
+    `handMode=${String(filters.handTagsMode || 'or')}`,
+    `boards=${normalizeList(filters.boardTags)}`,
+    `boardMode=${String(filters.boardTagsMode || 'or')}`,
     `rooms=${normalizeList(filters.rooms)}`,
     `pots=${normalizeList(filters.potBuckets)}`,
     `limits=${normalizeList(filters.limits)}`,
@@ -493,6 +505,11 @@ function buildTooltipCards(cards = [], options = {}) {
   wrap.className = `pt-cards ${board ? 'pt-board-cards' : ''}`.trim();
   cards.forEach((card) => wrap.appendChild(cardElement(card, { mini: true, board })));
   return wrap;
+}
+
+function isBoardTagToken(token) {
+  const value = String(token || '').trim();
+  return /^[a-z0-9]+_brd$/i.test(value);
 }
 
 function parseTooltipSample(sampleText) {
@@ -982,10 +999,34 @@ function renderTooltipSegmentLine(segments = [], options = {}) {
     }
 
     if (showExtras && segment.extras.length) {
-      const extra = document.createElement('span');
-      extra.className = 'pt-extra';
-      extra.textContent = segment.extras.join(' ');
-      item.appendChild(extra);
+      const boardTags = [];
+      const otherTokens = [];
+      segment.extras.forEach((token) => {
+        if (isBoardTagToken(token)) {
+          boardTags.push(String(token || '').toUpperCase());
+        } else {
+          otherTokens.push(token);
+        }
+      });
+
+      if (boardTags.length) {
+        const boardWrap = document.createElement('span');
+        boardWrap.className = 'pt-board-tags';
+        boardTags.forEach((tag) => {
+          const badge = document.createElement('span');
+          badge.className = 'pt-board-tag';
+          badge.textContent = tag;
+          boardWrap.appendChild(badge);
+        });
+        item.appendChild(boardWrap);
+      }
+
+      if (otherTokens.length) {
+        const extra = document.createElement('span');
+        extra.className = 'pt-extra';
+        extra.textContent = otherTokens.join(' ');
+        item.appendChild(extra);
+      }
     }
 
     const hasTimingContext = Boolean(timingStreet && showAction && segment.action);
@@ -1815,6 +1856,24 @@ function buildProfileTooltipContent(sampleInput, options = {}) {
       globalMain.appendChild(createHhManualFieldEditor(parsed, 'hand_presupposition', { readOnly: !editableSample }));
       globalRow.appendChild(globalMain);
       entry.appendChild(globalRow);
+    } else {
+      const globalRow = document.createElement('div');
+      globalRow.className = 'pt-street-row pt-hand-presup-row';
+
+      const globalLabel = document.createElement('span');
+      globalLabel.className = 'pt-street-label';
+      globalLabel.textContent = 'PRESUP';
+      globalRow.appendChild(globalLabel);
+
+      const globalMain = document.createElement('div');
+      globalMain.className = 'pt-street-main';
+      const value = String(parsed?.manual?.handPresupposition || '').trim();
+      const text = document.createElement('span');
+      text.className = value ? 'pt-presup-text' : 'pt-empty';
+      text.textContent = value || '—';
+      globalMain.appendChild(text);
+      globalRow.appendChild(globalMain);
+      entry.appendChild(globalRow);
     }
 
     root.appendChild(entry);
@@ -1971,13 +2030,15 @@ function resolveProfileRoomKey(filters = profileFilters, roomOptions = profileFi
 
 function profileMyNicknameForRoom(roomKey) {
   const key = normalizeRoomKey(roomKey);
-  if (!key) return '';
-  return String(profileMyNickByRoom[key] || '').trim();
+  if (key) {
+    const roomScoped = String(profileMyNickByRoom[key] || '').trim();
+    if (roomScoped) return roomScoped;
+  }
+  return String(profileMyNickByRoom[PROFILE_MY_NICK_FALLBACK_ROOM_KEY] || '').trim();
 }
 
 function persistProfileMyNickname(roomKey, nickname) {
-  const key = normalizeRoomKey(roomKey);
-  if (!key) return;
+  const key = normalizeRoomKey(roomKey) || PROFILE_MY_NICK_FALLBACK_ROOM_KEY;
   const next = { ...profileMyNickByRoom };
   const normalizedNick = String(nickname || '').trim();
   if (!normalizedNick) {
@@ -2072,6 +2133,10 @@ function cloneProfileFilters(filters) {
     playerGroups: Array.isArray(source.playerGroups) ? [...source.playerGroups] : [],
     datePreset: String(source.datePreset || 'all'),
     gameCards: Array.isArray(source.gameCards) ? [...source.gameCards] : [],
+    handTags: Array.isArray(source.handTags) ? [...source.handTags] : [],
+    handTagsMode: String(source.handTagsMode || 'or').toLowerCase() === 'and' ? 'and' : 'or',
+    boardTags: Array.isArray(source.boardTags) ? [...source.boardTags] : [],
+    boardTagsMode: String(source.boardTagsMode || 'or').toLowerCase() === 'and' ? 'and' : 'or',
     rooms: Array.isArray(source.rooms) ? [...source.rooms] : [],
     potBuckets: Array.isArray(source.potBuckets) ? [...source.potBuckets] : [],
     limits: Array.isArray(source.limits) ? [...source.limits] : [],
@@ -2133,7 +2198,7 @@ async function clearAllHhHandsInDb() {
     const response = await fetch('/api/hh-clear-all', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
+      body: JSON.stringify({ resetSequences: true })
     });
     const data = await response.json();
     if (!response.ok) {
@@ -2143,7 +2208,7 @@ async function clearAllHhHandsInDb() {
     profileListCache.clear();
     const notes = Number(data.notesDeleted || 0);
     const hands = Number(data.handsDeleted || 0);
-    setStatus(`Вся HH база очищена: notes=${notes}, hands=${hands}.`, 'ok');
+    setStatus(`Вся HH база очищена: notes=${notes}, hands=${hands}, id-счетчики сброшены.`, 'ok');
     if (profileModalOpponent && String(profileModalSource || '').toLowerCase() === 'hh') {
       setFiltersAndReload();
     }
@@ -2307,6 +2372,59 @@ function buildProfileFilterGroups(roomValues = []) {
       ],
       key: 'limits',
       single: false
+    },
+    {
+      title: 'Тип руки',
+      buttons: [
+        { label: 'NUTS', value: 'nuts' },
+        { label: 'QUADS', value: 'quads' },
+        { label: 'STRFLUSH', value: 'strflush' },
+        { label: 'FULL', value: 'full' },
+        { label: 'NUTFLUSH', value: 'nutflush' },
+        { label: '2NDFLUSH', value: '2ndflush' },
+        { label: 'MIDFLUSH', value: 'midflush' },
+        { label: 'LOWFLUSH', value: 'lowflush' },
+        { label: 'NUTSTR', value: 'nutstr' },
+        { label: 'MIDSTR', value: 'midstr' },
+        { label: 'LOWSTR', value: 'lowstr' },
+        { label: 'TOPSET', value: 'topset' },
+        { label: 'SET', value: 'set' },
+        { label: 'TRI', value: 'tri' },
+        { label: 'OV', value: 'ov' },
+        { label: '2P', value: '2p' },
+        { label: 'TP', value: 'tp' },
+        { label: 'MP', value: 'mp' },
+        { label: 'BP', value: 'bp' },
+        { label: 'NFD', value: 'nfd' },
+        { label: 'FD', value: 'fd' },
+        { label: 'WRAP', value: 'wrap' },
+        { label: 'OE', value: 'oe' },
+        { label: 'G', value: 'g' },
+        { label: 'AIR', value: 'air' }
+      ],
+      key: 'handTags',
+      modeKey: 'handTagsMode',
+      single: false
+    },
+    {
+      title: 'Тип борда',
+      buttons: [
+        { label: 'A_BRD', value: 'a_brd' },
+        { label: 'K_BRD', value: 'k_brd' },
+        { label: 'Q_BRD', value: 'q_brd' },
+        { label: 'MID_BRD', value: 'mid_brd' },
+        { label: 'LOW_BRD', value: 'low_brd' },
+        { label: 'PAIRED_BRD', value: 'paired_brd' },
+        { label: 'TRI_BRD', value: 'tri_brd' },
+        { label: 'STR_BRD', value: 'str_brd' },
+        { label: 'FD_BRD', value: 'fd_brd' },
+        { label: '2FD_BRD', value: '2fd_brd' },
+        { label: 'FLUSH_BRD', value: 'flush_brd' },
+        { label: 'MONO_BRD', value: 'mono_brd' }
+      ],
+      key: 'boardTags',
+      modeKey: 'boardTagsMode',
+      single: false
     }
   ];
 
@@ -2335,12 +2453,23 @@ function appendProfileFilterGroups(wrap, filters, roomValues, onFilterChange) {
     const actions = document.createElement('div');
     actions.className = 'profile-filter-actions';
 
+    if (group.modeKey) {
+      const modeWrap = document.createElement('div');
+      modeWrap.className = 'profile-filter-mode';
+      const currentMode = String(filters[group.modeKey] || 'or').toLowerCase() === 'and' ? 'and' : 'or';
+      const nextMode = currentMode === 'or' ? 'and' : 'or';
+      const modeButton = createFilterButton(currentMode.toUpperCase(), false, () => onFilterChange(group, nextMode, 'mode'));
+      modeButton.classList.add('profile-filter-mode-toggle');
+      modeWrap.appendChild(modeButton);
+      actions.appendChild(modeWrap);
+    }
+
     group.buttons.forEach((item) => {
       const value = String(item.value);
       const active = group.single
         ? String(filters[group.key] || '') === value
         : (Array.isArray(filters[group.key]) && filters[group.key].includes(value));
-      const button = createFilterButton(item.label, active, () => onFilterChange(group, value));
+      const button = createFilterButton(item.label, active, () => onFilterChange(group, value, 'value'));
       actions.appendChild(button);
     });
 
@@ -2507,9 +2636,16 @@ function renderProfileFilters(context = 'main') {
   }
 
   const roomValues = Array.isArray(options.rooms) ? options.rooms : [];
-  appendProfileFilterGroups(wrap, filters, roomValues, (group, value) => {
+  appendProfileFilterGroups(wrap, filters, roomValues, (group, value, kind = 'value') => {
+    const applyMode = (currentFilters) => {
+      if (!group.modeKey) return currentFilters;
+      const nextMode = String(value || '').toLowerCase() === 'and' ? 'and' : 'or';
+      return { ...currentFilters, [group.modeKey]: nextMode };
+    };
     if (isMirror) {
-      if (group.single) {
+      if (kind === 'mode') {
+        profileMirrorFilters = applyMode(profileMirrorFilters);
+      } else if (group.single) {
         profileMirrorFilters = setSingleFilterState(profileMirrorFilters, group.key, value);
       } else {
         profileMirrorFilters = toggleMultiFilterState(profileMirrorFilters, group.key, value);
@@ -2517,7 +2653,9 @@ function renderProfileFilters(context = 'main') {
       setFiltersAndReload();
       return;
     }
-    if (group.single) {
+    if (kind === 'mode') {
+      profileFilters = applyMode(profileFilters);
+    } else if (group.single) {
       setSingleFilter(group.key, value);
     } else {
       toggleMultiFilter(group.key, value);
@@ -2632,15 +2770,15 @@ function renderProfileFilters(context = 'main') {
     vsMeLabel.appendChild(vsMeText);
 
     const roomKey = currentMainRoomKey();
+    const nickScope = roomKey || 'all rooms';
     const myNicknameInput = document.createElement('input');
     myNicknameInput.type = 'text';
     myNicknameInput.className = 'profile-my-nick-input';
-    myNicknameInput.placeholder = roomKey ? `my nickname (${roomKey})` : 'my nickname (выбери room)';
+    myNicknameInput.placeholder = `my nickname (${nickScope})`;
     myNicknameInput.value = profileMyNicknameForRoom(roomKey);
-    myNicknameInput.disabled = !roomKey;
+    myNicknameInput.disabled = false;
 
     const saveMyNickname = () => {
-      if (!roomKey) return;
       const nextNickname = String(myNicknameInput.value || '').trim();
       const prevNickname = profileMyNicknameForRoom(roomKey);
       if (prevNickname === nextNickname) return;
@@ -2670,7 +2808,7 @@ function renderProfileFilters(context = 'main') {
       if (!myNickname) {
         profileVsMeEnabled = false;
         vsMeCheckbox.checked = false;
-        setStatus('Укажи my nickname для выбранного room.', 'error');
+        setStatus('Укажи my nickname (для room или all rooms).', 'error');
         return;
       }
       setVsFilter(myNickname);
@@ -2680,7 +2818,7 @@ function renderProfileFilters(context = 'main') {
 
     const myNickLabel = document.createElement('span');
     myNickLabel.className = 'profile-my-nick-label';
-    myNickLabel.textContent = 'my nickname';
+    myNickLabel.textContent = `my nickname (${nickScope})`;
 
     vsActions.appendChild(vsInput);
     vsActions.appendChild(suggestionList);
@@ -2745,18 +2883,67 @@ function buildProfileGrid(sections = [], legend = []) {
 }
 
 function buildProfileListSamples(payload) {
+  const toFinite = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+  const buildRowMeta = (row = {}) => {
+    const gameCards = toFinite(row?.gameCardCount);
+    const activePlayers = toFinite(row?.activePlayersCount);
+    const finalPotBb = toFinite(row?.finalPotBb);
+    const sb = toFinite(row?.sb);
+    const bb = toFinite(row?.bb);
+    const room = String(row?.room || '').trim().toLowerCase();
+    const handNumber = String(row?.handNumber || '').trim();
+    const playedAtUtc = String(row?.playedAtUtc || row?.date || '').trim();
+    const limitText = String(row?.limitText || '').trim();
+    const parsedLimitFromText = (() => {
+      if (!limitText) return '';
+      const match = limitText.match(/(\d+(?:[.,]\d+)?)\s*\/\s*(\d+(?:[.,]\d+)?)/);
+      if (!match?.[1] || !match?.[2]) return '';
+      const left = String(match[1]).replace(',', '.');
+      const right = String(match[2]).replace(',', '.');
+      return `${left}-${right}`;
+    })();
+    const potBucket = Number.isFinite(finalPotBb)
+      ? (finalPotBb < 15 ? 'small' : finalPotBb < 35 ? 'medium' : finalPotBb < 90 ? 'large' : 'huge')
+      : '';
+    const limit = Number.isFinite(sb) && Number.isFinite(bb)
+      ? `${sb}-${bb}`
+      : parsedLimitFromText;
+
+    if (!handNumber && !playedAtUtc && !room && !limit && !potBucket && !Number.isFinite(finalPotBb) && !Number.isFinite(gameCards) && !Number.isFinite(activePlayers)) {
+      return null;
+    }
+
+    return {
+      handNumber,
+      playedAtUtc,
+      game: Number.isFinite(gameCards) ? `PLO${gameCards}` : String(row?.gameType || '').trim(),
+      activePlayers: Number.isFinite(activePlayers) ? activePlayers : '',
+      room,
+      limit,
+      finalPotBb: Number.isFinite(finalPotBb) ? finalPotBb : '',
+      potBucket
+    };
+  };
+
   return Array.isArray(payload?.list)
     ? payload.list
       .map((row) => {
         const rowLabel = String(row?.rowLabel || '').trim() || `#DB:${row?.row ?? '?'}`;
         const handNumber = String(row?.handNumber || '').trim();
         const room = String(row?.room || '').trim().toLowerCase();
+        const source = String(row?.nickname || '').toLowerCase() === 'hh' ? 'hh' : 'voice';
         const manual = {
-          preflop: String(row?.manualPreflop || ''),
-          flop: String(row?.manualFlop || ''),
-          turn: String(row?.manualTurn || ''),
-          river: String(row?.manualRiver || ''),
-          handPresupposition: String(row?.handPresupposition || '')
+          preflop: source === 'hh' ? String(row?.manualPreflop || '') : '',
+          flop: source === 'hh' ? String(row?.manualFlop || '') : '',
+          turn: source === 'hh' ? String(row?.manualTurn || '') : '',
+          river: source === 'hh' ? String(row?.manualRiver || '') : '',
+          handPresupposition: source === 'hh'
+            ? String(row?.handPresupposition || '')
+            : String(row?.presupposition || '')
         };
         const timings = Array.isArray(row?.manualTimings)
           ? row.manualTimings
@@ -2775,13 +2962,14 @@ function buildProfileListSamples(payload) {
           handNumber,
           room,
           opponent: String(payload?.opponent || ''),
-          source: String(row?.nickname || '').toLowerCase() === 'hh' ? 'hh' : 'voice',
+          source,
           targetIdentity: extractTargetIdentity(payload?.opponent || '')
         };
         return JSON.stringify({
           type: 'profile_sample_v2',
           rowLabel,
           focusStreet: '',
+          meta: buildRowMeta(row),
           manual,
           context,
           timings,
@@ -2896,10 +3084,17 @@ function renderProfileModal(profile) {
     ? profile.filters.options.rooms
     : [];
   profileFilterOptions = { rooms };
-  profileContentEl.appendChild(renderProfileFilters('main'));
-  profileContentEl.appendChild(buildProfileLegend(profile?.legend || []));
-  profileContentEl.appendChild(buildProfileGrid(profile?.sections || [], profile?.legend || []));
-  appendMirrorPerspectiveSection(profileContentEl);
+  const mainPane = document.createElement('div');
+  mainPane.className = 'profile-main-pane';
+  mainPane.appendChild(renderProfileFilters('main'));
+  mainPane.appendChild(buildProfileLegend(profile?.legend || []));
+  mainPane.appendChild(buildProfileGrid(profile?.sections || [], profile?.legend || []));
+  appendMirrorPerspectiveSection(mainPane);
+  if (profileModalSource === 'hh') {
+    profileContentEl.appendChild(buildDualProfileCanvas(mainPane, profile?.opponent || profileModalOpponent));
+    return;
+  }
+  profileContentEl.appendChild(mainPane);
 }
 
 function renderProfileListPayload(payload) {
@@ -2916,9 +3111,81 @@ function renderProfileListPayload(payload) {
     ? payload.filters.options.rooms
     : [];
   profileFilterOptions = { rooms };
-  profileContentEl.appendChild(renderProfileFilters('main'));
-  profileContentEl.appendChild(buildProfileListView(payload));
-  appendMirrorPerspectiveSection(profileContentEl);
+  const mainPane = document.createElement('div');
+  mainPane.className = 'profile-main-pane';
+  mainPane.appendChild(renderProfileFilters('main'));
+  mainPane.appendChild(buildProfileListView(payload));
+  appendMirrorPerspectiveSection(mainPane);
+  if (profileModalSource === 'hh') {
+    profileContentEl.appendChild(buildDualProfileCanvas(mainPane, payload?.opponent || profileModalOpponent));
+    return;
+  }
+  profileContentEl.appendChild(mainPane);
+}
+
+function buildVoiceContextPanel(opponent) {
+  const rightPane = document.createElement('section');
+  rightPane.className = 'profile-dual-panel profile-voice-context';
+
+  const title = document.createElement('h4');
+  title.className = 'profile-voice-context-title';
+  title.textContent = 'Voice Context (List)';
+  rightPane.appendChild(title);
+
+  const body = document.createElement('div');
+  body.className = 'profile-voice-context-body';
+  body.textContent = 'Подгружаю список аудио-заметок...';
+  rightPane.appendChild(body);
+
+  const requestId = ++profileVoiceContextRequestId;
+  const loadVoiceContextList = async () => {
+    const baseOptions = {
+      source: 'voice',
+      filters: createDefaultProfileFilters(),
+      suppressRender: true
+    };
+    const firstAttempt = await prefetchOpponentProfileList(opponent, {
+      ...baseOptions,
+      force: false
+    });
+    if (firstAttempt) return firstAttempt;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return prefetchOpponentProfileList(opponent, {
+      ...baseOptions,
+      force: true
+    });
+  };
+
+  void loadVoiceContextList().then((payload) => {
+    if (requestId !== profileVoiceContextRequestId) return;
+    if (!body.isConnected) return;
+    if (String(profileModalOpponent || '').trim() !== String(opponent || '').trim()) return;
+    if (normalizeProfileSource(profileModalSource) !== 'hh') return;
+    if (!payload) {
+      body.textContent = 'Не удалось загрузить список аудио-заметок.';
+      return;
+    }
+    body.innerHTML = '';
+    body.appendChild(buildProfileListView(payload, 'Аудио-заметок по текущему игроку не найдено.'));
+  }).catch(() => {
+    if (requestId !== profileVoiceContextRequestId) return;
+    if (!body.isConnected) return;
+    body.textContent = 'Не удалось загрузить список аудио-заметок.';
+  });
+
+  return rightPane;
+}
+
+function buildDualProfileCanvas(mainPane, opponent) {
+  const canvas = document.createElement('div');
+  canvas.className = 'profile-dual-canvas';
+
+  const leftPane = document.createElement('section');
+  leftPane.className = 'profile-dual-panel profile-dual-panel-main';
+  leftPane.appendChild(mainPane);
+  canvas.appendChild(leftPane);
+  canvas.appendChild(buildVoiceContextPanel(opponent));
+  return canvas;
 }
 
 function renderProfileModalState(opponent, source = PROFILE_DEFAULT_SOURCE) {
@@ -2969,66 +3236,85 @@ async function prefetchOpponentProfile(opponent, options = {}) {
   const key = profileCacheKey(name, source, filters);
   const force = options.force === true;
   const current = profileCache.get(key);
-  if (!force && current && (current.status === 'loading' || current.status === 'ready')) {
+  if (!force && current?.status === 'ready') {
     return current.profile || null;
+  }
+  if (!force && profilePendingRequests.has(key)) {
+    return profilePendingRequests.get(key);
   }
 
   profileCache.set(key, { status: 'loading', profile: null, error: '' });
   if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
     renderProfileModalState(name, source);
   }
-
-  try {
-    const params = new URLSearchParams({ opponent: name, source });
-    if (Array.isArray(filters.playerGroups) && filters.playerGroups.length) {
-      params.set('players', filters.playerGroups.join(','));
+  let requestPromise = null;
+  requestPromise = (async () => {
+    try {
+      const params = new URLSearchParams({ opponent: name, source });
+      if (Array.isArray(filters.playerGroups) && filters.playerGroups.length) {
+        params.set('players', filters.playerGroups.join(','));
+      }
+      if (filters.datePreset && filters.datePreset !== 'all') {
+        params.set('date', filters.datePreset);
+      }
+      if (Array.isArray(filters.gameCards) && filters.gameCards.length) {
+        params.set('games', filters.gameCards.join(','));
+      }
+      if (Array.isArray(filters.handTags) && filters.handTags.length) {
+        params.set('hands', filters.handTags.join(','));
+        params.set('handMode', String(filters.handTagsMode || 'or').toLowerCase() === 'and' ? 'and' : 'or');
+      }
+      if (Array.isArray(filters.boardTags) && filters.boardTags.length) {
+        params.set('boards', filters.boardTags.join(','));
+        params.set('boardMode', String(filters.boardTagsMode || 'or').toLowerCase() === 'and' ? 'and' : 'or');
+      }
+      if (Array.isArray(filters.rooms) && filters.rooms.length) {
+        params.set('rooms', filters.rooms.join(','));
+      }
+      if (Array.isArray(filters.potBuckets) && filters.potBuckets.length) {
+        params.set('pots', filters.potBuckets.join(','));
+      }
+      if (Array.isArray(filters.limits) && filters.limits.length) {
+        params.set('limits', filters.limits.join(','));
+      }
+      if (filters.vsOpponent) {
+        params.set('vs', filters.vsOpponent);
+      }
+      if (String(filters.cardsVisibility || '').toLowerCase() === 'known') {
+        params.set('cards', 'known');
+      }
+      if (filters.recentLimit && filters.recentLimit !== 'all') {
+        params.set('recent', filters.recentLimit);
+        params.set('limit', filters.recentLimit);
+      }
+      if (filters.manualOnly === true) {
+        params.set('manual', '1');
+      }
+      if (force) params.set('force', '1');
+      const response = await fetch(`/api/opponent-visual-profile?${params.toString()}`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Не удалось собрать визуализацию.');
+      }
+      profileCache.set(key, { status: 'ready', profile: data.profile, error: '' });
+      if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
+        renderProfileModalState(name, source);
+      }
+      return data.profile;
+    } catch (error) {
+      profileCache.set(key, { status: 'error', profile: null, error: error.message || 'Ошибка профиля.' });
+      if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
+        renderProfileModalState(name, source);
+      }
+      return null;
+    } finally {
+      if (profilePendingRequests.get(key) === requestPromise) {
+        profilePendingRequests.delete(key);
+      }
     }
-    if (filters.datePreset && filters.datePreset !== 'all') {
-      params.set('date', filters.datePreset);
-    }
-    if (Array.isArray(filters.gameCards) && filters.gameCards.length) {
-      params.set('games', filters.gameCards.join(','));
-    }
-    if (Array.isArray(filters.rooms) && filters.rooms.length) {
-      params.set('rooms', filters.rooms.join(','));
-    }
-    if (Array.isArray(filters.potBuckets) && filters.potBuckets.length) {
-      params.set('pots', filters.potBuckets.join(','));
-    }
-    if (Array.isArray(filters.limits) && filters.limits.length) {
-      params.set('limits', filters.limits.join(','));
-    }
-    if (filters.vsOpponent) {
-      params.set('vs', filters.vsOpponent);
-    }
-    if (String(filters.cardsVisibility || '').toLowerCase() === 'known') {
-      params.set('cards', 'known');
-    }
-    if (filters.recentLimit && filters.recentLimit !== 'all') {
-      params.set('recent', filters.recentLimit);
-      params.set('limit', filters.recentLimit);
-    }
-    if (filters.manualOnly === true) {
-      params.set('manual', '1');
-    }
-    if (force) params.set('force', '1');
-    const response = await fetch(`/api/opponent-visual-profile?${params.toString()}`);
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || 'Не удалось собрать визуализацию.');
-    }
-    profileCache.set(key, { status: 'ready', profile: data.profile, error: '' });
-    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
-      renderProfileModalState(name, source);
-    }
-    return data.profile;
-  } catch (error) {
-    profileCache.set(key, { status: 'error', profile: null, error: error.message || 'Ошибка профиля.' });
-    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
-      renderProfileModalState(name, source);
-    }
-    return null;
-  }
+  })();
+  profilePendingRequests.set(key, requestPromise);
+  return requestPromise;
 }
 
 async function prefetchOpponentProfileList(opponent, options = {}) {
@@ -3040,73 +3326,92 @@ async function prefetchOpponentProfileList(opponent, options = {}) {
   const key = profileListCacheKey(name, source, filters);
   const force = options.force === true;
   const current = profileListCache.get(key);
-  if (!force && current && (current.status === 'loading' || current.status === 'ready')) {
+  if (!force && current?.status === 'ready') {
     return current.payload || null;
+  }
+  if (!force && profileListPendingRequests.has(key)) {
+    return profileListPendingRequests.get(key);
   }
 
   profileListCache.set(key, { status: 'loading', payload: null, error: '' });
   if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
     renderProfileModalState(name, source);
   }
+  let requestPromise = null;
+  requestPromise = (async () => {
+    try {
+      const params = new URLSearchParams({ opponent: name, source });
+      if (Array.isArray(filters.playerGroups) && filters.playerGroups.length) {
+        params.set('players', filters.playerGroups.join(','));
+      }
+      if (filters.datePreset && filters.datePreset !== 'all') {
+        params.set('date', filters.datePreset);
+      }
+      if (Array.isArray(filters.gameCards) && filters.gameCards.length) {
+        params.set('games', filters.gameCards.join(','));
+      }
+      if (Array.isArray(filters.handTags) && filters.handTags.length) {
+        params.set('hands', filters.handTags.join(','));
+        params.set('handMode', String(filters.handTagsMode || 'or').toLowerCase() === 'and' ? 'and' : 'or');
+      }
+      if (Array.isArray(filters.boardTags) && filters.boardTags.length) {
+        params.set('boards', filters.boardTags.join(','));
+        params.set('boardMode', String(filters.boardTagsMode || 'or').toLowerCase() === 'and' ? 'and' : 'or');
+      }
+      if (Array.isArray(filters.rooms) && filters.rooms.length) {
+        params.set('rooms', filters.rooms.join(','));
+      }
+      if (Array.isArray(filters.potBuckets) && filters.potBuckets.length) {
+        params.set('pots', filters.potBuckets.join(','));
+      }
+      if (Array.isArray(filters.limits) && filters.limits.length) {
+        params.set('limits', filters.limits.join(','));
+      }
+      if (filters.vsOpponent) {
+        params.set('vs', filters.vsOpponent);
+      }
+      if (String(filters.cardsVisibility || '').toLowerCase() === 'known') {
+        params.set('cards', 'known');
+      }
+      if (filters.recentLimit && filters.recentLimit !== 'all') {
+        params.set('recent', filters.recentLimit);
+        params.set('limit', filters.recentLimit);
+      }
+      if (filters.manualOnly === true) {
+        params.set('manual', '1');
+      }
 
-  try {
-    const params = new URLSearchParams({ opponent: name, source });
-    if (Array.isArray(filters.playerGroups) && filters.playerGroups.length) {
-      params.set('players', filters.playerGroups.join(','));
+      const response = await fetch(`/api/opponent-visual-list?${params.toString()}`);
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Не удалось собрать список раздач.');
+      }
+      const payload = {
+        opponent: name,
+        list: Array.isArray(data.list) ? data.list : [],
+        totalRows: Number(data.totalRows || 0),
+        sources: Array.isArray(data.sources) ? data.sources : [],
+        filters: data.filters || { options: { rooms: [] } }
+      };
+      profileListCache.set(key, { status: 'ready', payload, error: '' });
+      if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
+        renderProfileModalState(name, source);
+      }
+      return payload;
+    } catch (error) {
+      profileListCache.set(key, { status: 'error', payload: null, error: error.message || 'Ошибка списка.' });
+      if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
+        renderProfileModalState(name, source);
+      }
+      return null;
+    } finally {
+      if (profileListPendingRequests.get(key) === requestPromise) {
+        profileListPendingRequests.delete(key);
+      }
     }
-    if (filters.datePreset && filters.datePreset !== 'all') {
-      params.set('date', filters.datePreset);
-    }
-    if (Array.isArray(filters.gameCards) && filters.gameCards.length) {
-      params.set('games', filters.gameCards.join(','));
-    }
-    if (Array.isArray(filters.rooms) && filters.rooms.length) {
-      params.set('rooms', filters.rooms.join(','));
-    }
-    if (Array.isArray(filters.potBuckets) && filters.potBuckets.length) {
-      params.set('pots', filters.potBuckets.join(','));
-    }
-    if (Array.isArray(filters.limits) && filters.limits.length) {
-      params.set('limits', filters.limits.join(','));
-    }
-    if (filters.vsOpponent) {
-      params.set('vs', filters.vsOpponent);
-    }
-    if (String(filters.cardsVisibility || '').toLowerCase() === 'known') {
-      params.set('cards', 'known');
-    }
-    if (filters.recentLimit && filters.recentLimit !== 'all') {
-      params.set('recent', filters.recentLimit);
-      params.set('limit', filters.recentLimit);
-    }
-    if (filters.manualOnly === true) {
-      params.set('manual', '1');
-    }
-
-    const response = await fetch(`/api/opponent-visual-list?${params.toString()}`);
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || 'Не удалось собрать список раздач.');
-    }
-    const payload = {
-      opponent: name,
-      list: Array.isArray(data.list) ? data.list : [],
-      totalRows: Number(data.totalRows || 0),
-      sources: Array.isArray(data.sources) ? data.sources : [],
-      filters: data.filters || { options: { rooms: [] } }
-    };
-    profileListCache.set(key, { status: 'ready', payload, error: '' });
-    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
-      renderProfileModalState(name, source);
-    }
-    return payload;
-  } catch (error) {
-    profileListCache.set(key, { status: 'error', payload: null, error: error.message || 'Ошибка списка.' });
-    if (!suppressRender && profileModalOpponent === name && profileModalSource === source) {
-      renderProfileModalState(name, source);
-    }
-    return null;
-  }
+  })();
+  profileListPendingRequests.set(key, requestPromise);
+  return requestPromise;
 }
 
 function openProfileModal(opponent, options = {}) {
@@ -3123,6 +3428,7 @@ function openProfileModal(opponent, options = {}) {
   profileMirrorFilterOptions = { rooms: [] };
   profileMirrorVsHimEnabled = true;
   profileMirrorRequestId += 1;
+  profileVoiceContextRequestId += 1;
   resetMirrorFilters();
   if (source !== 'hh') {
     profileMirrorFilters = createDefaultProfileFilters();
@@ -3131,6 +3437,14 @@ function openProfileModal(opponent, options = {}) {
   profileModalEl.setAttribute('aria-hidden', 'false');
   renderProfileModalState(opponent, source);
   prefetchOpponentProfile(opponent, { force: true, source, filters: profileFilters });
+  if (source === 'hh') {
+    prefetchOpponentProfileList(opponent, {
+      force: false,
+      source: 'voice',
+      filters: createDefaultProfileFilters(),
+      suppressRender: true
+    });
+  }
 }
 
 function closeProfileModal() {
@@ -3144,6 +3458,7 @@ function closeProfileModal() {
   profileViewMode = 'chart';
   profileVsMeEnabled = false;
   profileMirrorRequestId += 1;
+  profileVoiceContextRequestId += 1;
   profileModalEl.classList.add('hidden');
   profileModalEl.setAttribute('aria-hidden', 'true');
   hideProfileTooltip({ force: true });
@@ -3409,6 +3724,17 @@ function renderOpponents() {
     openButton.addEventListener('click', () => openOpponentInSheet(name));
     profileButton.addEventListener('click', () => openProfileModal(name, { source: 'voice' }));
     profileDbButton.addEventListener('click', () => openProfileModal(name, { source: 'hh' }));
+    const warmDbProfile = () => {
+      prefetchOpponentProfile(name, { force: false, source: 'hh', filters: createDefaultProfileFilters(), suppressRender: true });
+      prefetchOpponentProfileList(name, {
+        force: false,
+        source: 'voice',
+        filters: createDefaultProfileFilters(),
+        suppressRender: true
+      });
+    };
+    profileDbButton.addEventListener('mouseenter', warmDbProfile);
+    profileDbButton.addEventListener('focus', warmDbProfile);
 
     card.appendChild(removeButton);
     card.appendChild(recordButton);

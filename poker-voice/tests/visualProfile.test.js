@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   __testables,
-  buildOpponentVisualProfile
+  buildOpponentVisualProfile,
+  filterProfileRowsByTagFilters
 } from '../src/visualProfile.js';
 
 test('visual profile bucket detection maps sizing and miss', () => {
@@ -34,6 +35,112 @@ test('visual profile action summary marks direct all-in on first bet action', ()
   assert.equal(summary.hasBet, true);
   assert.equal(summary.bucket, 'P');
   assert.equal(summary.firstBetAllIn, true);
+});
+
+test('visual profile filters rows by selected hand tags for target actor', () => {
+  const rows = [
+    { rowLabel: '#DB:1', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKd2c A_BRD FD_BRD' },
+    { rowLabel: '#DB:2', flop: 'BB_target cb33 AhKhQhJcTc_air onAdKd2c A_BRD FD_BRD' },
+    { rowLabel: '#DB:3', flop: 'BB_other cb33 AhKhQhJcTc_set onAdKd2c A_BRD FD_BRD / BB_target f' }
+  ];
+
+  const filtered = filterProfileRowsByTagFilters(rows, {
+    opponent: 'target',
+    filters: { handTags: ['set'] }
+  });
+
+  assert.deepEqual(filtered.map((row) => row.rowLabel), ['#DB:1']);
+});
+
+test('visual profile filters rows by selected board tags', () => {
+  const rows = [
+    { rowLabel: '#DB:11', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKd2c A_BRD FD_BRD' },
+    { rowLabel: '#DB:12', flop: 'BB_target cb33 AhKhQhJcTc_set onKdQd2c K_BRD STR_BRD' }
+  ];
+
+  const filtered = filterProfileRowsByTagFilters(rows, {
+    opponent: 'target',
+    filters: { boardTags: ['fd_brd'] }
+  });
+
+  assert.deepEqual(filtered.map((row) => row.rowLabel), ['#DB:11']);
+});
+
+test('visual profile applies hand and board tag filters with AND semantics', () => {
+  const rows = [
+    { rowLabel: '#DB:21', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKdAc A_BRD PAIRED_BRD' },
+    { rowLabel: '#DB:22', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKd2c A_BRD FD_BRD' },
+    { rowLabel: '#DB:23', flop: 'BB_target cb33 AhKhQhJcTc_air onAdKdAc A_BRD PAIRED_BRD' }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, {
+    opponent: 'target',
+    filters: {
+      handTags: ['set'],
+      boardTags: ['paired_brd']
+    }
+  });
+
+  assert.equal(profile.totalRows, 1);
+});
+
+test('visual profile hand-tag mode AND requires all selected tags in same street', () => {
+  const rows = [
+    { rowLabel: '#DB:31', flop: 'BB_target cb33 AhKhQhJcTc_set_tp onAdKdAc A_BRD PAIRED_BRD' },
+    { rowLabel: '#DB:32', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKdAc A_BRD PAIRED_BRD', turn: 'BB_target b55 AhKhQhJcTc_tp onAdKdAc7d A_BRD' }
+  ];
+
+  const filtered = filterProfileRowsByTagFilters(rows, {
+    opponent: 'target',
+    filters: {
+      handTags: ['set', 'tp'],
+      handTagsMode: 'and'
+    }
+  });
+
+  assert.deepEqual(filtered.map((row) => row.rowLabel), ['#DB:31']);
+});
+
+test('visual profile board-tag mode AND requires all selected board tags in same street', () => {
+  const rows = [
+    { rowLabel: '#DB:41', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKdAc A_BRD PAIRED_BRD' },
+    { rowLabel: '#DB:42', flop: 'BB_target cb33 AhKhQhJcTc_set onAdKd2c A_BRD FD_BRD', turn: 'BB_target b55 AhKhQhJcTc_set onAdKdAc7d A_BRD PAIRED_BRD' }
+  ];
+
+  const filtered = filterProfileRowsByTagFilters(rows, {
+    opponent: 'target',
+    filters: {
+      boardTags: ['a_brd', 'paired_brd'],
+      boardTagsMode: 'and'
+    }
+  });
+
+  assert.deepEqual(filtered.map((row) => row.rowLabel), ['#DB:41', '#DB:42']);
+});
+
+test('visual profile applies hand filters on anchor street only (set on river does not leak into flop)', () => {
+  const rows = [
+    {
+      flop: '(8.0) BB_target b50 onAhKd2c / BTN_other c',
+      turn: '(18.0) BB_target x onAhKd2c7d / BTN_other x',
+      river: '(18.0) BB_target b60 AhKhQhJcTc_set onAhKd2c7d9s / BTN_other f'
+    }
+  ];
+
+  const profile = buildOpponentVisualProfile(rows, {
+    opponent: 'target',
+    filters: {
+      handTags: ['set']
+    }
+  });
+
+  const flop = profile.sections.find((section) => section.id === 'flop');
+  const total = profile.sections.find((section) => section.id === 'tot');
+  const flop5 = flop.groups.find((group) => group.id === 'HU').rows.find((row) => row.bucket === '5');
+  const river6 = total.groups[0].rows.find((row) => row.bucket === '6');
+
+  assert.equal(flop5.total, 0);
+  assert.equal(river6.total, 1);
 });
 
 test('visual profile builder aggregates sections and strengths', () => {
@@ -849,12 +956,19 @@ test('visual profile classifies board-discounted strong made as fragileStrong', 
   const setOnStraightBoard = __testables.classifyStrength('SB_hero b60 AhAcKd9d4h_set on9cKcQd');
   const straightOnPairedBoard = __testables.classifyStrength('SB_hero b60 AhTc9d8d7h_str on9c9dJcQh');
   const flushOnPairedBoard = __testables.classifyStrength('SB_hero b60 AhKhQd9d4h_flush on9c9dJdQd');
-  const explicitTags = __testables.classifyStrength('SB_hero b60 AhTc9d8d7h_str_lowstr_STRB on6c7d8h9sKs');
+  const explicitTags = __testables.classifyStrength('SB_hero b60 AhTc9d8d7h_midstr on6c7d8h9sKs K_BRD STR_BRD');
 
   assert.equal(setOnStraightBoard, 'fragileStrong');
   assert.equal(straightOnPairedBoard, 'fragileStrong');
   assert.equal(flushOnPairedBoard, 'fragileStrong');
   assert.equal(explicitTags, 'fragileStrong');
+});
+
+test('visual profile maps explicit tp token to topPair bucket', () => {
+  assert.equal(
+    __testables.classifyStrength('SB_hero b42 AhKcQd9s8d_tp onKh7d2c'),
+    'topPair'
+  );
 });
 
 test('visual profile uses opaque light-red palette for conditionalStrong legend on dark background', () => {

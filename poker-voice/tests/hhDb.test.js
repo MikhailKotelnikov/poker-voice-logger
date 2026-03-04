@@ -360,6 +360,78 @@ Table 'CGG_9224270-WEEKLYBENDER' 6-max Seat #1 is the button
   assert.equal(timingCountAfterAllClear, 1);
 });
 
+test('clearAllHhHands with resetSequences restarts HH row ids from 1', () => {
+  const dbPath = makeTempDbPath();
+  initHhDb(dbPath);
+
+  const parsedHH = {
+    blinds: { smallBlind: 5, bigBlind: 10 },
+    players: ['12121116', '85033665'],
+    positionsByPlayer: { '12121116': 'BB', '85033665': 'SB' },
+    targetPlayer: '12121116',
+    board: { flop: ['4c', 'Qc', '4d'], turn: '', river: '' },
+    events: {
+      preflop: [
+        { player: '12121116', type: 'raise', amount: 310, amountBb: 31, potBefore: 0, potAfter: 310 },
+        { player: '85033665', type: 'call', amount: 310, amountBb: 31, potBefore: 310, potAfter: 620 }
+      ],
+      flop: [
+        { player: '12121116', type: 'bet', amount: 420, amountBb: 42, pctPot: 67.74, potBefore: 620, potAfter: 1040 },
+        { player: '85033665', type: 'fold', amount: 0, amountBb: 0, pctPot: 0, potBefore: 1040, potAfter: 1040 }
+      ],
+      turn: [],
+      river: []
+    },
+    showdown: { showCardsByPlayer: {} }
+  };
+
+  const parsed = {
+    preflop: 'BB_12121116 r31bb / SB_85033665 c31bb',
+    flop: '(62) BB_12121116 cb67.7 on4cQc4d / SB_85033665 f',
+    turn: '',
+    river: '',
+    presupposition: ''
+  };
+
+  const runId1 = beginHhImportRun(dbPath, { sourceType: 'single', fileCount: 1 });
+  const firstSave = saveHhParsedRecord(dbPath, {
+    runId: runId1,
+    handHistory: `PokerStars Hand #71000001:  5 Card Omaha Pot Limit (¥5/¥10 CNY) - 2026/02/11 21:42:00 UTC
+Table 'CGG_9224270-WEEKLYBENDER' 6-max Seat #1 is the button`,
+    parsedHH,
+    parsed,
+    parserVersion: 'test-clear-reset-seq-v1',
+    targetIdentity: '12121116',
+    targetPlayer: '12121116'
+  });
+  finishHhImportRun(dbPath, runId1, { handCount: 1, savedCount: 1, failedCount: 0, errors: [] });
+  assert.equal(runId1, 1);
+  assert.equal(firstSave.noteId, 1);
+
+  const clearResult = clearAllHhHands(dbPath, { resetSequences: true });
+  assert.equal(clearResult.resetSequences, true);
+
+  const runId2 = beginHhImportRun(dbPath, { sourceType: 'single', fileCount: 1 });
+  const secondSave = saveHhParsedRecord(dbPath, {
+    runId: runId2,
+    handHistory: `PokerStars Hand #71000002:  5 Card Omaha Pot Limit (¥5/¥10 CNY) - 2026/02/11 21:43:00 UTC
+Table 'CGG_9224270-WEEKLYBENDER' 6-max Seat #1 is the button`,
+    parsedHH,
+    parsed,
+    parserVersion: 'test-clear-reset-seq-v1',
+    targetIdentity: '12121116',
+    targetPlayer: '12121116'
+  });
+  finishHhImportRun(dbPath, runId2, { handCount: 1, savedCount: 1, failedCount: 0, errors: [] });
+
+  assert.equal(runId2, 1);
+  assert.equal(secondSave.noteId, 1);
+
+  const rows = getHhProfileRows(dbPath, { opponent: '12121116', limit: 10 }).rows;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].row, 1);
+});
+
 test('manual presupp/timing are resolved by selected target identity, support manualOnly filter and clear APIs', () => {
   const dbPath = makeTempDbPath();
   initHhDb(dbPath);

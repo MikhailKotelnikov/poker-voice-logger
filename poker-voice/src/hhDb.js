@@ -1248,20 +1248,56 @@ export function clearHhHandsByOpponent(dbPath, { opponent = '', targetIdentity =
   });
 }
 
-export function clearAllHhHands(dbPath) {
+export function clearAllHhHands(dbPath, { resetSequences = false } = {}) {
   const db = openDb(dbPath);
+  const HH_CLEAR_ALL_SEQUENCE_TABLES = [
+    'hh_import_runs',
+    'hh_hands',
+    'hh_players',
+    'hh_hand_players',
+    'hh_events',
+    'hh_notes',
+    'hh_profile_cache'
+  ];
+  const hasSqliteSequence = () => {
+    try {
+      return Boolean(
+        db.prepare(`
+          SELECT 1
+          FROM sqlite_master
+          WHERE type = 'table' AND name = 'sqlite_sequence'
+          LIMIT 1
+        `).get()
+      );
+    } catch {
+      return false;
+    }
+  };
+  const resetAutoincrementSequences = () => {
+    if (!hasSqliteSequence()) return 0;
+    const placeholders = HH_CLEAR_ALL_SEQUENCE_TABLES.map(() => '?').join(', ');
+    const result = db.prepare(`
+      DELETE FROM sqlite_sequence
+      WHERE name IN (${placeholders})
+    `).run(...HH_CLEAR_ALL_SEQUENCE_TABLES);
+    return Number(result.changes || 0);
+  };
+  const shouldResetSequences = resetSequences === true;
   return withTransaction(db, () => {
     const notesDeleted = Number(db.prepare('DELETE FROM hh_notes').run().changes || 0);
     const handsDeleted = Number(db.prepare('DELETE FROM hh_hands').run().changes || 0);
     const playersDeleted = Number(db.prepare('DELETE FROM hh_players').run().changes || 0);
     const runsDeleted = Number(db.prepare('DELETE FROM hh_import_runs').run().changes || 0);
     db.prepare('DELETE FROM hh_profile_cache').run();
+    const sequencesDeleted = shouldResetSequences ? resetAutoincrementSequences() : 0;
 
     return {
       notesDeleted,
       handsDeleted,
       playersDeleted,
-      runsDeleted
+      runsDeleted,
+      resetSequences: shouldResetSequences,
+      sequencesDeleted
     };
   });
 }

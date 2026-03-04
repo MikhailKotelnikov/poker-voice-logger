@@ -259,6 +259,7 @@ const RANK_VALUE = {
 };
 const CARD_RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
 const CARD_SUITS = ['c', 'd', 'h', 's'];
+const STRAIGHT_HIGHS_CACHE = new Map();
 
 function parseCardToken(token) {
   const card = String(token || '').trim();
@@ -592,11 +593,90 @@ function hasPairToBoard(holeCardsRaw, boardCardsRaw) {
   return holeCards.some((card) => boardRanks.has(card.rank));
 }
 
+function classifyPairRankToken(holeCardsRaw, boardCardsRaw) {
+  const holeCards = (holeCardsRaw || []).map(parseCardToken).filter(Boolean);
+  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  if (!holeCards.length || !boardCards.length) return '';
+
+  const boardRanksDesc = Array.from(new Set(
+    boardCards
+      .map((card) => Number(card.value))
+      .filter(Number.isFinite)
+  )).sort((a, b) => b - a);
+  if (!boardRanksDesc.length) return '';
+
+  const holeRankValues = new Set(
+    holeCards
+      .map((card) => Number(card.value))
+      .filter(Number.isFinite)
+  );
+
+  let bestPairIndex = Infinity;
+  boardRanksDesc.forEach((rankValue, index) => {
+    if (holeRankValues.has(rankValue)) {
+      bestPairIndex = Math.min(bestPairIndex, index);
+    }
+  });
+
+  if (!Number.isFinite(bestPairIndex)) return '';
+  if (bestPairIndex === 0) return 'tp';
+  if (bestPairIndex === 1) return 'mp';
+  return 'bp';
+}
+
 function buildStreetBoards(board) {
   const flop = Array.isArray(board?.flop) ? board.flop.filter(Boolean) : [];
   const turn = board?.turn ? [...flop, board.turn] : [...flop];
   const river = board?.river ? [...turn, board.river] : [...turn];
   return { flop, turn, river };
+}
+
+function boardSignature(boardCardsRaw) {
+  const cards = (boardCardsRaw || [])
+    .map(parseCardToken)
+    .filter(Boolean)
+    .map((card) => card.raw);
+  return cards.join('');
+}
+
+function possibleStraightHighsOnBoard(boardCardsRaw) {
+  const key = boardSignature(boardCardsRaw);
+  if (!key) return [];
+  if (STRAIGHT_HIGHS_CACHE.has(key)) {
+    return STRAIGHT_HIGHS_CACHE.get(key).slice();
+  }
+
+  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  if (boardCards.length < 3) {
+    STRAIGHT_HIGHS_CACHE.set(key, []);
+    return [];
+  }
+
+  const deck = cardDeckExcluding(boardCardsRaw);
+  const highs = new Set();
+  for (let i = 0; i < deck.length; i += 1) {
+    for (let j = i + 1; j < deck.length; j += 1) {
+      const details = evaluateOmahaStreetClass([deck[i], deck[j]], boardCardsRaw);
+      if (details.classToken === 'str' && Number(details.straightHigh) > 0) {
+        highs.add(Number(details.straightHigh));
+      }
+    }
+  }
+  const out = Array.from(highs).sort((a, b) => b - a);
+  STRAIGHT_HIGHS_CACHE.set(key, out);
+  return out.slice();
+}
+
+function classifyStraightTierToken(straightHighRaw, boardCardsRaw) {
+  const straightHigh = Number(straightHighRaw || 0);
+  if (!Number.isFinite(straightHigh) || straightHigh <= 0) return '';
+  const highs = possibleStraightHighsOnBoard(boardCardsRaw);
+  if (!highs.length) return '';
+  const index = highs.indexOf(straightHigh);
+  if (index < 0) return '';
+  if (index === 0) return 'nutstr';
+  if (index === highs.length - 1) return 'lowstr';
+  return 'midstr';
 }
 
 function computeStreetClasses(cards, board) {
@@ -627,13 +707,10 @@ function computeStreetClasses(cards, board) {
     const boardCards = boards[street] || [];
     const detail = out._details[street];
     if (!detail || detail.classToken !== 'str' || !detail.straightHigh) continue;
-    if (boardIsPaired(boardCards)) continue;
-    if (boardMaxSuitCount(boardCards) >= 3) continue;
-    const nutStraightHigh = nutStraightHighOnBoard(boardCards);
-    if (nutStraightHigh > 0 && detail.straightHigh === nutStraightHigh) {
-      out[street] = 'nutstr';
-      out._details[street] = { ...detail, classToken: 'nutstr', nutStraightHigh };
-    }
+    const straightTier = classifyStraightTierToken(detail.straightHigh, boardCards);
+    if (!straightTier) continue;
+    out[street] = straightTier;
+    out._details[street] = { ...detail, classToken: straightTier };
   }
 
   for (const street of ['flop', 'turn', 'river']) {
@@ -659,17 +736,29 @@ function computeStreetClasses(cards, board) {
     out._details[street] = { ...detail, classToken: 'ov', upgradedFrom: 'p_overpair' };
   }
 
+  for (const street of ['flop', 'turn', 'river']) {
+    const boardCards = boards[street] || [];
+    const detail = out._details[street];
+    if (!detail || detail.classToken !== 'p') continue;
+    const pairToken = classifyPairRankToken(cards, boardCards);
+    if (!pairToken) continue;
+    out[street] = pairToken;
+    out._details[street] = { ...detail, classToken: pairToken, upgradedFrom: 'p_pair_subtype' };
+  }
+
   return out;
 }
 
-function buildStreetDraws(cardsRaw, board) {
+function buildStreetDraws(cardsRaw, board, classesByStreet = null) {
   const cards = (cardsRaw || []).map(parseCardToken).filter(Boolean);
   if (cards.length < 2) {
     return { flop: [], turn: [], river: [] };
   }
 
   const boards = buildStreetBoards(board);
-  const classes = computeStreetClasses(cardsRaw, board);
+  const classes = classesByStreet && typeof classesByStreet === 'object'
+    ? classesByStreet
+    : computeStreetClasses(cardsRaw, board);
 
   return {
     flop: deriveStreetDrawTokens(cards, boards.flop, classes.flop),
@@ -737,7 +826,20 @@ function detectFlushDrawToken(holeCards, boardCardsRaw, cardsToCome, madeClass) 
 }
 
 function detectStraightDrawToken(holeCards, boardCardsRaw, cardsToCome, madeClass) {
-  if (['str', 'nutstr', 'strflush', 'full', 'quads'].includes(madeClass)) {
+  if ([
+    'str',
+    'nutstr',
+    'midstr',
+    'lowstr',
+    'flush',
+    'nutflush',
+    '2ndflush',
+    'midflush',
+    'lowflush',
+    'strflush',
+    'full',
+    'quads'
+  ].includes(madeClass)) {
     return '';
   }
   if (cardsToCome <= 0) return '';
@@ -905,6 +1007,18 @@ function boardHasNToStraight(boardCardsRaw, n) {
   return false;
 }
 
+function boardHasTrips(boardCardsRaw) {
+  const counts = new Map();
+  const cards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  for (const card of cards) {
+    counts.set(card.rank, (counts.get(card.rank) || 0) + 1);
+    if ((counts.get(card.rank) || 0) >= 3) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function deriveFragileStrongTokens(streetClassToken, boardCardsRaw, detail = null) {
   const classToken = String(streetClassToken || '').toLowerCase();
   if (!classToken) return [];
@@ -915,7 +1029,7 @@ function deriveFragileStrongTokens(streetClassToken, boardCardsRaw, detail = nul
   const board4Or5Str = boardHasNToStraight(boardCardsRaw, 4) || boardHasNToStraight(boardCardsRaw, 5);
 
   const isSetLike = classToken === 'set' || classToken === 'topset' || classToken === 'tri';
-  const isStraightLike = classToken === 'str';
+  const isStraightLike = classToken === 'str' || classToken === 'nutstr' || classToken === 'midstr' || classToken === 'lowstr';
   const isFlushLike = ['flush', 'nutflush', '2ndflush', 'midflush', 'lowflush'].includes(classToken);
 
   const tags = [];
@@ -955,19 +1069,8 @@ function cardDeckExcluding(boardCardsRaw) {
 }
 
 function nutStraightHighOnBoard(boardCardsRaw) {
-  const boardCards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
-  if (boardCards.length < 3) return 0;
-  const deck = cardDeckExcluding(boardCardsRaw);
-  let best = 0;
-  for (let i = 0; i < deck.length; i += 1) {
-    for (let j = i + 1; j < deck.length; j += 1) {
-      const details = evaluateOmahaStreetClass([deck[i], deck[j]], boardCardsRaw);
-      if (details.classToken === 'str' && details.straightHigh > best) {
-        best = details.straightHigh;
-      }
-    }
-  }
-  return best;
+  const highs = possibleStraightHighsOnBoard(boardCardsRaw);
+  return highs.length ? highs[0] : 0;
 }
 
 function selectPrimaryShowdownOpponent(targetPlayer, showEvents, events) {
@@ -1263,9 +1366,10 @@ export function parseHandHistory(handHistory, opponent) {
   const targetCards = Array.isArray(knownCardsByPlayer[targetPlayer]) ? knownCardsByPlayer[targetPlayer] : targetShowCards;
   const streetClassByPlayer = {};
   const streetDrawByPlayer = {};
-  for (const [player, cards] of Object.entries(showCardsByPlayer)) {
-    streetClassByPlayer[player] = computeStreetClasses(cards, board);
-    streetDrawByPlayer[player] = buildStreetDraws(cards, board);
+  for (const [player, cards] of Object.entries(knownCardsByPlayer)) {
+    const classes = computeStreetClasses(cards, board);
+    streetClassByPlayer[player] = classes;
+    streetDrawByPlayer[player] = buildStreetDraws(cards, board, classes);
   }
   const primaryOpponentShow = selectPrimaryShowdownOpponent(targetPlayer, showEvents, events);
   const primaryOpponentCards = primaryOpponentShow?.cards || [];
@@ -1409,12 +1513,80 @@ function streetBoardCards(parsedHistory, street) {
   return [];
 }
 
-function boardToken(parsedHistory, street) {
+function boardHighTagToken(boardCardsRaw) {
+  const values = (boardCardsRaw || [])
+    .map(parseCardToken)
+    .filter(Boolean)
+    .map((card) => Number(card.value))
+    .filter(Number.isFinite);
+  if (!values.length) return '';
+  const top = Math.max(...values);
+  if (top >= 14) return 'A_BRD';
+  if (top >= 13) return 'K_BRD';
+  if (top >= 12) return 'Q_BRD';
+  if (top >= 8) return 'MID_BRD';
+  return 'LOW_BRD';
+}
+
+function boardSuitCounts(boardCardsRaw) {
+  const counts = new Map();
+  const cards = (boardCardsRaw || []).map(parseCardToken).filter(Boolean);
+  for (const card of cards) {
+    counts.set(card.suit, (counts.get(card.suit) || 0) + 1);
+  }
+  return counts;
+}
+
+function deriveBoardTagTokens(boardCardsRaw, street) {
+  const normalizedStreet = String(street || '').trim().toLowerCase();
+  const cards = (boardCardsRaw || [])
+    .map((card) => String(card?.raw || card || '').trim())
+    .filter(Boolean);
+  const parsedCards = cards.map(parseCardToken).filter(Boolean);
+  if (parsedCards.length < 3 || !['flop', 'turn', 'river'].includes(normalizedStreet)) return [];
+
+  const tags = [];
+  const highTag = boardHighTagToken(cards);
+  if (highTag) tags.push(highTag);
+  if (boardIsPaired(cards)) tags.push('PAIRED_BRD');
+  if (boardHasTrips(cards)) tags.push('TRI_BRD');
+  if (boardHasNToStraight(cards, 3)) tags.push('STR_BRD');
+
+  const suitCounts = boardSuitCounts(cards);
+  const suitValues = Array.from(suitCounts.values());
+  const maxSuitCount = suitValues.length ? Math.max(...suitValues) : 0;
+
+  if (normalizedStreet === 'flop') {
+    if (maxSuitCount >= 3) {
+      tags.push('FLUSH_BRD');
+      if (maxSuitCount === 3) tags.push('MONO_BRD');
+    } else if (maxSuitCount === 2) {
+      tags.push('FD_BRD');
+    }
+  } else if (normalizedStreet === 'turn') {
+    if (maxSuitCount >= 3) {
+      tags.push('FLUSH_BRD');
+    } else {
+      const twoCardSuits = suitValues.filter((count) => count === 2).length;
+      if (twoCardSuits === 2) {
+        tags.push('2FD_BRD');
+      } else if (twoCardSuits === 1) {
+        tags.push('FD_BRD');
+      }
+    }
+  } else if (normalizedStreet === 'river' && maxSuitCount >= 3) {
+    tags.push('FLUSH_BRD');
+  }
+
+  return Array.from(new Set(tags));
+}
+
+function boardTokens(parsedHistory, street) {
   const cards = streetBoardCards(parsedHistory, street)
     .map((item) => String(item || '').trim())
     .filter(Boolean);
-  if (!cards.length) return '';
-  return `on${cards.join('')}`;
+  if (!cards.length) return [];
+  return [`on${cards.join('')}`, ...deriveBoardTagTokens(cards, street)];
 }
 
 function streetPotToken(parsedHistory, street) {
@@ -1624,7 +1796,6 @@ function playerStreetHandToken(parsedHistory, player, street) {
   if (!cards) return '';
   const cls = parsedHistory?.showdown?.streetClassByPlayer?.[player]?.[street] || '';
   const drawTokens = parsedHistory?.showdown?.streetDrawByPlayer?.[player]?.[street] || [];
-  const classDetails = parsedHistory?.showdown?.streetClassByPlayer?.[player]?._details?.[street] || null;
   const boardCards = streetBoardCards(parsedHistory, street);
   const pairedBoardModifier = (
     cls === 'ov'
@@ -1632,8 +1803,7 @@ function playerStreetHandToken(parsedHistory, player, street) {
   )
     ? ['p']
     : [];
-  const fragileTokens = deriveFragileStrongTokens(cls, boardCards, classDetails);
-  const suffix = [cls, ...pairedBoardModifier, ...drawTokens, ...fragileTokens].filter(Boolean).join('_');
+  const suffix = [cls, ...pairedBoardModifier, ...drawTokens].filter(Boolean).join('_');
   return suffix ? `${cards}_${suffix}` : cards;
 }
 
@@ -1788,8 +1958,8 @@ function buildTargetStreetPrefix(parsedHistory, street) {
   }
 
   if (street !== 'preflop') {
-    const board = boardToken(parsedHistory, street);
-    if (board) parts.push(board);
+    const board = boardTokens(parsedHistory, street);
+    if (board.length) parts.push(...board);
   }
 
   const interpretation = deriveTargetInterpretation(parsedHistory, street, actionEvent, targetClass);
@@ -1926,15 +2096,15 @@ function buildPostflopSequenceNote(parsedHistory, street) {
       tokenParts.push(inferredTag);
     }
     if (target && event.player === target) {
-      const board = boardToken(parsedHistory, street);
-      if (board) tokenParts.push(board);
+      const board = boardTokens(parsedHistory, street);
+      if (board.length) tokenParts.push(...board);
       const targetClass = parsedHistory?.showdown?.targetStreetClass?.[street] || '';
       const interpretation = deriveTargetInterpretation(parsedHistory, street, event, targetClass);
       if (interpretation) tokenParts.push(interpretation);
     } else if (!target && !boardAddedWithoutTarget) {
-      const board = boardToken(parsedHistory, street);
-      if (board) {
-        tokenParts.push(board);
+      const board = boardTokens(parsedHistory, street);
+      if (board.length) {
+        tokenParts.push(...board);
         boardAddedWithoutTarget = true;
       }
     }
