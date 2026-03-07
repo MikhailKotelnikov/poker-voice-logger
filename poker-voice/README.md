@@ -427,3 +427,61 @@ npm run verify
 5. URL веб-приложения вставить в `.env` как `SHEETS_WEBHOOK_URL`.
 
 Если менялся `Code.gs`, нужен redeploy новой версии.
+
+---
+
+## Video HH Contract Lab (Wave-1)
+
+Локальный офлайн прогон baseline OCR-экстрактора (`opencv + rapidocr`) с contract-first артефактами.
+
+Одноразовая установка OCR runtime (делаю я в первичном прогоне, но можно выполнить вручную):
+
+```bash
+python3 -m pip install --target /tmp/codex-video-hh-lab/.deps rapidocr-onnxruntime imageio-ffmpeg
+```
+
+При другом пути к зависимостям задайте `VIDEO_OCR_PYTHONPATH`.
+
+
+```bash
+cd /Users/parisianreflect/Documents/codex/poker-voice
+npm run video:lab -- \
+  --video "/Users/parisianreflect/Documents/codex/20260303-1610-37.8875770.mp4" \
+  --out "/Users/parisianreflect/Documents/codex/poker-voice/reports/video-hh-lab" \
+  --sample-ms 1200 \
+  --max-frames 600 \
+  --preview
+```
+
+Опции:
+- `--labels /abs/path/session.labels.json` — сравнение с эталоном `canonical_hand_v1`
+- `--sample-ms <n>` — интервал сэмплирования кадров в миллисекундах
+- `--max-frames <n>` — ограничение количества OCR-кадров
+- `--strict-extractor` — завершать команду с non-zero кодом, если baseline extractor не смог декодировать/прочитать видео
+- `--preview` — сгенерировать визуальный preview (`preview/index.html` + JPEG-кадры по таймкодам событий)
+
+Артефакты прогона пишутся в `reports/video-hh-lab/<run-id>/`:
+- `manifest.json`
+- `events.json`
+- `metrics.json`
+- `errors.json`
+- `hh-draft.json`
+- `preview/index.html` (если `--preview`)
+- `preview/frames/*.jpg` (если `--preview`)
+- `preview/preview.json` (если `--preview`)
+
+Быстрая ручная проверка для оператора (ключевой check на этом этапе):
+1. Открыть `preview/index.html`.
+2. Пройти 10-20 строк сверху вниз и подтвердить:
+   - actor/action в таблице совпадают с миниатюрой кадра,
+   - нет явного спама одинаковыми `FOLD/CALL/RAISE` подряд,
+   - street не “залип” на `preflop` во второй половине раздачи.
+
+Отдельный запуск preview для уже существующего run:
+
+```bash
+cd /Users/parisianreflect/Documents/codex/poker-voice
+npm run video:preview -- --run "/abs/path/to/reports/video-hh-lab/<run-id>"
+```
+
+Если в `manifest.status` = `extractor_error` или в `errors.json` есть `reader_start: Cannot Decode`, то видео-кодек/поток в текущем окружении не декодируется. Для следующего прогона сохраните копию видео в более совместимом формате (H.264/AAC, `.mp4`) и повторите запуск.

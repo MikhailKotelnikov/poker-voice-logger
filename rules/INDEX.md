@@ -99,6 +99,50 @@ Load this file before any substantial task. Then load only relevant rule files.
 90. [HH Room For Phenom Poker Must Be Derived From Header Line](./process-hh-room-from-header-for-phenom.md)
 91. [HH Header Timezone Must Be Converted To UTC](./process-hh-header-timezone-must-convert-to-utc.md)
 
+92. [Video-HH Wave 1 Must Freeze Contract And Labeled Baseline Before Extractor Logic](./process-video-hh-wave1-contract-and-labeled-baseline-first.md)
+
+93. [Video-HH Decode Must Fallback From AVFoundation To Python OCR Stack](./process-video-hh-decode-fallback-from-avfoundation-to-python-ocr.md)
+
+94. [Video-HH Action-Only OCR Must Suppress Bottom Buttons And Dedupe By Pot-Stable Overlay](./process-video-hh-action-only-noise-control-with-pot-aware-dedupe.md)
+
+95. [Video-HH Runs Must Produce Event-To-Frame Preview For Human Verification](./process-video-hh-run-preview-must-map-events-to-frames.md)
+
+96. [Video-HH Player State Must Block Actions After Fold In Same Hand](./process-video-hh-player-state-must-block-actions-after-fold.md)
+
+97. [Video-HH Turn Indicator Must Gate Action Assignment To Active Actor](./process-video-hh-turn-indicator-must-prioritize-active-actor.md)
+
+98. [Video-HH Action Timestamp Must Anchor To Onset Frame](./process-video-hh-action-timestamp-must-anchor-to-onset-frame.md)
+
+99. [Video-HH Preflop Squeeze Response Chain Must Be Complete Before Street Transition](./process-video-hh-preflop-squeeze-response-chain-must-be-complete.md)
+
+100. [Video-HH Focus-First Detection Must Use Active Ring And Timebar As Primary Signal](./process-video-hh-focus-first-must-use-ring-and-timebar.md)
+
+101. [Video-HH Action Inference Must Prioritize Pot/Stack Delta Over Static Action Text](./process-video-hh-action-inference-must-prioritize-pot-and-stack-delta.md)
+
+102. [Video-HH Postfactum Turn Context Must Explain Action Timestamp Lag](./process-video-hh-postfactum-turn-context-must-explain-action-lag.md)
+
+103. [Video-HH Pre-Roll Fold Inference Must Break Same-Timestamp Ties Before First Aggression](./process-video-hh-preroll-fold-order-must-break-same-ms-ties.md)
+
+104. [Video-HH Sampling Must Use 1s Baseline With Adaptive Refinement On Pot Jumps](./process-video-hh-sampling-must-use-1s-baseline-with-adaptive-refine-on-pot-jumps.md)
+
+105. [Video-HH Preview Must Use Global Event Index And Show Focus Actor](./process-video-hh-preview-must-use-global-event-index-and-focus-column.md)
+
+106. [Video-HH Action Commit Must Require Two Independent Signals](./process-video-hh-commit-must-require-two-independent-signals.md)
+
+107. [Video-HH Pending Events Must Resolve At Nearest Committed Anchor](./process-video-hh-pending-events-must-resolve-at-nearest-committed-anchor.md)
+
+108. [Video-HH Backward Inference Must Stop At Committed Anchor](./process-video-hh-backward-inference-must-stop-at-committed-anchor.md)
+
+109. [Video-HH Terminal Hand State Must Set Focus To None](./process-video-hh-terminal-state-must-set-focus-none.md)
+
+110. [Video-HH Inferred Events Must Carry Explicit Resolution State](./process-video-hh-inferred-events-must-carry-explicit-resolution-state.md)
+111. [Video-HH Preview Explainability Must Show Signals, Locked History, And Next Expectation](./process-video-hh-preview-explainability-must-show-signals-history-and-next-expectation.md)
+112. [Video-HH Stale Preflop Response Must Lock Actor Focus And Mark Pending](./process-video-hh-stale-preflop-response-must-lock-actor-focus-and-mark-pending.md)
+113. [Video-HH Preview Must Exclude Pending Rows From Event Numbering](./process-video-hh-preview-must-exclude-pending-rows-from-event-numbering.md)
+114. [Video-HH Reconstruction Must Be Ledger-First With Validator](./process-video-hh-reconstruction-must-be-ledger-first-with-validator.md)
+115. [Video-HH Gap Resolution Must Stay Between Committed Anchors](./process-video-hh-gap-resolution-must-stay-between-committed-anchors.md)
+116. [Video-HH Review Preview Must Show Proof Blocks For Inferred Actions](./process-video-hh-review-preview-must-show-proof-blocks-for-inferred-actions.md)
+
 ## How to Add a Rule
 
 1. Copy `rules/rule-template.md` into a new file named `rules/<category>-<slug>.md`.

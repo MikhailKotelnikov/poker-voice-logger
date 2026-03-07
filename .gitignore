@@ -1,3 +1,5 @@
 .DS_Store
 poker-voice/node_modules/
 poker-voice/.env
+
+.deps/
